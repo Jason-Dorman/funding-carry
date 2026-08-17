@@ -45,6 +45,15 @@ const divisionPrecision = 16
 
 func init() {
 	decimal.DivisionPrecision = divisionPrecision
+
+	// The second mutable global with a silent failure mode. When it is true, a
+	// decimal marshals as a bare JSON number, and every consumer outside Go —
+	// the Python backtester, jq, a browser reading a Grafana panel — parses that
+	// number into a float64. Postgres keeps a jsonb number exact, so nothing
+	// inside the system ever notices the loss. Decisions persist their whole
+	// input snapshot as jsonb (API spec section 3.5), so this pin is what keeps
+	// a recorded decision re-derivable; internal/db proves it round trips.
+	decimal.MarshalJSONWithoutQuotes = false
 }
 
 // Secret is a configuration value that must never appear in a log line, an error
@@ -185,6 +194,17 @@ type Carry struct {
 	Secrets         Secrets
 }
 
+// MigrateCmd configures cmd/migrate, which applies the schema and seeds the
+// product row. It is deliberately not built on Common: a schema migration has no
+// venue endpoints, no metrics endpoint and no spot product, and requiring them
+// would mean a migration could fail on configuration it never reads.
+type MigrateCmd struct {
+	DatabaseURL     string
+	PerpProductID   string
+	ContractSizeETH decimal.Decimal
+	Log             LogConfig
+}
+
 // SimVenue configures cmd/sim-venue: the FIX 4.4 acceptor and its fill model.
 type SimVenue struct {
 	Common
@@ -200,6 +220,9 @@ func LoadCarry() (*Carry, error) { return loadCarry(os.LookupEnv) }
 
 // LoadSimVenue reads cmd/sim-venue's configuration from the process environment.
 func LoadSimVenue() (*SimVenue, error) { return loadSimVenue(os.LookupEnv) }
+
+// LoadMigrateCmd reads cmd/migrate's configuration from the process environment.
+func LoadMigrateCmd() (*MigrateCmd, error) { return loadMigrateCmd(os.LookupEnv) }
 
 func loadIngest(lookup lookupFunc) (*Ingest, error) {
 	l := newLoader(lookup)
@@ -224,7 +247,7 @@ func loadCarry(lookup lookupFunc) (*Carry, error) {
 		Common:          l.common("CARRY_METRICS_ADDR", ":9102"),
 		Coinbase:        l.coinbase(),
 		Base:            l.baseChain(),
-		ContractSizeETH: l.Decimal("CONTRACT_SIZE_ETH", "0.10"),
+		ContractSizeETH: l.Decimal("CONTRACT_SIZE_ETH", defaultContractSizeETH),
 		Signals: Signals{
 			ZEnter:          l.Decimal("Z_ENTER", "1.5"),
 			ZExit:           l.Decimal("Z_EXIT", "0.5"),
@@ -278,8 +301,20 @@ func loadSimVenue(lookup lookupFunc) (*SimVenue, error) {
 	return cfg, l.err()
 }
 
+func loadMigrateCmd(lookup lookupFunc) (*MigrateCmd, error) {
+	l := newLoader(lookup)
+	cfg := &MigrateCmd{
+		DatabaseURL:     l.Required("DATABASE_URL"),
+		PerpProductID:   l.Required("PERP_PRODUCT_ID"),
+		ContractSizeETH: l.Decimal("CONTRACT_SIZE_ETH", defaultContractSizeETH),
+		Log:             l.logConfig(),
+	}
+	return cfg, l.err()
+}
+
 const (
 	defaultMaintenanceBreak = "Fri 17:00-18:00 America/New_York"
+	defaultContractSizeETH  = "0.10"
 	pressureWeightCount     = 3
 )
 

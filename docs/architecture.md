@@ -97,7 +97,7 @@ internal/treasury/   internal/db/        internal/config/
 research/            deploy/             docs/
 ```
 
-`internal/db` is the shared persistence layer (pgx pool, batch writer, migrations). `internal/config` loads each binary's typed configuration from the environment ([API spec §7](api-spec.md#7-configuration-surface)) and is the one place that knows how a credential is redacted; `internal/metrics` owns each binary's Prometheus registry and its `/metrics` and `/healthz` endpoints. Everything else matches spec §6.11.
+`internal/db` is the shared persistence layer: the pgx pool (with the shopspring codec registered so `numeric` is a `decimal` on the wire), the embedded SQL migrations, the typed row structs that enumerate every table the system writes to, and the batch writer. `cmd/migrate` is a fourth, one-shot binary that applies those migrations and seeds the product row; it is not a service and is not part of `make up`. `internal/config` loads each binary's typed configuration from the environment ([API spec §7](api-spec.md#7-configuration-surface)) and is the one place that knows how a credential is redacted; `internal/metrics` owns each binary's Prometheus registry and its `/metrics` and `/healthz` endpoints. Everything else matches spec §6.11.
 
 ---
 
@@ -130,8 +130,8 @@ graph LR
 
 Rules, enforced in review:
 
-1. **One writer per binary.** Stream goroutines never call the DB. They publish typed structs to channels; the writer batches inserts (interval- and size-triggered flush).
-2. **`context` cancellation flows down the stack.** Root context → per-stream contexts. Graceful shutdown = cancel root, flush channels, close writer, log out FIX, close pool — in that order.
+1. **One writer per binary.** Stream goroutines never call the DB. They publish typed structs to channels; the writer batches inserts (interval- and size-triggered flush) and sends each flush as a single pgx batch, which Postgres runs in one implicit transaction — so a flush lands whole or not at all, in one round trip. The channel is bounded: when it fills, producers block, which is the backpressure that keeps an unreachable database from turning into unbounded memory.
+2. **`context` cancellation flows down the stack.** Root context → per-stream contexts. Graceful shutdown = cancel root, flush channels, close writer, log out FIX, close pool — in that order. The writer's final flush runs on a context cancellation cannot reach, so SIGTERM still persists the last batch.
 3. **Each stream owns its reconnect loop** with exponential backoff + jitter. Reconnects and detected gaps increment per-stream counters; a `last_seen` timestamp gauge per stream feeds the staleness flag that the risk engine consumes.
 4. **Errors on a feed are wrapped and surfaced, not swallowed** — but a feed error degrades to `stale`, it never crashes the binary. Only invariant violations (e.g. writer cannot reach DB after retries) are fatal.
 
@@ -311,11 +311,11 @@ TimescaleDB (Postgres + hypertables). Full column-level schema in the [API spec]
 
 ```mermaid
 erDiagram
-    cb_products ||--o{ cb_venue_state : coin
-    cb_products ||--o{ cb_bars : coin
-    cb_products ||--o{ cb_book_snapshots : coin
-    cb_products ||--o{ cb_trades_agg : coin
-    cb_products ||--o{ cb_features : coin
+    cb_products ||--o{ cb_venue_state : product_id
+    cb_products ||--o{ cb_bars : product_id
+    cb_products ||--o{ cb_book_snapshots : product_id
+    cb_products ||--o{ cb_trades_agg : product_id
+    cb_products ||--o{ cb_features : product_id
     cb_features ||--o{ decisions : "input snapshot"
     cb_account_state ||--o{ positions : "margin + contracts"
     decisions ||--o{ positions : "drives"
@@ -326,16 +326,16 @@ erDiagram
 
     cb_venue_state {
         timestamptz ts
-        text coin
+        text product_id
         numeric futures_mark
         numeric spot_mark
-        numeric funding_hourly
+        numeric funding_rate_hourly
         numeric spread_bps
         numeric open_interest
     }
     cb_features {
         timestamptz ts
-        text coin
+        text product_id
         numeric tier1_core
         numeric tier2_micro
         numeric tier3_price

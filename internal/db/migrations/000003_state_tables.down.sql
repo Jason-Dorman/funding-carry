@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS fix_sessions;
+DROP TABLE IF EXISTS risk_events;
+DROP TABLE IF EXISTS funding_events;
+DROP TABLE IF EXISTS fills;
+DROP TABLE IF EXISTS decisions;
+DROP TABLE IF EXISTS positions;
+DROP TABLE IF EXISTS cb_products;

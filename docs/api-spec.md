@@ -204,6 +204,9 @@ Money is `decimal.Decimal` in Go and `numeric` in SQL, end to end (spec §11). T
 | Never `==` or `!=` on a `decimal.Decimal` — use `Equal` | `Decimal` is a struct holding a `*big.Int`, so `==` compiles and compares representation. It is false even for two decimals parsed from the same string, which makes `x == decimal.Zero` a check that can never fire | `internal/guard` (type-aware AST test over the whole module) |
 | Never construct a decimal from a float (`NewFromFloat*`) | The only path by which binary rounding error enters. Values come from strings, integers, or the database | `internal/guard` |
 | Truncate toward zero when quantizing contracts, never `Floor` | A short is a negative contract count; `Floor(-7.9) = -8` rounds *up* into more risk | table test with negative cases, build plan Part 13 |
+| A decimal in a `jsonb` column is a JSON **string**, never a JSON number | Postgres keeps a bare JSON number exact, so nothing inside the system notices; the loss lands on every consumer outside Go — the Python backtester, `jq`, a browser reading a Grafana panel — which parse JSON numbers as IEEE-754 doubles. A decision's recorded inputs then stop matching the decision that was made from them | `decimal.MarshalJSONWithoutQuotes` pinned false in `internal/config`; `internal/db.EncodeSnapshot` refuses to encode if it is ever true; round trip through `jsonb` asserted in the integration suite ([ADR-0011](decisions/0011-decimal-json-encoding.md)) |
+
+`decimal` ↔ `numeric` is exact in both directions because `internal/db` registers the shopspring codec on every pgx connection, making `decimal.Decimal` the native representation of `numeric` rather than something reached through `pgtype.Numeric` and a float. The integration suite proves it with values a `float64` cannot hold (`2^53 + 1` and wider). Note that Postgres preserves a numeric's *scale* while `String()` drops trailing zeros: `0.10` stored and read back is still scale 2, and still renders as `0.1` — which is why money-facing output uses `StringFixed(n)`.
 
 `Add`, `Sub` and `Mul` are exact at arbitrary precision. `Div` is not: it rounds to `decimal.DivisionPrecision`, a mutable package global pinned to 16 by `internal/config`'s `init` so division is identical across processes, tests and replays. Division is for **ratios** (margin ratio, basis, premium proxy); a value that must reconcile against a venue statement is added and multiplied, never divided.
 
@@ -272,7 +275,9 @@ Fills against last recorded top-of-book from TimescaleDB with configurable: late
 
 ## 5. Database schema
 
-TimescaleDB; all `ts` columns `timestamptz`, hypertables partitioned on `ts`. Prices/quantities are `numeric`, never floats. Migrations in `internal/db/migrations`, applied by `make migrate`.
+TimescaleDB; all `ts` columns `timestamptz`, hypertables partitioned on `ts` with a one-day chunk interval. Prices/quantities are `numeric` with no declared precision — arbitrary precision — never floats. Migrations live in `internal/db/migrations`, are embedded in the binaries, and are applied by `make migrate` (which also seeds the perp `cb_products` row); see [ADR-0010](decisions/0010-embedded-migrations.md).
+
+Every column below is nullable unless the table's notes say otherwise: a poll that did not return a field, or a rolling window that has not filled, must read as NULL. A zero would be a value the decision engine acts on.
 
 ### 5.1 Hypertables
 
@@ -416,11 +421,34 @@ Conventions: `positions.venue` separates paper/sim/live P&L buckets; `funding_ev
 
 `cb_account_state` is the polled truth behind the risk engine's margin ratio and the treasury's balance reconciliation — the system never derives a liquidation price of its own.
 
+### 5.3 Constraints and indexes
+
+The schema carries the rules that must hold regardless of which process wrote the row. Each one exists because the alternative is a silent wrong answer later.
+
+**Read paths.** `(product_id, ts DESC)` on every product-scoped series table — the venue state cache, the feature engine's warm start and the replay all read "the latest rows for this product". `base_state` needs none beyond the hypertable's own time index; it has no product dimension. `decisions` and `risk_events` are indexed on `(ts DESC)`, `risk_events` again on unresolved rows only, `positions` on open positions only, and `fills` on `(position_id, ts DESC)` and `cl_ord_id`.
+
+**Idempotency.** Three unique indexes are what let a backfill or a resend be replayed safely, with inserts written as `ON CONFLICT … DO NOTHING`:
+
+| Index | Makes idempotent |
+|---|---|
+| `cb_bars (product_id, tf, ts)` | candle backfill (Part 5) |
+| `cb_trades_agg (product_id, bucket_secs, ts)` | trade backfill (Part 5) |
+| `funding_events (product_id, kind, ts) WHERE position_id IS NULL` | funding-history backfill (Part 5) |
+| `fills (venue, venue_exec_id) WHERE venue_exec_id IS NOT NULL` | FIX resend after reconnect (Part 8) — an ExecutionReport delivered twice inserts one row |
+
+**Closed vocabularies** are `CHECK` constraints, so a value outside the set is rejected at write time rather than found in a dashboard: `funding_source ∈ {venue, computed}` (on `cb_venue_state`, `cb_features`, `funding_events`), `decisions.state`, `fills.leg`/`side`/`exec_state`, `positions.venue`, `funding_events.kind`, and `cb_features.crowded_side`/`pressure_level`. `risk_events.kind` is deliberately *not* constrained — it is an append-only vocabulary that grows with the risk engine, and a rejected insert there would lose the record of the event it describes.
+
+**Cross-column invariants.** `funding_events` enforces that a `SETTLEMENT` row carries no `rate_hourly`, no `funding_source` and no `settled_by`: a settlement is an observed cash movement, and a rate on one would make the accrual-versus-settlement reconciliation meaningless.
+
+`positions.id`, `decisions.id`, `fills.id`, `funding_events.id`, `risk_events.id` and `fix_sessions.id` are `bigint GENERATED ALWAYS AS IDENTITY`. Nothing yet reads a generated id back — the writer is append-only — so how a position's id reaches the fills that reference it is an open question recorded against Part 13 in the [build plan](build-plan.md#changelog--decision-record).
+
 ---
 
 ## 6. Prometheus metrics
 
 All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-cardinality (`product`, `stream`, `venue`, `leg`, `component`).
+
+The three writer metrics (`rows_written_total`, `write_batch_seconds`, `write_queue_depth`) come from shared code in `internal/db` and take the prefix of whichever binary owns that writer, so `carry_rows_written_total` exists alongside the `ingest_` ones listed below. "Is this binary keeping up with its writes?" is a per-binary question.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -429,6 +457,7 @@ All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-
 | `ingest_ws_gaps_total` | counter | stream | detected gaps |
 | `ingest_rows_written_total` | counter | table | writer throughput |
 | `ingest_write_batch_seconds` | histogram | — | batch insert latency |
+| `ingest_write_queue_depth` | gauge | — | rows waiting on the writer's channel; a rising floor is backpressure |
 | `carry_funding_rate` | gauge | product, source | current hourly funding; `source` = venue\|computed |
 | `carry_funding_rate_est` | gauge | product | locally computed estimate (always present) |
 | `carry_funding_reconciliation_error` | gauge | — | accrued estimate minus cash adjustments applied |
@@ -483,7 +512,7 @@ All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-
 | `ASSET` | all | `ETH` |
 | `PERP_PRODUCT_ID` | all | `ETP-20DEC30-CDE` |
 | `SPOT_PRODUCT_ID` | all | `ETH-USD` |
-| `CONTRACT_SIZE_ETH` | carry, research | `0.10` |
+| `CONTRACT_SIZE_ETH` | carry, migrate, research | `0.10` — `make migrate` seeds it into `cb_products` until Part 5 reads the real value from the products endpoint |
 | `BASE_RPC_URL`, `ALCHEMY_API_KEY` | ingest, carry | — |
 | `POLL_REST_SECS`, `POLL_BASE_SECS`, `BOOK_SNAP_SECS` | ingest | 5 / 30 / 10 |
 | `Z_ENTER`, `Z_EXIT`, `F_FLIP` | carry | 1.5 / 0.5 / 0 *(placeholders — real values private)* |
@@ -514,7 +543,7 @@ All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-
 | `INGEST_METRICS_ADDR`, `CARRY_METRICS_ADDR`, `SIM_METRICS_ADDR` | ingest / carry / sim-venue | `:9101` / `:9102` / `:9103` — one per binary so all three can also run side by side on a host |
 | `LOG_LEVEL`, `LOG_FORMAT` | all | `info` / `json` (`text` when run outside a container) |
 
-`DATABASE_URL`, `PERP_PRODUCT_ID` and `SPOT_PRODUCT_ID` are required; everything else has a documented default. A load reports *every* problem it found at once rather than failing on the first, so a misconfigured deployment learns all of it in one restart.
+`DATABASE_URL`, `PERP_PRODUCT_ID` and `SPOT_PRODUCT_ID` are required; everything else has a documented default. `cmd/migrate` is the exception to the shared `Common` block: it reads only `DATABASE_URL`, `PERP_PRODUCT_ID`, `CONTRACT_SIZE_ETH` and the log settings, so a schema migration cannot fail on configuration it never uses. A load reports *every* problem it found at once rather than failing on the first, so a misconfigured deployment learns all of it in one restart.
 
 Three values fail the load rather than being checked at trade time, because a configuration that violates them must never reach a venue:
 

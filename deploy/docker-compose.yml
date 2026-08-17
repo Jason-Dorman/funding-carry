@@ -37,7 +37,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      - "5432:5432"
+      # Published on a non-default host port: 5432 is where a developer machine
+      # usually already has its own Postgres, and a silent collision would point
+      # host-side tools (psql, `make test-integration`) at the wrong server.
+      # Inside the Compose network the port is still 5432.
+      - "15432:5432"
     volumes:
       - timescale-data:/var/lib/postgresql/data
     healthcheck:
@@ -87,6 +91,19 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9103/healthz || exit 1"]
       <<: *health-defaults
+
+  # One-shot: applies the schema, seeds the perp product row, exits. Its profile
+  # keeps it out of `make up`, so bringing the stack up never migrates as a side
+  # effect — `make migrate` is a decision someone makes.
+  migrate:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        SERVICE: migrate
+    profiles: ["tools"]
+    restart: "no"
 
   prometheus:
     image: prom/prometheus:latest

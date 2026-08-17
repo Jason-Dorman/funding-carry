@@ -4,6 +4,16 @@ Notable changes to the system and its contracts. Structural decisions get an ADR
 
 ## [Unreleased]
 
+### Schema and persistence contracts — 2026-08-17 (Part 2)
+
+The v1 schema landed as embedded migrations, and with it three things other components and other languages now depend on:
+
+- **A decimal inside a `jsonb` column is a JSON string.** [ADR-0011](docs/decisions/0011-decimal-json-encoding.md). This binds the Python backtester and any dashboard reading `decisions.input_snapshot`: read the string and parse it with a decimal type, do not let a JSON parser turn it into a double. Numeric comparison in SQL needs an explicit `::numeric` cast.
+- **Constraints and indexes are part of the schema contract**, now written down as [API spec §5.3](docs/api-spec.md#53-constraints-and-indexes): the unique keys that make Part-5 backfills and Part-8 FIX resends idempotent, and `CHECK` constraints for every closed vocabulary. Producers write these tables with `ON CONFLICT … DO NOTHING`.
+- **The writer metrics take their binary's prefix** — `carry_rows_written_total` exists alongside `ingest_rows_written_total`, plus a new `*_write_queue_depth` gauge.
+
+Operationally: `make migrate` applies the schema through a one-shot container ([ADR-0010](docs/decisions/0010-embedded-migrations.md)), `make test-integration` runs the schema and writer suites against a real TimescaleDB in a throwaway database, and TimescaleDB is published on host port **15432** instead of 5432 so it cannot collide with a Postgres already on the machine.
+
 ### CHANGE-001 — Perp venue migrated from Hyperliquid to Coinbase US perpetual-style futures — 2026-08-16
 
 **Breaking change to venue selection.** Strategy, language, FIX loop, observability, and wallet doctrine are unchanged. Decision and full consequences: [ADR-0009](docs/decisions/0009-perp-venue-coinbase.md). Directive: [CHANGE-001](docs/CHANGE-001-venue-migration.md).
