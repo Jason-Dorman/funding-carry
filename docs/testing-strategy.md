@@ -23,7 +23,8 @@ Conventions defined once so every build part tests the same way. Per-part accept
 
 ## Integration tests
 
-- Build tag `//go:build integration`, run via `make test-integration` against the Compose TimescaleDB (real hypertables, real migrations — the schema is a contract under test).
+- Build tag `//go:build integration`, run via `make test-integration` against the Compose TimescaleDB (real hypertables, real migrations — the schema is a contract under test). `golangci-lint` lints with the tag set, so these files are not a blind spot.
+- **The suite creates and drops its own database** (`carry_integration`) beside the one `TEST_DATABASE_URL` points at, and never writes to that one. Self-recorded market history is the system's primary asset ([ADR-0002](decisions/0002-one-timescaledb-instance.md)); a test run must not be able to delete weeks of it. It connects over the published host port `15432`, which is deliberately not `5432` so a Postgres already on the developer's machine cannot be mistaken for the stack's.
 - FIX integration: real quickfixgo initiator ↔ acceptor over localhost, including the restart/resend scenario (Part 8 acceptance) — kill the initiator process mid-fill, restart, assert no lost ExecReport.
 - Deterministic sim: `sim-venue` under a fixed seed produces byte-identical fill sequences.
 

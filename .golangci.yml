@@ -5,6 +5,12 @@
 # complexity ceiling matching docs/engineering-principles.md.
 version: "2"
 
+run:
+  # The integration suite is code too, and it is where the schema contract is
+  # asserted. Without this, its files are invisible to the linter.
+  build-tags:
+    - integration
+
 linters:
   # standard = errcheck, govet, ineffassign, staticcheck, unused.
   default: standard
@@ -38,9 +44,12 @@ linters:
   exclusions:
     generated: lax
     rules:
-      # Test helpers legitimately do things production code should not.
+      # Test helpers legitimately do things production code should not, and a
+      # test that walks a table of cases is a straight-line list of assertions
+      # rather than the branching the complexity ceiling exists to catch.
       - path: _test\.go
         linters:
+          - gocyclo
           - gosec
           - noctx
 

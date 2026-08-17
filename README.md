@@ -76,22 +76,29 @@ docs/                                   the documents below
 ## Running
 
 ```sh
-make up        # full stack: services + TimescaleDB + Prometheus + Grafana + Alertmanager
-make migrate   # apply schema
-make test      # Go + Python suites
-make lint      # golangci-lint
-make replay    # 30-day backtest, refreshes Grafana
+make up               # full stack: services + TimescaleDB + Prometheus + Grafana + Alertmanager
+make migrate          # apply schema, seed the perp product row
+make test             # Go + Python suites
+make test-integration # schema and writer against the Compose TimescaleDB
+make lint             # golangci-lint
+make replay           # 30-day backtest, refreshes Grafana
 ```
 
 `make up` creates `.env` from `.env.example` on first run and waits until all seven
 services report healthy. Grafana is on `:3000`, Prometheus on `:9090`, Alertmanager
-on `:9093`; the binaries expose `/metrics` on `:9101` (ingest), `:9102` (carry) and
-`:9103` (sim-venue).
+on `:9093`, TimescaleDB on `:15432` (not the default `5432`, so it cannot collide
+with a Postgres already on the machine); the binaries expose `/metrics` on `:9101`
+(ingest), `:9102` (carry) and `:9103` (sim-venue).
+
+`make migrate` runs a one-shot container that applies the embedded migrations and
+exits — bringing the stack up never changes the schema on its own. It is safe to
+re-run: it reports the schema version and leaves any product metadata already read
+from the venue untouched.
 
 Configuration is env-based: `.env.example` documents every variable with synthetic placeholder values; real thresholds and credentials live in a gitignored `.env.private`.
 
 ## Status
 
-[Part 1](docs/build-plan.md#part-1--repo-scaffold-compose-stack-config) complete (2026-08-16): repo scaffold, Compose stack, and typed configuration. `make up` brings all seven services to healthy, each binary serves `/metrics`, and Prometheus and Grafana are wired to them — the system is running and empty. Next: [Part 2](docs/build-plan.md#part-2--database-schema-migrations-writer-package), the schema and the one-writer persistence layer. The wallet track (manual carries) runs ahead of the code by design.
+[Part 2](docs/build-plan.md#part-2--database-schema-migrations-writer-package) complete (2026-08-17): the full v1 schema — seven hypertables, seven state tables — as embedded migrations, and the shared one-writer persistence layer that every binary writes through. `make up && make migrate` brings the stack up and creates the schema; the system is running with an empty database waiting for feeds. Money is `decimal` in Go and `numeric` in SQL end to end, proven by a round trip of values a `float64` cannot represent. Next: [Part 4](docs/build-plan.md#part-4--coinbase-ws-ingest), the Coinbase WebSocket ingest that starts filling it ([Part 3](docs/build-plan.md#part-3--go-onramp-toy-hand-written-first--collaborative-part) is a hand-written exercise, taken when Jason writes it). The wallet track (manual carries) runs ahead of the code by design.
 
 *Personal project. Not investment advice; live size is deliberately tiny.*

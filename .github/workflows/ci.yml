@@ -1,6 +1,6 @@
 # CI gate per docs/testing-strategy.md: lint plus unit tests under the race
-# detector, green on every push. Integration tests (build tag `integration`, run
-# against the Compose TimescaleDB) join from Part 2.
+# detector, green on every push, and the integration suite against a real
+# TimescaleDB — the schema is a contract, so it is tested rather than asserted.
 name: ci
 
 on:
@@ -40,3 +40,38 @@ jobs:
       # the module, which the test cache cannot represent.
       - name: Test
         run: go test -race -count=1 ./...
+
+  integration:
+    runs-on: ubuntu-latest
+
+    # The same image the Compose stack runs, so the migrations are exercised
+    # against the TimescaleDB version they will actually meet.
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_USER: carry
+          POSTGRES_PASSWORD: carry
+          POSTGRES_DB: carry
+        # The same host port the Compose stack publishes, so `make
+        # test-integration` needs no CI-specific configuration.
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U carry -d carry"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Credentials match the synthetic ones in .env.example; the suite creates
+      # its own throwaway database beside the one this points at.
+      - name: Integration test
+        run: make test-integration

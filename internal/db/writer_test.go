@@ -1,0 +1,432 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/shopspring/decimal"
+)
+
+// ---------------------------------------------------------------------------
+// A fake database, per the testing strategy: a hand-written stand-in for the one
+// method the writer actually uses, not a mocking framework.
+// ---------------------------------------------------------------------------
+
+type sentBatch struct {
+	statements []string
+	arguments  [][]any
+}
+
+type fakeDB struct {
+	mu       sync.Mutex
+	batches  []sentBatch
+	sent     chan struct{}
+	failures int   // number of leading sends that fail
+	failErr  error // the failure they report
+}
+
+func newFakeDB() *fakeDB {
+	return &fakeDB{sent: make(chan struct{}, 64)}
+}
+
+func (f *fakeDB) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	batch := sentBatch{}
+	for _, q := range b.QueuedQueries {
+		batch.statements = append(batch.statements, q.SQL)
+		batch.arguments = append(batch.arguments, q.Arguments)
+	}
+	f.batches = append(f.batches, batch)
+
+	var err error
+	if f.failures > 0 {
+		f.failures--
+		err = f.failErr
+	}
+
+	// Non-blocking so a test that does not watch the channel cannot deadlock the
+	// writer.
+	select {
+	case f.sent <- struct{}{}:
+	default:
+	}
+
+	return &fakeResults{n: len(batch.statements), err: err}
+}
+
+func (f *fakeDB) snapshot() []sentBatch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]sentBatch(nil), f.batches...)
+}
+
+// rowsFor counts the rows the fake was asked to insert into one table, across
+// every batch it received.
+func (f *fakeDB) rowsFor(table string) int {
+	var n int
+	for _, b := range f.snapshot() {
+		for _, stmt := range b.statements {
+			if strings.HasPrefix(stmt, "INSERT INTO "+table+" ") {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+type fakeResults struct {
+	n   int
+	err error
+}
+
+func (r *fakeResults) Exec() (pgconn.CommandTag, error) {
+	if r.err != nil {
+		return pgconn.CommandTag{}, r.err
+	}
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+func (r *fakeResults) Query() (pgx.Rows, error) { return nil, errors.New("not used") }
+func (r *fakeResults) QueryRow() pgx.Row        { return nil }
+func (r *fakeResults) Close() error             { return nil }
+
+// ---------------------------------------------------------------------------
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func testMetrics() *WriterMetrics {
+	return NewWriterMetrics(prometheus.NewRegistry(), "test")
+}
+
+// startWriter runs the writer and returns a stop function that closes it and
+// reports its error. Tests never sleep to synchronize; they either drive the
+// flush ticker or wait on the fake's send channel.
+func startWriter(t *testing.T, f *fakeDB, opts WriterOptions) (*Writer, func() error) {
+	t.Helper()
+
+	w := NewWriter(f, opts, discardLogger(), testMetrics())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(context.Background()) }()
+
+	var (
+		once   sync.Once
+		runErr error
+	)
+	stop := func() error {
+		once.Do(func() {
+			_ = w.Close()
+			runErr = <-done
+		})
+		return runErr
+	}
+	t.Cleanup(func() { _ = stop() })
+	return w, stop
+}
+
+func sampleBar(product string, ts time.Time) BarRow {
+	return BarRow{
+		TS: ts, ProductID: product, TF: "1m",
+		Open:  decimal.RequireFromString("4000.10"),
+		High:  decimal.RequireFromString("4001.20"),
+		Low:   decimal.RequireFromString("3999.80"),
+		Close: decimal.RequireFromString("4000.90"),
+		// A candle with no trades is a real candle; the count is zero, not absent.
+		Volume:     decimal.Zero,
+		TradeCount: Opt[int32](0),
+	}
+}
+
+// Batching is size-triggered: the writer holds rows until the pending count
+// reaches BatchSize, then sends them as one batch.
+func TestWriterFlushesOnBatchSize(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	// A long interval takes the ticker out of the picture entirely.
+	w, _ := startWriter(t, f, WriterOptions{BatchSize: 3, FlushInterval: time.Hour})
+
+	ctx := context.Background()
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	for i := range 3 {
+		if err := w.Submit(ctx, sampleBar("ETP-20DEC30-CDE", base.Add(time.Duration(i)*time.Minute))); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+	}
+
+	<-f.sent
+
+	batches := f.snapshot()
+	if len(batches) != 1 {
+		t.Fatalf("expected exactly one batch, got %d", len(batches))
+	}
+	if got := len(batches[0].statements); got != 3 {
+		t.Fatalf("expected 3 statements in the batch, got %d", got)
+	}
+}
+
+// The interval is the other trigger: a row that never reaches the batch size
+// must still be written promptly.
+func TestWriterFlushesOnInterval(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	// Unbuffered, so a send here lands only when the writer's select takes it.
+	ticks := make(chan time.Time)
+	w, _ := startWriter(t, f, WriterOptions{BatchSize: 1000, ticks: ticks})
+
+	ts := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts)); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	// The queued row and the tick are both ready, and select picks between them
+	// at random: a tick taken first finds nothing pending and flushes nothing.
+	// That is fine in production — the next tick writes the row — but a test
+	// cannot wait for a ticker it owns, so it keeps offering ticks until a batch
+	// actually goes out.
+	for flushed := false; !flushed; {
+		select {
+		case ticks <- ts:
+		case <-f.sent:
+			flushed = true
+		}
+	}
+
+	if got := f.rowsFor("cb_bars"); got != 1 {
+		t.Fatalf("expected 1 bar written on the interval tick, got %d", got)
+	}
+}
+
+// Rows are grouped per statement and every value is a bind parameter: nothing a
+// producer supplies reaches the SQL text.
+func TestWriterGroupsRowsPerTable(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	w, stop := startWriter(t, f, WriterOptions{BatchSize: 100, FlushInterval: time.Hour})
+
+	ctx := context.Background()
+	ts := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	rows := []Row{
+		sampleBar("ETP-20DEC30-CDE", ts),
+		BaseStateRow{TS: ts, SpotPx: Num(decimal.RequireFromString("4000.25"))},
+		sampleBar("ETH-USD", ts),
+		VenueStateRow{TS: ts, ProductID: "ETP-20DEC30-CDE", FundingSource: FundingSourceComputed},
+	}
+	for _, r := range rows {
+		if err := w.Submit(ctx, r); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	batches := f.snapshot()
+	if len(batches) != 1 {
+		t.Fatalf("expected one batch, got %d", len(batches))
+	}
+
+	// Same table, same statement — and the two bars are adjacent, because rows
+	// accumulate per statement rather than in arrival order.
+	want := []string{"cb_bars", "cb_bars", "base_state", "cb_venue_state"}
+	for i, table := range want {
+		prefix := "INSERT INTO " + table + " ("
+		if !strings.HasPrefix(batches[0].statements[i], prefix) {
+			t.Errorf("statement %d: expected an insert into %s, got %q", i, table, batches[0].statements[i])
+		}
+	}
+	for _, stmt := range batches[0].statements {
+		if strings.Contains(stmt, "4000") {
+			t.Errorf("value interpolated into SQL text: %q", stmt)
+		}
+	}
+}
+
+// Close is a flush: rows still pending when the producers stop are written
+// before Run returns. This is the "one flush on close" acceptance item.
+func TestWriterFlushesPendingRowsOnClose(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	w, stop := startWriter(t, f, WriterOptions{BatchSize: 1000, FlushInterval: time.Hour})
+
+	ctx := context.Background()
+	base := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	for i := range 7 {
+		if err := w.Submit(ctx, sampleBar("ETP-20DEC30-CDE", base.Add(time.Duration(i)*time.Minute))); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+	}
+
+	// Nothing has been written yet: neither trigger has fired.
+	if got := len(f.snapshot()); got != 0 {
+		t.Fatalf("expected no batch before close, got %d", got)
+	}
+
+	if err := stop(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	batches := f.snapshot()
+	if len(batches) != 1 {
+		t.Fatalf("expected exactly one flush on close, got %d", len(batches))
+	}
+	if got := len(batches[0].statements); got != 7 {
+		t.Fatalf("expected the 7 pending rows in the final flush, got %d", got)
+	}
+}
+
+// Cancelling the root context is the SIGTERM path: it must still flush, on a
+// context the cancellation cannot reach.
+func TestWriterFlushesOnContextCancel(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	w := NewWriter(f, WriterOptions{BatchSize: 1000, FlushInterval: time.Hour}, discardLogger(), testMetrics())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	ts := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts)); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := f.rowsFor("cb_bars"); got != 1 {
+		t.Fatalf("expected the pending row to survive cancellation, got %d", got)
+	}
+}
+
+// A transient failure is retried; the rows are not lost.
+func TestWriterRetriesFailedBatch(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	f.failures = 2
+	f.failErr = errors.New("connection reset")
+
+	w, stop := startWriter(t, f, WriterOptions{
+		BatchSize:    1,
+		MaxAttempts:  3,
+		RetryBackoff: time.Millisecond,
+	})
+
+	ts := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts)); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := stop(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if got := len(f.snapshot()); got != 3 {
+		t.Fatalf("expected 3 send attempts, got %d", got)
+	}
+}
+
+// Exhausting the retries is fatal. A feed error degrades to staleness; a
+// database that will not take writes is an invariant violation, and Run says so
+// rather than dropping rows quietly (architecture section 8).
+func TestWriterFailsFatallyWhenRetriesAreExhausted(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	f.failures = 100
+	f.failErr = errors.New("connection refused")
+
+	w := NewWriter(f, WriterOptions{
+		BatchSize:    1,
+		MaxAttempts:  2,
+		RetryBackoff: time.Millisecond,
+	}, discardLogger(), testMetrics())
+
+	done := make(chan error, 1)
+	go func() { done <- w.Run(context.Background()) }()
+
+	ts := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts)); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	err := <-done
+	if err == nil {
+		t.Fatal("expected a fatal error after the retries were exhausted")
+	}
+	if !strings.Contains(err.Error(), "failed after 2 attempts") {
+		t.Fatalf("expected the error to name the attempts, got %v", err)
+	}
+	// Close reports the same failure to a caller that only holds the writer.
+	if closeErr := w.Close(); !errors.Is(closeErr, err) {
+		t.Fatalf("Close returned %v, want the run error %v", closeErr, err)
+	}
+}
+
+// Submitting after Close is refused rather than silently dropped or panicking on
+// a closed channel.
+func TestSubmitAfterCloseIsRefused(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	w, stop := startWriter(t, f, WriterOptions{})
+	if err := stop(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	ts := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts)); !errors.Is(err, ErrWriterStopped) {
+		t.Fatalf("Submit after Close returned %v, want ErrWriterStopped", err)
+	}
+}
+
+// The generated SQL is parameterized, names its columns, and carries the
+// conflict clause the idempotent tables need.
+func TestInsertStatement(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		row  Row
+		want string
+	}{
+		{
+			name: "plain insert",
+			row:  BaseStateRow{},
+			want: "INSERT INTO base_state (ts, spot_px, wallet_eth, wallet_usdc, gas_gwei) " +
+				"VALUES ($1, $2, $3, $4, $5)",
+		},
+		{
+			name: "idempotent insert",
+			row:  sampleBar("ETP-20DEC30-CDE", time.Now()),
+			want: "INSERT INTO cb_bars (ts, product_id, tf, open, high, low, close, volume, trade_count) " +
+				"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) " +
+				"ON CONFLICT (product_id, tf, ts) DO NOTHING",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := insertStatement(tc.row.row()); got != tc.want {
+				t.Errorf("insertStatement:\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
