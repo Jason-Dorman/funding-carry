@@ -93,11 +93,11 @@ cmd/ingest/          cmd/carry/          cmd/sim-venue/
 internal/ingest/     internal/venue/     internal/features/
 internal/pressure/   internal/carry/     internal/risk/
 internal/exec/       internal/fix/       internal/metrics/
-internal/treasury/   internal/db/
+internal/treasury/   internal/db/        internal/config/
 research/            deploy/             docs/
 ```
 
-`internal/db` is the shared persistence layer (pgx pool, batch writer, migrations). Everything else matches spec §6.11.
+`internal/db` is the shared persistence layer (pgx pool, batch writer, migrations). `internal/config` loads each binary's typed configuration from the environment ([API spec §7](api-spec.md#7-configuration-surface)) and is the one place that knows how a credential is redacted; `internal/metrics` owns each binary's Prometheus registry and its `/metrics` and `/healthz` endpoints. Everything else matches spec §6.11.
 
 ---
 

@@ -1,0 +1,40 @@
+# CI gate per docs/testing-strategy.md: lint plus unit tests under the race
+# detector, green on every push. Integration tests (build tag `integration`, run
+# against the Compose TimescaleDB) join from Part 2.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify formatting
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Vet
+        run: go vet ./...
+
+      # v9 is the first line of the action that supports golangci-lint v2, which
+      # is the schema .golangci.yml is written against. The version is pinned to
+      # the one used locally so CI and `make lint` cannot disagree about what
+      # passes; bump both together.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+      - name: Test
+        run: go test -race ./...

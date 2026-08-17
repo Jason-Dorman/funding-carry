@@ -1,0 +1,39 @@
+# Secrets and local configuration (spec section 9).
+# .env.private holds real thresholds, weights and credentials and must never be
+# committed; .env is a local working copy generated from .env.example by `make env`.
+.env
+.env.private
+.env.local
+*.pem
+*.key
+
+# Build output
+/bin/
+*.exe
+*.test
+coverage.out
+coverage.html
+
+# FIX sequence stores and message logs (Parts 7 and 8) — session state and
+# potentially live order detail.
+/deploy/fix/
+*.session
+
+# Local data directories
+/data/
+
+# Toolchain archives downloaded into the working tree
+/go*.tar.gz
+
+# Python (research/)
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Editor and OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

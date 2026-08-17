@@ -457,10 +457,11 @@ All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-
 
 ## 7. Configuration surface
 
-`.env` (public, synthetic placeholders) + `.env.private` (gitignored, real values). Loaded once at startup; the kill switch is the only runtime-mutable flag.
+`.env.example` (committed, synthetic placeholders) → `.env` (local working copy, gitignored, created by `make env`) + `.env.private` (gitignored, real values). Loaded once at startup; the kill switch is the only runtime-mutable flag.
 
 | Variable | Scope | Example (synthetic) |
 |---|---|---|
+| `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | deploy | `carry` / `carry` / `carry` — read by Compose and the provisioned Grafana datasource, not by the binaries |
 | `DATABASE_URL` | all | postgres://… |
 | `CB_API_URL`, `CB_WS_URL` | ingest, carry | `https://api.coinbase.com/api/v3/brokerage/` |
 | `ASSET` | all | `ETH` |
@@ -494,6 +495,18 @@ All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-
 | `SESSION_KEY_EXPIRY` | **private** | RFC3339; `baseVenue` refuses to start once past |
 | `SESSION_KEY_ALLOWANCE_USD`, `SESSION_KEY_ROUTER` | **private** | scope the grant; asserted at preflight |
 | `KILL_SWITCH` | carry | `false` |
+| `INGEST_METRICS_ADDR`, `CARRY_METRICS_ADDR`, `SIM_METRICS_ADDR` | ingest / carry / sim-venue | `:9101` / `:9102` / `:9103` — one per binary so all three can also run side by side on a host |
+| `LOG_LEVEL`, `LOG_FORMAT` | all | `info` / `json` (`text` when run outside a container) |
+
+`DATABASE_URL`, `PERP_PRODUCT_ID` and `SPOT_PRODUCT_ID` are required; everything else has a documented default. A load reports *every* problem it found at once rather than failing on the first, so a misconfigured deployment learns all of it in one restart.
+
+Three values fail the load rather than being checked at trade time, because a configuration that violates them must never reach a venue:
+
+- `INTRADAY_MARGIN_OPT_IN` true — intraday margin is never opted into in v1 (spec §9, architecture §12).
+- `MAX_LEVERAGE` above 3 or non-positive — the overnight cap.
+- `DELTA_TOLERANCE_ETH` above half of `CONTRACT_SIZE_ETH` — the spot leg can always close residual delta smaller than half a contract, so a wider tolerance would accept delta the system could have removed.
+
+Credentials are typed as a redacting `Secret` in `internal/config`: `%v`, `String()` and `slog` attributes all render `[REDACTED]`, and the value is reachable only through an explicit `Reveal()` at the point of use.
 
 ---
 
