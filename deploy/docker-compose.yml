@@ -1,0 +1,154 @@
+# The full stack: three Go services plus TimescaleDB, Prometheus, Grafana and
+# Alertmanager.
+#
+# Run it through the Makefile from the repository root (`make up`), which sets
+# --project-directory to the repo root so build contexts and .env paths resolve
+# there rather than in deploy/.
+name: delta-neutral
+
+# Shared by the three Go services. .env holds public synthetic values and is
+# required; .env.private holds real thresholds and credentials, is gitignored, and
+# is optional so the public stack starts without it.
+x-go-service: &go-service
+  build:
+    context: .
+    dockerfile: deploy/docker/Dockerfile
+  env_file:
+    - path: .env
+      required: true
+    - path: .env.private
+      required: false
+  depends_on:
+    timescaledb:
+      condition: service_healthy
+  restart: unless-stopped
+
+x-health-defaults: &health-defaults
+  interval: 10s
+  timeout: 5s
+  retries: 5
+  start_period: 15s
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+    healthcheck:
+      # Every other service waits on this: the schema is the contract between
+      # ingest, carry and research.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      <<: *health-defaults
+    restart: unless-stopped
+
+  ingest:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        SERVICE: ingest
+    ports:
+      - "9101:9101"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9101/healthz || exit 1"]
+      <<: *health-defaults
+
+  carry:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        SERVICE: carry
+    ports:
+      - "9102:9102"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9102/healthz || exit 1"]
+      <<: *health-defaults
+
+  sim-venue:
+    <<: *go-service
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        SERVICE: sim-venue
+    ports:
+      - "9103:9103"
+      # FIX 4.4 acceptor, listening from Part 7.
+      - "5001:5001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9103/healthz || exit 1"]
+      <<: *health-defaults
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9090/-/healthy || exit 1"]
+      <<: *health-defaults
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./deploy/alertmanager:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "9093:9093"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9093/-/healthy || exit 1"]
+      <<: *health-defaults
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      # Local-only stack; the login is not a secret worth protecting here, and
+      # anonymous viewing makes the demo script (Part 22) a single click.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # Read by the provisioned TimescaleDB datasource.
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/api/health || exit 1"]
+      <<: *health-defaults
+    restart: unless-stopped
+
+volumes:
+  timescale-data:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

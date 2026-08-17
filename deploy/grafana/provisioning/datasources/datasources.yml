@@ -1,0 +1,31 @@
+# Datasources are provisioned, not clicked together by hand: a fresh `make up`
+# has to come with working dashboards (Part 19 acceptance) and a cold reader has
+# to be able to reproduce them.
+apiVersion: 1
+
+datasources:
+  # Metrics: everything in docs/api-spec.md section 6.
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+
+  # The database itself: features, decisions with their input snapshots, fills and
+  # funding events are queried directly for the P&L and decision-log panels.
+  - name: TimescaleDB
+    uid: timescaledb
+    type: grafana-postgresql-datasource
+    access: proxy
+    url: timescaledb:5432
+    user: ${POSTGRES_USER}
+    database: ${POSTGRES_DB}
+    editable: false
+    secureJsonData:
+      password: ${POSTGRES_PASSWORD}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1700
+      timescaledb: true

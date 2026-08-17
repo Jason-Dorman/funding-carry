@@ -52,7 +52,7 @@ It runs real (small) size, and its wallet history is the audit trail.
 cmd/ingest, cmd/carry, cmd/sim-venue    service binaries
 internal/...                            ingest, venue, features, pressure,
                                         carry, risk, exec, fix, treasury,
-                                        metrics, db
+                                        metrics, db, config
 research/                               Python backtester, notebooks
 deploy/                                 Compose, Grafana, Prometheus, Alertmanager
 docs/                                   the documents below
@@ -79,13 +79,19 @@ docs/                                   the documents below
 make up        # full stack: services + TimescaleDB + Prometheus + Grafana + Alertmanager
 make migrate   # apply schema
 make test      # Go + Python suites
+make lint      # golangci-lint
 make replay    # 30-day backtest, refreshes Grafana
 ```
+
+`make up` creates `.env` from `.env.example` on first run and waits until all seven
+services report healthy. Grafana is on `:3000`, Prometheus on `:9090`, Alertmanager
+on `:9093`; the binaries expose `/metrics` on `:9101` (ingest), `:9102` (carry) and
+`:9103` (sim-venue).
 
 Configuration is env-based: `.env.example` documents every variable with synthetic placeholder values; real thresholds and credentials live in a gitignored `.env.private`.
 
 ## Status
 
-Pre-build: spec and documentation complete, build [Part 1](docs/build-plan.md#part-1--repo-scaffold-compose-stack-config) not yet started. The wallet track (manual carries) runs ahead of the code by design.
+[Part 1](docs/build-plan.md#part-1--repo-scaffold-compose-stack-config) complete (2026-08-16): repo scaffold, Compose stack, and typed configuration. `make up` brings all seven services to healthy, each binary serves `/metrics`, and Prometheus and Grafana are wired to them — the system is running and empty. Next: [Part 2](docs/build-plan.md#part-2--database-schema-migrations-writer-package), the schema and the one-writer persistence layer. The wallet track (manual carries) runs ahead of the code by design.
 
 *Personal project. Not investment advice; live size is deliberately tiny.*

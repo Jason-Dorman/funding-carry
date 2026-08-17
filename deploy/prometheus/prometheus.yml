@@ -1,0 +1,47 @@
+# Prometheus scrape configuration.
+#
+# Metric catalogue: docs/api-spec.md section 6. Alert rules arrive in Part 19 and
+# are loaded from alerts.yml via rule_files below.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    stack: delta-neutral
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  # Part 19 adds deploy/prometheus/alerts.yml; the glob keeps this file unchanged
+  # when it lands.
+  - /etc/prometheus/alerts*.yml
+
+scrape_configs:
+  - job_name: ingest
+    static_configs:
+      - targets: ["ingest:9101"]
+        labels:
+          service: ingest
+
+  - job_name: carry
+    static_configs:
+      - targets: ["carry:9102"]
+        labels:
+          service: carry
+
+  - job_name: sim-venue
+    static_configs:
+      - targets: ["sim-venue:9103"]
+        labels:
+          service: sim-venue
+
+  # Prometheus scrapes itself so "is the monitoring up" is answerable from the
+  # same place as everything else.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          service: prometheus

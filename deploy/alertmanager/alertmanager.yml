@@ -1,0 +1,15 @@
+# Alertmanager routing.
+#
+# Part 1 ships the minimum valid configuration so the service starts and
+# Prometheus has somewhere to send alerts. Part 19 adds the real routes for the
+# rules in docs/api-spec.md section 6 — the hard-stop and margin-ratio alerts are
+# the ones that need to reach a human rather than a log.
+route:
+  receiver: default
+  group_by: [alertname, service]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 3h
+
+receivers:
+  - name: default

@@ -1,0 +1,54 @@
+# golangci-lint v2 configuration. Run with `make lint`.
+#
+# The linter set enforces the project's engineering rules mechanically where it
+# can: wrapped errors rather than log-and-continue, no unchecked returns, and a
+# complexity ceiling matching docs/engineering-principles.md.
+version: "2"
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - bodyclose     # HTTP response bodies closed: leaks show up as stuck feeds
+    - copyloopvar
+    - errorlint     # errors compared with errors.Is/As, wrapped with %w
+    - gocyclo
+    - gosec
+    - misspell
+    - nilerr        # never return nil after checking a non-nil error
+    - noctx         # no HTTP requests without a context: cancellation must flow
+    - revive
+    - unconvert
+    - wastedassign
+
+  settings:
+    gocyclo:
+      # docs/engineering-principles.md: under 10, 5 is the target.
+      min-complexity: 10
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # readability of config structs beats packing bytes
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+
+  exclusions:
+    generated: lax
+    rules:
+      # Test helpers legitimately do things production code should not.
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/jasondorman/delta-neutral
