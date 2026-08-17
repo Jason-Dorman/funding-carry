@@ -33,8 +33,12 @@ logs: ## Follow logs from all services
 build: ## Compile all binaries
 	$(GO) build ./...
 
+# -count=1 disables the test cache. internal/guard type-checks the whole module,
+# and the cache cannot see that its result depends on every other package:
+# without it the guard keeps reporting a stale pass after a violation is
+# introduced elsewhere.
 test: ## Run the Go test suite with the race detector
-	$(GO) test -race ./...
+	$(GO) test -race -count=1 ./...
 
 lint: ## Run golangci-lint
 	golangci-lint run

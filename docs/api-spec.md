@@ -176,7 +176,9 @@ type TargetPosition struct {
 The perp leg is an **integer contract count** (contract size 0.10 ETH), sized by flooring toward zero; the spot leg is continuous and absorbs the remainder, so `ResidualDelta` is always under half a contract. Sizing helper:
 
 ```go
-// ContractsForNotional floors toward zero — never round up into more risk.
+// ContractsForNotional truncates toward zero — never round up into more risk.
+// Use Truncate/IntPart, NOT Floor: a short is a negative contract count, and
+// Floor(-7.9) is -8, which is MORE short exposure, not less.
 func ContractsForNotional(notionalUSD, mark, contractSize decimal.Decimal) int64
 ```
 
@@ -193,7 +195,21 @@ type PressureOut struct {
 }
 ```
 
-### 3.5 Ingest channel messages
+### 3.5 Decimal rules
+
+Money is `decimal.Decimal` in Go and `numeric` in SQL, end to end (spec §11). The library has three behaviors that are silent when violated, so each has an enforcement mechanism rather than a convention:
+
+| Rule | Why | Enforced by |
+|---|---|---|
+| Never `==` or `!=` on a `decimal.Decimal` — use `Equal` | `Decimal` is a struct holding a `*big.Int`, so `==` compiles and compares representation. It is false even for two decimals parsed from the same string, which makes `x == decimal.Zero` a check that can never fire | `internal/guard` (type-aware AST test over the whole module) |
+| Never construct a decimal from a float (`NewFromFloat*`) | The only path by which binary rounding error enters. Values come from strings, integers, or the database | `internal/guard` |
+| Truncate toward zero when quantizing contracts, never `Floor` | A short is a negative contract count; `Floor(-7.9) = -8` rounds *up* into more risk | table test with negative cases, build plan Part 13 |
+
+`Add`, `Sub` and `Mul` are exact at arbitrary precision. `Div` is not: it rounds to `decimal.DivisionPrecision`, a mutable package global pinned to 16 by `internal/config`'s `init` so division is identical across processes, tests and replays. Division is for **ratios** (margin ratio, basis, premium proxy); a value that must reconcile against a venue statement is added and multiplied, never divided.
+
+For display, `String()` drops trailing zeros (`0.10` renders as `0.1`). Anything money-facing — reports, dashboards, reconciliation output — uses `StringFixed(n)`.
+
+### 3.6 Ingest channel messages
 
 One struct per stream (`MidTick`, `BookSnap`, `TradeBatch`, `CandleClose`, `VenueSample`, `BaseSample`), each carrying venue timestamp + receive timestamp (for staleness and latency measurement). All flow into the writer's fan-in `select`; the writer owns mapping structs → batched inserts.
 

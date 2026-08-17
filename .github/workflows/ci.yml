@@ -36,5 +36,7 @@ jobs:
         with:
           version: v2.12.2
 
+      # -count=1 matches `make test`: internal/guard depends on every package in
+      # the module, which the test cache cannot represent.
       - name: Test
-        run: go test -race ./...
+        run: go test -race -count=1 ./...
