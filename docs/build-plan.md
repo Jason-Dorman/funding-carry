@@ -1,0 +1,371 @@
+# Build Plan — Basis Carry System
+
+**Source of truth:** [`basis-carry-build-spec.md`](basis-carry-build-spec.md) (v3.1)
+**Companion docs:** [Architecture](architecture.md) · [API Spec](api-spec.md) · [PRD](prd.md) · [Venue Facts](venue-coinbase-perps.md)
+
+This is the execution document. The build is decomposed into **numbered parts** small enough to complete and review in one sitting, sequenced so every part starts with its dependencies already merged. Each part lists objective, deliverables (file-level), tasks, acceptance criteria, and tests. Point at a part ("do Part 7") and it should be executable from this document plus the spec, without re-deriving design.
+
+Working rules for every part (spec §1–2):
+
+- AI writes the code; **every diff is read before commit**. Anything unexplainable is rewritten.
+- Go services, Python research. Idiomatic patterns are deliverables in themselves: one writer goroutine, `context` cancellation through the stack, consumer-defined interfaces, error wrapping (not log-and-continue) except on feed loops, graceful shutdown.
+- Public/private split respected from Part 1 (`.env.private` gitignored before any secret exists).
+- Prices and quantities are `decimal`/`numeric` end to end — no float money.
+
+---
+
+## Part index and dependencies
+
+```mermaid
+graph TD
+    P1[P1 scaffold + compose] --> P2[P2 DB schema + writer pkg]
+    P1 --> P3[P3 Go onramp toy]
+    P2 --> P4[P4 CB WS ingest]
+    P2 --> P5[P5 REST poller + funding estimator]
+    P2 --> P6[P6 Base poller]
+    P4 --> P7[P7 sim-venue acceptor]
+    P7 --> P8[P8 FIX initiator + Venue iface]
+    P4 --> P9[P9 venue state cache]
+    P5 --> P9
+    P6 --> P9
+    P9 --> P10[P10 feature engine]
+    P10 --> P11[P11 pressure engine]
+    P11 --> P12[P12 decision engine - advisory]
+    P12 --> P13[P13 risk engine + kill switch]
+    P8 --> P14[P14 paper engine]
+    P10 --> P14
+    P13 --> P15[P15 execution router wiring]
+    P14 --> P15
+    P15 --> P16[P16 cbVenue live]
+    P15 --> P17[P17 baseVenue live]
+    P16 --> P18[P18 treasury]
+    P17 --> P18
+    P5 --> P19[P19 dashboards + alerts]
+    P15 --> P19
+    P10 --> P20[P20 backtester / replay]
+    P15 --> P21[P21 hardening + chaos tests]
+    P18 --> P21
+    P19 --> P22[P22 public artifact + demo]
+    P20 --> P22
+    P21 --> P22
+```
+
+Mapping to spec §10 weeks: P1–P3 ≈ wk 0, P4–P6 ≈ wk 1, P7–P8 ≈ wk 2, P9–P12 ≈ wk 3, P13–P15 ≈ wk 4, P16–P18 ≈ wk 5, P19–P20 ≈ wk 6, P21–P22 ≈ wk 7–8.
+
+**Parallel wallet track (manual, not code — never blocked by parts; procedure and log template in the [manual carry playbook](manual-carry-playbook.md)):** wk 0a wallet bootstrap → wk 0b manual carry #1 (the reference sequence) → manual carry #2 opened wk 1, closed wk 2 → manual carry #3 timed by Part-12 advisory signals wk 3 → first automated cycle after P16–P17 → continuous small-size after P19. If a part slips, the week's manual carry still happens.
+
+---
+
+## Phase A — Foundations (wk 0)
+
+### Part 1 — Repo scaffold, Compose stack, config
+
+**Objective:** a running empty system: three placeholder binaries, full infra stack, config loading, metrics endpoints.
+
+**Deliverables**
+- `go.mod` (single module), layout: `cmd/{ingest,carry,sim-venue}`, `internal/{ingest,venue,features,pressure,carry,risk,exec,fix,metrics,treasury,db}`, `research/`, `deploy/`, `docs/`.
+- `deploy/docker-compose.yml`: `ingest`, `carry`, `sim-venue`, `timescaledb`, `prometheus`, `grafana`, `alertmanager`; Dockerfiles; Prometheus scrape config for all three binaries.
+- `Makefile`: `up`, `down`, `test`, `lint`, `migrate`, `replay` (stub).
+- `internal/metrics`: Prometheus registry + `/metrics` HTTP server helper used by all binaries.
+- Config loader (env → typed struct per binary), `.env.example` with every variable from [API spec §7](api-spec.md#7-configuration-surface) (synthetic values), `.gitignore` covering `.env.private`, FIX stores/logs, data dirs.
+- Logging: stdlib `log/slog`, JSON in containers.
+- `golangci-lint` config; CI stub optional.
+
+**Acceptance**
+- `make up` → all 7 services healthy; each binary serves `/metrics`; Grafana reaches Prometheus and TimescaleDB datasources.
+- `make lint` and `make test` pass (trivially).
+
+### Part 2 — Database schema, migrations, writer package
+
+**Objective:** the full v1 schema and the shared one-writer persistence layer.
+
+**Deliverables**
+- `internal/db/migrations/*.sql`: every hypertable and state table from [API spec §5](api-spec.md#5-database-schema), TimescaleDB extension + hypertable creation, indexes on `(coin, ts desc)` for series tables; `make migrate` applies (golang-migrate or equivalent).
+- `internal/db`: pgx pool setup; `Writer` — a goroutine owning batched inserts fed by a channel of typed rows (interval + size flush triggers, per-table batches); insert helpers per table; graceful `Close` that flushes.
+- Seed: `cb_products` row for the perp product (placeholder contract size / tick until Part 5 fills it from the products endpoint).
+- Includes `cb_account_state` (polled margin/balance snapshot) and the `funding_events.kind` accrual-vs-settlement split — both are load-bearing for reconciliation, not later additions.
+
+**Acceptance**
+- Fresh `make up && make migrate` creates all tables; hypertables confirmed via `timescaledb_information`.
+- Writer test: 10k rows across 3 tables through one writer, all persisted, one flush on close, no goroutine leaks (`goleak`).
+
+### Part 3 — Go onramp toy *(hand-written first — collaborative part)*
+
+**Objective:** spec wk-0 learning exercise: Jason hand-writes it, then it is refactored with review. Not production code; lives in `research/onramp/` or a branch.
+
+**Scope:** two goroutines read a fake WS feed, fan into a channel, one writer inserts to Postgres via pgx, `/metrics` exposed. Read *Go by Example*: goroutines, channels, `select`, `context`, errors, interfaces.
+
+**Acceptance:** it runs; the refactor diff is read and each change explainable. This part is **pointed at explicitly by Jason when he's written his version** — do not pre-write it.
+
+---
+
+## Phase B — Ingestion (wk 1)
+
+### Part 4 — Coinbase WS ingest
+
+**Objective:** live ETH market data flowing into TimescaleDB with reliability plumbing.
+
+**Deliverables**
+- `internal/ingest/ws.go` + per-channel handlers: `ticker`, `level2`, `market_trades`, `candles` (1m), `status` — subscribed for both the perp product and the spot reference product, one goroutine each, typed channel out ([API spec §3.5](api-spec.md#35-ingest-channel-messages) message structs). JWT refreshed before expiry and on reconnect.
+- Reconnect loop per stream: exponential backoff + jitter, resubscribe, `ingest_ws_reconnects_total`.
+- Gap detection per stream (candle-time discontinuity, trade-time regression, silence threshold) → `ingest_ws_gaps_total`; `ingest_last_seen_timestamp_seconds` gauge per stream.
+- Persistence policy: completed candles → `cb_bars`; top-N book snapshot every `BOOK_SNAP_SECS` (with imbalance + impact px) → `cb_book_snapshots`; trade aggregates per bucket → `cb_trades_agg` (these feed the 3-minute VWAP marks the funding estimator needs); mids and marks sampled into `cb_venue_state` alongside Part-5 sampling.
+- `cmd/ingest` wiring: root context, signal handling, graceful shutdown (cancel → drain → writer flush → close).
+- **[verify]** live WS payload shapes and that every channel accepts the perp product id; adjust structs. Close the relevant `TODO(verify)` items in [venue-coinbase-perps.md](venue-coinbase-perps.md).
+
+**Acceptance**
+- 1h run: rows accruing in all four tables; zero writer errors; kill -TERM flushes cleanly.
+- Pull network mid-run: reconnect metric increments, streams resume, gap recorded.
+- Unit tests with a fake WS server: reconnect, gap detection, candle-close-only persistence.
+
+### Part 5 — REST poller, funding estimator, backfill
+
+**Objective:** the funding / futures-mark / spot-mark series — the system's primary asset — recorded, computed where the venue does not publish it, and backfilled.
+
+**Deliverables**
+- REST poller goroutine (`POLL_REST_SECS`): products endpoint → `cb_products` upsert (contract size, tick, status, fee tier, max leverage); market data → `cb_venue_state` rows (futures_mark, spot_mark, mid, premium_proxy, spread, OI, maintenance flag).
+- **Local funding-rate estimator** (the headline of this part): 3-min futures mark (VWAP, mid-TWAP fallback) and spot mark, 1-hour TWAP of `(futures_mark − spot_mark)/spot_mark/24`, then `0.75 × premium + 0.25 × previous`. Writes `funding_rate_est` hourly; sets `funding_rate_hourly` from the venue if it publishes one, else copies the estimate and sets `funding_source='computed'`. No rate is written for the Friday maintenance hour — that hour is a gap, not a zero.
+- Observed funding ledger: hourly-boundary rows into `funding_events` (position_id NULL).
+- Backfill: on first run (empty table), pull `fundingHistory` as far back as the API allows; idempotent on re-run.
+- `cfm/balance_summary` and `cfm/positions` polls → **`cb_account_state`** rows (`available_margin`, `liquidation_threshold`, derived `margin_ratio`, CBI/CFM balances, buying power, contracts held, avg entry, unrealized P&L). This table is what the risk engine reads margin ratio from and what treasury reconciles against. Assert intraday margin is **off** via `cfm/intraday/margin_setting` and record it on the row.
+- Decision point (open item #1): read the CDP JWT auth flow and any community Go package; **record the client decision (hand-rolled vs community) in this doc's changelog and an ADR before Part 16.** No official Go SDK exists.
+
+**Acceptance**
+- `cb_venue_state` rows every poll tick with plausible marks and funding; funding/candle history backfilled as far as the API allows (record the depth actually available).
+- Estimator sanity: over a 24h window the computed hourly series is stable, bounded, and — if the venue publishes a rate — tracks it within a documented tolerance.
+- `cb_account_state` rows accrue every poll and match the account UI at a spot check; `intraday_margin_enabled` reads false.
+- Funding rows are written as `kind='ACCRUAL'`; an observed cash adjustment writes a `kind='SETTLEMENT'` row and links the accruals it cleared.
+- Backfill re-run inserts nothing new. Poller failure degrades to staleness, never crashes the binary.
+
+### Part 6 — Base poller
+
+**Objective:** the spot side of the book: wallet balances, reference price, gas.
+
+**Deliverables**
+- `internal/ingest/base.go`: poll (`POLL_BASE_SECS`) wallet ETH via `eth_getBalance`, USDC via `balanceOf`, `eth_gasPrice`, ETH/USDC reference px (DEX aggregator quote; Coinbase spot as configured fallback) → `base_state`.
+- Wallet address from config; works against any address (use the named wallet).
+
+**Acceptance:** `base_state` rows accruing with correct balances (cross-checked against a block explorer once); RPC failure → staleness, not crash.
+
+---
+
+## Phase C — Order entry (wk 2)
+
+### Part 7 — sim-venue (FIX acceptor)
+
+**Objective:** the exchange simulator: quickfixgo acceptor with a realistic fill model.
+
+**Deliverables**
+- `cmd/sim-venue` + `internal/fix/acceptor`: FIX 4.4 acceptor per [API spec §4](api-spec.md#4-fix-44-specification) (session settings, FileStore, FileLog).
+- Message handling: NOS (D) → ExecutionReport(NEW) then fill reports; OrderCancelRequest (F) → ER(CANCELED) or OrderCancelReject (9); malformed → Reject (3).
+- Fill model: fills against last top-of-book read from TimescaleDB; configurable latency (jittered), slippage bps, partial fills above `SIM_PARTIAL_THRESHOLD` (N slices); deterministic under seed.
+- Fills persisted to `fills` (venue='sim'); session state to `fix_sessions`; `fix_*` metrics.
+
+**Acceptance**
+- Bring-up with a scripted FIX client: D→8(NEW)→8(FILLED) round trip; oversized order produces partials summing to full qty; cancel works both pre-fill and mid-partial.
+- Restart sim-venue: sequence numbers persist, session resumes without reset.
+
+### Part 8 — FIX initiator + `Venue` interface
+
+**Objective:** `carry`'s order-entry stack: the interface every venue implements, the exec-report state machine, and the FIX implementation.
+
+**Deliverables**
+- `internal/carry/venue.go`: `Venue` interface + `Order`/`Ack`/`ExecReport` types exactly per [API spec §3](api-spec.md#3-internal-go-contracts).
+- `internal/exec/statemachine.go`: order-state tracking (NEW→PARTIAL→FILLED|CANCELED|REJECTED), CumQty-monotonic sequencing, idempotent duplicates, per-order timeout.
+- `internal/fix/initiator.go`: `fixVenue` — quickfixgo initiator, Order→NOS mapping, ER→ExecReport mapping, session-state metric, ClOrdID = ULID.
+- Round-trip latency histogram (`carry_order_roundtrip_seconds`).
+
+**Acceptance** *(spec wk-2 done-when)*
+- `carry` (temporary CLI trigger) sends NOS → sim-venue → ExecReports arrive on the channel, state machine terminal.
+- **Kill and restart `carry` mid-session: sequence numbers survive, resend recovery completes, no ExecReport lost** — proven by a test that fills while the initiator is down.
+- Unit tests: state machine transitions incl. out-of-order and duplicate reports.
+
+---
+
+## Phase D — The brain (wk 3)
+
+### Part 9 — Venue state cache
+
+**Objective:** `carry`'s read model: latest venue + wallet state refreshed from TimescaleDB on a ticker (same read path live and replay — architecture §2).
+
+**Deliverables**
+- `internal/venue/state.go`: cache struct per spec §6.2 (funding now and estimated next, futures mark, spot mark, mid, premium proxy, spread bps, contract size, margin ratio, leverage/max leverage, tick, fee tier, OI, maintenance-window flag; Base inventory, gas, venue status flags); `Refresh(ctx)` pulling latest rows; staleness computed per source.
+- Staleness exposed as typed flags (`FeedOK`, per-stream ages) consumed later by risk.
+
+**Acceptance:** with ingest running, cache refresh returns current values in <50ms; with ingest stopped, staleness flags trip at `STALE_FEED_SECS`. Unit tests against seeded DB rows.
+
+### Part 10 — Feature engine
+
+**Objective:** Tier 1–3 + risk features computed each tick and persisted.
+
+**Deliverables**
+- `internal/features/`: computation per spec §6.3 — Tier 1 (funding_rate_hourly, funding_rate_est, funding_source, funding_annualized, funding_zscore over rolling window, cumulative_funding, expected_carry_N_hours, futures_mark, spot_mark, basis, trade_premium, time_to_next_funding), Tier 2 (spread bps, ToB imbalance, impact imbalance, trade imbalance, sweep intensity, mid-vs-mark, slippage estimate), Tier 3 (log returns, EMAs, ATR, realized vol, VWAP, momentum slope), risk features (margin ratio at current + proposed size, effective leverage, net delta, residual delta, contracts held, notional).
+- Rolling windows fed from DB history at startup (warm start), then incrementally.
+- Persist full row to `cb_features` each tick; tick driver in `cmd/carry` (fast ticker + funding-boundary alignment).
+- Formula fidelity to spec §8 table; window lengths and all bands from config.
+
+**Acceptance** *(spec wk-3 done-when, first half)*
+- `cb_features` rows land every tick with all columns non-null (Tier gaps explicit as NULL where data insufficient, e.g. z-score before window fills).
+- Golden tests: fixed input series → expected feature values (hand-computed fixtures).
+- Z-score after restart matches z-score without restart (warm-start correctness).
+
+### Part 11 — Funding-pressure engine
+
+**Objective:** the brain's summary judgment per spec §6.4.
+
+**Deliverables**
+- `internal/pressure/`: inputs funding_rate, funding_zscore, cumulative_funding, basis, imbalance → `PressureOut{crowded_side, pressure_level, expected_pain, exhaustion_flag}`; z-band mapping (|z|<1 / 1–2 / 2–3 / ≥3 → NORMAL/ELEVATED/EXTREME/FORCED); pressure score `w1·z + w2·cum + w3·basis` with weights from config.
+- Outputs appended to the `cb_features` row + `carry_pressure_level` metric.
+
+**Acceptance:** table-driven tests covering each band and the exhaustion condition (|imbalance| > threshold AND momentum slope flattening); visible in Grafana explore.
+
+### Part 12 — Decision engine (advisory mode)
+
+**Objective:** ENTER/HOLD/REBALANCE/EXIT/BLOCKED per spec §8, emitted and persisted — **advisory only**: signals logged and alerted, human executes (this times manual carry #3).
+
+**Deliverables**
+- `internal/carry/decision.go`: rule evaluation exactly per spec §8 v1 rules; closed reason-code enum; `TargetPosition` emission on funding ticks + risk events; sizing per §8 (perp `min(notional_cap, margin_avail × leverage)/mark`, spot to net delta ≈ 0).
+- Persist every decision to `decisions` with full `input_snapshot` JSON.
+- Advisory surface: decision-state metric, log line, and an Alertmanager route for ENTER/EXIT transitions (so a human can act on it).
+
+**Acceptance** *(spec wk-3 done-when, second half)*
+- Replaying a seeded day of features produces a deterministic, explainable decision sequence; every §8 rule reachable in table-driven tests (one test per reason code).
+- Two identical runs over the same data → identical decisions (reproducibility NFR).
+
+---
+
+### Research task R1 — carry break-even study *(before Part 13; notebook, not code)*
+
+**Question:** at 0.10 ETH per contract and `k ≥ 2`, how many hours of positive funding does one carry need to clear round-trip perp fees, DEX slippage, and gas?
+
+**Why it gates Part 13:** costs are a one-time round-trip toll while funding accrues hourly, so break-even time is set by cost-rate vs funding-rate — it is **independent of position size** (only gas is fixed, and on Base it is small). The lever is therefore `CARRY_HORIZON_HOURS`, not `MAX_NOTIONAL_USD`. Set the horizon too short and the ENTER rule is arithmetically unsatisfiable at any size; the engine would look healthy and simply never trade.
+
+**Deliverable:** a notebook computing break-even hours across fee/slippage scenarios and funding APRs, using the fee tier and contract spec confirmed in Part 5 (venue doc `TODO(verify)`), plus the realized slippage and gas from manual carries #1–#3. Output: a recommended `CARRY_HORIZON_HOURS`, and the funding APR below which entering is never worth it (a candidate `z_enter` floor).
+
+**Also check:** whether the EXIT rule (`funding_z ≤ z_exit`) tends to fire *before* break-even at that horizon. If it does, entry and exit thresholds are fighting each other and one of them needs to move — better to learn that in a notebook than from a month of tiny realized losses.
+
+---
+
+## Phase E — Risk and paper (wk 4)
+
+### Part 13 — Risk engine + hard stops + kill switch
+
+**Objective:** the only component allowed to emit orders; everything that can flatten the book.
+
+**Deliverables**
+- `internal/risk/`: position/delta/residual-delta/notional/margin-ratio/accrued-and-pending-funding/P&L-split state (from fills + funding_events + marks + balance summary); pre-trade checks (FR-4.2) including the maintenance-window guard and the "at least one whole contract affordable" test; hard stops (FR-4.3, margin-ratio floor replacing any liquidation-price estimate) → flatten + `risk_events` row + alert; rebalance trigger on |residual delta| > tolerance, trimmed on the spot leg; daily loss limit with UTC day roll.
+- Contract quantization helper: desired notional → whole contracts, flooring toward zero; spot target derived from the resulting contract count.
+- Intent → approved order deltas: converts `TargetPosition` into leg orders (spot-first on entry, perp-first on exit sizing per unwind safety), or BLOCKED with reason.
+- Kill switch: config flag + SIGUSR-style runtime trigger → cancel all, flatten, halt all venues; engaged state metric.
+- Persistence to `positions`, `fills` linkage, `funding_events` (position-linked), `risk_events`.
+
+**Acceptance** *(spec wk-4 done-when, risk half)*
+- Every hard stop demonstrated firing in tests (seeded conditions per stop); flatten orders generated correctly from arbitrary open state.
+- Kill switch test: with open paper position and resting orders → everything canceled, flattened, submissions refused until reset.
+- Restart with open position: state rebuilt from DB matches pre-restart state exactly.
+
+### Part 14 — Paper engine
+
+**Objective:** the second `Venue`: realistic fills for both legs without a network.
+
+**Deliverables**
+- `internal/exec/paper.go`: implements `Venue` for perp + spot legs per FR-5.3 — perp orders quantized to whole contracts; marketable orders consume recorded book depth; passive orders queue-aware slippage; maker/taker fees from `cb_products`; funding accrued hourly (`contracts × contract_size × mark × funding_rate`) into `funding_events` and cash-settled on the venue's twice-daily schedule (`settled_at`); unrealized P&L on futures mark; spot leg vs `base_state.spot_px` + configured DEX slippage + gas.
+- Fills → `fills` (venue='paper'); positions bucket venue='paper'.
+
+**Acceptance:** scripted scenario test — enter carry, hold across 3 funding boundaries, exit — produces hand-checkable P&L decomposition (price/funding/fees/slippage each verified); partial-fill behavior on thin seeded books.
+
+### Part 15 — Execution router wiring (full loop)
+
+**Objective:** close the loop: decisions drive orders through both FIX and paper simultaneously; this is spec wk-4's headline.
+
+**Deliverables**
+- `internal/exec/router.go`: routes approved orders to configured venues (perp leg → fixVenue and/or paperVenue; spot leg → paper), merges ExecReport streams into risk state; leg-sequencing (spot-first entry, timeout unwind) per architecture §6.4.
+- `cmd/carry` final wiring: state cache → features → pressure → decision → risk → router, all under one root context, graceful shutdown order per architecture §8.
+- Config: advisory / paper / sim / live mode switch per leg.
+
+**Acceptance** *(spec wk-4 done-when)*
+- End-to-end soak on live data (paper + sim): decisions → orders → fills → delta tracked ≈ 0; runs 24h unattended; hard stop injected mid-soak flattens both paths.
+- Leg-failure drill: sim-venue configured to reject perp leg → spot leg unwound within timeout, risk event recorded.
+
+---
+
+## Phase F — Live (wk 5) — *gated on Part 13 & 15 acceptance*
+
+> Live parts sign real transactions from the named wallet. Notional cap hard-coded low. Credentials only in `.env.private`. The manual carries (wallet track) have already exercised every step by hand — the code reproduces the reference sequence from wk 0b.
+
+### Part 16 — `cbVenue` (Coinbase live adapter)
+
+**Deliverables**
+- `internal/exec/cb.go`: `Venue` impl over Advanced Trade — CDP JWT auth (per the Part-5 client decision), order place/cancel with tick rounding and **integer contract sizes**, client order id = ClOrdID, fills via WS `user` channel → ExecReports; leverage ≤ 3× overnight enforced and intraday opt-in asserted off; maintenance-window guard; kill-switch check before every submit.
+- Reconciliation: positions and margin from `cfm/positions` + `cfm/balance_summary` vs internal state; divergence → risk event. Funding actually applied vs accrued → `carry_funding_reconciliation_error`.
+
+**Acceptance:** full order lifecycle exercised at minimum size (place, partial where reachable, cancel, reject) — a far-from-market limit order proves place/cancel without taking risk; then one tiny real round trip in the perp product; positions, margin ratio, and funding accrual all reconcile against the venue. Fractional-contract submission is rejected by our own guard before it reaches the API.
+
+### Part 17 — `baseVenue` (Base spot live adapter)
+
+**Deliverables**
+- **Session-key provisioning first, as its own reviewed step:** create the key from the owner wallet on-chain — scoped to the DEX router, capped allowance, explicit expiry — recording address, scope, allowance, and expiry in `.env.private`. This is a wallet operation the PO performs, and it is itself a legible on-chain event under the ENS name.
+- `internal/exec/base.go`: `Venue` impl — USDC↔ETH swap via DEX aggregator (per wk-4 decision, open item #2) from the Alchemy Smart Wallet: build swap calldata, wrap in UserOp, sign with session key, Gas Manager sponsorship, submit via bundler RPC, receipt → ExecReport with effective px + gas; slippage bound from config; kill-switch gated.
+- Session-key preflight: refuse to construct `baseVenue` with a missing or past `SESSION_KEY_EXPIRY`, and re-check before every submit; export `carry_session_key_expiry_timestamp_seconds` and wire the `SessionKeyExpiring` alert (7 days out). A lapsed key must fail loudly, never as an opaque bundler error mid-carry.
+
+**Acceptance:** Base Sepolia swap round trip; then one tiny mainnet swap from the named wallet; effective price within slippage bound; receipt persisted. **Expiry drill:** with the expiry set in the past, `baseVenue` refuses to start with a clear error and the perp leg is never opened one-sided; with expiry inside 7 days, `SessionKeyExpiring` fires.
+
+### Part 18 — Treasury reconciliation
+
+**Deliverables**
+- `internal/treasury/`: balance reconciliation across the Coinbase spot (CBI) account, futures (CFM) margin account, and the Base wallet, reading `cb_account_state`. Four tracked transitions, each with its own timeout from config per [spec §6.8](basis-carry-build-spec.md#68-treasury-internaltreasury--week-5): CBI→CFM auto-transfer (`TREASURY_TRANSFER_TIMEOUT`), CFM→CBI sweep (`TREASURY_SWEEP_TIMEOUT`), funding cash adjustment vs expected settlement time (`TREASURY_SETTLEMENT_TIMEOUT`), Base tx submitted→confirmed (`TREASURY_BASE_TX_TIMEOUT`). Breach or mismatch → risk event + alert; a missed settlement also feeds `carry_funding_reconciliation_error`. Snapshot table + metrics.
+
+**Acceptance:** a deliberate test transfer between Coinbase spot and futures margin, and a Base wallet funding move, each tracked through every state; a funding settlement observed and reconciled; a synthetic mismatch (edited row) alarms. **Milestone: first fully automated carry entry + exit** — spot leg via P17 (on-chain from the named wallet), perp via P16, tracked by treasury.
+
+---
+
+## Phase G — Observe and validate (wk 6)
+
+### Part 19 — Dashboards + alert rules
+
+**Deliverables**
+- `deploy/grafana/`: provisioned four-panel dashboard per spec §6.9 — (1) funding & basis, (2) position & delta, (3) P&L decomposition by venue bucket, (4) system health (staleness, gaps, FIX state, round-trip latency); headline stat: *"Who is paying whom, how much, and is the crowd getting exhausted?"*
+- `deploy/prometheus/alerts.yml`: the six rules from [API spec §6](api-spec.md#6-prometheus-metrics); Alertmanager routing (start: log/webhook receiver).
+
+**Acceptance:** dashboards render from provisioning on fresh `make up`; each alert proven by inducing its condition (stop ingest → FeedStale, etc.).
+
+### Part 20 — Backtester / replay
+
+**Deliverables**
+- `research/backtest/`: Python (polars/duckdb) chronological replay per FR-8; same decision rules imported as config-parity (thresholds read from the same env); funding at hourly boundaries; report per FR-8.2; results → `bt_runs`/`bt_results` for Grafana.
+- `make replay`: 30 days end-to-end + dashboard refresh.
+- Parity check: replay over a period the paper engine also traded → decisions match.
+
+**Acceptance** *(spec wk-6 done-when)*: `make replay` runs 30 days clean; **PnL decomposition matches on-chain reality for the live book** within tolerance (fees/gas exact, slippage modeled); acceptance rule wired: report prints ACCEPTED/REJECTED per the profitable-after-costs rule.
+
+---
+
+## Phase H — Hardening and artifact (wk 7–8)
+
+### Part 21 — Hardening + chaos tests
+
+**Deliverables**
+- Fault-injection test suite: WS drop/flap mid-decision, DB outage (writer backpressure), FIX disconnect mid-partial-fill, sim-venue reject storms, cancel/replace races, clock-skew on funding boundary, maintenance-window entry and exit, funding-settlement reconciliation mismatch, crash-restart during an open live position.
+- Fixes for everything found; runbook notes in `docs/runbook.md` (new): start/stop, kill switch, manual flatten, credential rotation, "feed is stale" triage.
+- Optional (open item #3): investigate Coinbase Exchange FIX sandbox for spot leg; record findings; wire initiator config if viable.
+
+**Acceptance:** chaos suite green in CI/`make test`; 1-week continuous run at small size with zero unexplained alerts.
+
+### Part 22 — Public artifact + demo
+
+**Deliverables**
+- Public/private scrub: verify no real thresholds/credentials in history; synthetic `.env.example` complete; `positions`/P&L exports excluded.
+- README finalized: wallet address (ENS + .base.eth), architecture diagram, demo script (`docs/demo.md`): 10-minute walkthrough — dashboard tour, a decision row with its snapshot, FIX resend demo, kill-switch demo, wallet-history walkthrough matching on-chain reality.
+- Interview-surface checklist (spec §11) — each item mapped to where it's demonstrable in the repo/system.
+
+**Acceptance:** a cold reader can run `make up`, follow the demo script, and audit the wallet against the decision log.
+
+---
+
+## Changelog / decision record
+
+Record here as parts complete (date, part, decisions made, deviations from plan). This is the chronological index; anything structural also gets an ADR in [`decisions/`](decisions/README.md). Test conventions for all parts: [testing strategy](testing-strategy.md).
+
+- *2026-08-16 — plan created from spec v3.0. Open decisions pending: Base spot venue (before P17, wk-4), FIX beyond sim-venue (P21).*
+- *2026-08-16 — **CHANGE-001 applied**: perp venue migrated from Hyperliquid to Coinbase US perpetual-style futures. See [CHANGELOG](../CHANGELOG.md) and [ADR-0009](decisions/0009-perp-venue-coinbase.md). Adds contract quantization, local funding estimator, margin-ratio hard stop, and the Friday maintenance guard across P5, P9–P16. Open decision: Advanced Trade Go client (hand-rolled vs community, before P16, informed in P5).*
+- *2026-08-16 — ADRs 0001–0008 backfilled for decisions already embedded in spec/architecture; testing strategy and manual carry playbook added.*
