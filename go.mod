@@ -1,4 +1,4 @@
-module github.com/jasondorman/delta-neutral
+module github.com/Jason-Dorman/funding-carry
 
 go 1.26.6
 

@@ -15,9 +15,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -28,9 +28,13 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - uses: golangci/golangci-lint-action@v6
+      # v9 is the first line of the action that supports golangci-lint v2, which
+      # is the schema .golangci.yml is written against. The version is pinned to
+      # the one used locally so CI and `make lint` cannot disagree about what
+      # passes; bump both together.
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.12.2
 
       - name: Test
         run: go test -race ./...

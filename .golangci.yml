@@ -51,4 +51,4 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/jasondorman/delta-neutral
+        - github.com/Jason-Dorman/funding-carry

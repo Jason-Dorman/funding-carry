@@ -15,8 +15,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/jasondorman/delta-neutral/internal/config"
-	"github.com/jasondorman/delta-neutral/internal/metrics"
+	"github.com/Jason-Dorman/funding-carry/internal/config"
+	"github.com/Jason-Dorman/funding-carry/internal/metrics"
 )
 
 const service = "sim-venue"
