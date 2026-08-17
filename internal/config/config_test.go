@@ -54,6 +54,16 @@ func loadErr[T any](load func(lookupFunc) (*T, error)) func(lookupFunc) error {
 	}
 }
 
+// Importing config must pin the library's one mutable global, whatever a
+// dependency may have set it to.
+func TestDivisionPrecisionIsPinned(t *testing.T) {
+	t.Parallel()
+
+	if got, want := decimal.DivisionPrecision, divisionPrecision; got != want {
+		t.Errorf("decimal.DivisionPrecision = %d, want %d", got, want)
+	}
+}
+
 func TestLoadIngestDefaults(t *testing.T) {
 	t.Parallel()
 

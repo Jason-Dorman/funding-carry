@@ -29,6 +29,24 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// divisionPrecision is the number of digits decimal.Div keeps.
+//
+// Div is the only decimal operation that is not exact — Add, Sub and Mul are
+// arbitrary precision — and the library controls it through a mutable
+// package-level global that any dependency could change at any time. Pinning it
+// here, in the package every binary loads first, makes division behave
+// identically in every process, every test and every replay, which the
+// reproducibility requirement depends on.
+//
+// It is a rounding budget for ratios (margin ratio, basis, premium), never for a
+// value that has to reconcile against a venue statement. Money that must balance
+// is added and multiplied, not divided.
+const divisionPrecision = 16
+
+func init() {
+	decimal.DivisionPrecision = divisionPrecision
+}
+
 // Secret is a configuration value that must never appear in a log line, an error
 // message, or a %v of the struct that holds it. Both String and LogValue redact,
 // so the only way to read one is Reveal at the point of use.
