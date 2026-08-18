@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -29,18 +30,54 @@ type sentBatch struct {
 type fakeDB struct {
 	mu       sync.Mutex
 	batches  []sentBatch
+	ctxErrs  []error // ctx.Err() of the context each batch was written on
 	sent     chan struct{}
 	failures int   // number of leading sends that fail
 	failErr  error // the failure they report
+
+	// hold, when set, parks the first batch inside the fake until the test
+	// closes it, and entered reports that the writer has arrived there. Together
+	// they let a test land a cancellation in the middle of a write rather than
+	// hoping to hit the window by timing.
+	hold    chan struct{}
+	held    bool // the hold applies to the first batch only
+	entered chan struct{}
 }
 
 func newFakeDB() *fakeDB {
 	return &fakeDB{sent: make(chan struct{}, 64)}
 }
 
-func (f *fakeDB) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
+// blocking returns a fake whose first batch stalls until the test releases it.
+func blockingFakeDB() *fakeDB {
+	f := newFakeDB()
+	f.hold = make(chan struct{})
+	f.entered = make(chan struct{}, 1)
+	return f
+}
+
+func (f *fakeDB) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	f.mu.Lock()
+	var hold chan struct{}
+	if !f.held {
+		// The field itself is left alone so the test still owns the channel and
+		// can close it to release the write.
+		f.held, hold = true, f.hold
+	}
+	f.mu.Unlock()
+
+	if hold != nil {
+		f.entered <- struct{}{}
+		<-hold
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	// Recorded here, after the hold releases, so a test that cancels while the
+	// batch is parked is asking the question that matters: is the context this
+	// write is running on still alive?
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 
 	batch := sentBatch{}
 	for _, q := range b.QueuedQueries {
@@ -50,7 +87,13 @@ func (f *fakeDB) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
 	f.batches = append(f.batches, batch)
 
 	var err error
-	if f.failures > 0 {
+	switch {
+	case ctx.Err() != nil:
+		// A real driver fails the round trip when the context it was handed is
+		// dead. A fake that ignored that would let every cancellation bug in
+		// this file pass unnoticed — which is how the flush defect survived.
+		err = ctx.Err()
+	case f.failures > 0:
 		f.failures--
 		err = f.failErr
 	}
@@ -63,6 +106,28 @@ func (f *fakeDB) SendBatch(_ context.Context, b *pgx.Batch) pgx.BatchResults {
 	}
 
 	return &fakeResults{n: len(batch.statements), err: err}
+}
+
+// contexts reports the liveness of every context the writer handed the database.
+func (f *fakeDB) contexts() []error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]error(nil), f.ctxErrs...)
+}
+
+// distinctRowsFor counts the distinct rows the fake was asked to insert into a
+// table. Retries re-send the same row, so a raw statement count can make a lost
+// row and a retried one look identical.
+func (f *fakeDB) distinctRowsFor(table string) int {
+	seen := map[string]struct{}{}
+	for _, b := range f.snapshot() {
+		for i, stmt := range b.statements {
+			if strings.HasPrefix(stmt, "INSERT INTO "+table+" ") {
+				seen[fmt.Sprint(b.arguments[i])] = struct{}{}
+			}
+		}
+	}
+	return len(seen)
 }
 
 func (f *fakeDB) snapshot() []sentBatch {
@@ -312,6 +377,84 @@ func TestWriterFlushesOnContextCancel(t *testing.T) {
 	}
 	if got := f.rowsFor("cb_bars"); got != 1 {
 		t.Fatalf("expected the pending row to survive cancellation, got %d", got)
+	}
+}
+
+// Regression for a defect the Part 3 onramp toy hit first: only the final flush
+// was detached from cancellation, so a shutdown landing while a size- or
+// interval-triggered batch was in flight aborted the round trip. A write in
+// progress must reach the database on a live context whatever the parent is
+// doing.
+func TestWriterNeverWritesOnACanceledContext(t *testing.T) {
+	t.Parallel()
+
+	f := blockingFakeDB()
+	w := NewWriter(f, WriterOptions{BatchSize: 1, FlushInterval: time.Hour}, discardLogger(), testMetrics())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	ts := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts)); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	<-f.entered // the batch is now inside the database call
+	cancel()    // ... and the parent dies underneath it
+	close(f.hold)
+
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	got := f.contexts()
+	if len(got) == 0 {
+		t.Fatal("no batches reached the database")
+	}
+	for i, err := range got {
+		if err != nil {
+			t.Errorf("batch %d was written on a dead context: %v", i, err)
+		}
+	}
+}
+
+// The other half of the same defect: once the in-flight batch survives, the rows
+// queued behind it must still be drained and flushed. This is the promise in
+// architecture section 8 — cancel, drain, flush, close — and it is the path that
+// runs on every SIGTERM while a position is open.
+func TestWriterDrainsAndFinalFlushesAfterCancellationMidBatch(t *testing.T) {
+	t.Parallel()
+
+	f := blockingFakeDB()
+	w := NewWriter(f, WriterOptions{BatchSize: 1, FlushInterval: time.Hour}, discardLogger(), testMetrics())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	ts := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts)); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	<-f.entered
+
+	// Two more rows accepted while the writer is stuck in the first batch. The
+	// producers have been told these are safe.
+	for i := 1; i <= 2; i++ {
+		if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts.Add(time.Duration(i)*time.Minute))); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+
+	cancel()
+	close(f.hold)
+
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got := f.distinctRowsFor("cb_bars"); got != 3 {
+		t.Fatalf("distinct rows written = %d, want all 3: the queued rows were dropped on shutdown", got)
 	}
 }
 

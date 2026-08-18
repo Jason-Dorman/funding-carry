@@ -450,6 +450,8 @@ All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-
 
 The three writer metrics (`rows_written_total`, `write_batch_seconds`, `write_queue_depth`) come from shared code in `internal/db` and take the prefix of whichever binary owns that writer, so `carry_rows_written_total` exists alongside the `ingest_` ones listed below. "Is this binary keeping up with its writes?" is a per-binary question.
 
+One prefix is deliberately outside this catalogue: the Part 3 learning exercise in `research/onramp/` exports `onramp_*` series and nothing scrapes it. It is not a service, it is not in the Compose stack, and its metrics are not alertable — the exception is recorded here so it does not read as drift.
+
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `ingest_last_seen_timestamp_seconds` | gauge | stream | unix ts of last message per stream |

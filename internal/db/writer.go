@@ -46,7 +46,7 @@ type WriterOptions struct {
 	QueueSize     int           // rows buffered before Submit blocks
 	BatchSize     int           // pending rows that trigger an immediate flush
 	FlushInterval time.Duration // longest a row waits before being written
-	FlushTimeout  time.Duration // bound on one flush, including retries
+	FlushTimeout  time.Duration // bound on one flush, including retries; every flush, not just the last
 	MaxAttempts   int           // flush attempts before the failure becomes fatal
 	RetryBackoff  time.Duration // base delay between attempts, multiplied by attempt
 
@@ -213,8 +213,8 @@ func (w *Writer) Close() error {
 
 // shutdown takes the rows producers already handed over — they are in the
 // channel buffer, and dropping them would lose writes the producer believes
-// succeeded — and flushes once more on a context that cancellation cannot
-// reach, so a SIGTERM still persists the last batch.
+// succeeded — and flushes once more. flush is what detaches the write from
+// cancellation, so this path needs no context of its own.
 func (w *Writer) shutdown(ctx context.Context) error {
 	for draining := true; draining; {
 		select {
@@ -226,10 +226,7 @@ func (w *Writer) shutdown(ctx context.Context) error {
 	}
 
 	final := w.pending
-	flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.opts.FlushTimeout)
-	defer cancel()
-
-	if err := w.flush(flushCtx); err != nil {
+	if err := w.flush(ctx); err != nil {
 		return fmt.Errorf("final flush: %w", err)
 	}
 	w.log.Info("writer stopped", "final_flush_rows", final)
@@ -270,8 +267,23 @@ func (w *Writer) flush(ctx context.Context) error {
 		}
 	}
 
+	// Every flush runs on a context that cancellation cannot reach, bounded by
+	// FlushTimeout — the final one is not a special case. Cancellation is meant
+	// to stop producers; a batch already in flight has to be allowed to land or
+	// to fail on its own clock.
+	//
+	// Passing ctx straight to pgx here was a defect: a SIGTERM arriving while a
+	// size- or interval-triggered batch was in flight aborted the round trip,
+	// send gave up at its first ctx.Done() check, Run returned fatal, and
+	// shutdown — the drain and the final flush architecture section 8 promises —
+	// never ran. Rows producers had been told were accepted were lost, on the
+	// one path that exists to prevent exactly that. Found by the Part 3 onramp
+	// toy hitting it, not by reading this code.
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.opts.FlushTimeout)
+	defer cancel()
+
 	start := time.Now()
-	err := w.send(ctx, batch)
+	err := w.send(writeCtx, batch)
 	w.m.observeBatch(time.Since(start).Seconds())
 	if err != nil {
 		return err
