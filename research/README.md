@@ -8,7 +8,7 @@ Contents as the build progresses:
 
 | Path | What | Part |
 |---|---|---|
-| `onramp/` | Go learning exercise, hand-written then refactored with review | 3 |
+| [`onramp/`](onramp/README.md) | Go learning exercise: fake feeds, fan-in channel, one pgx writer, `/metrics` — with a walkthrough of every construct in it | 3 |
 | `notebooks/` | Carry break-even study (research task R1), funding comparisons | before 13 |
 | `backtest/` | Chronological replay, run report, `bt_runs` / `bt_results` output | 20 |
 

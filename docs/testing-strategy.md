@@ -8,7 +8,7 @@ Conventions defined once so every build part tests the same way. Per-part accept
 
 1. **Acceptance is demonstrated, not asserted.** Each part's summary shows the command run and the observed evidence (test output, induced alert, DB rows). "It should work" is not done.
 2. **Determinism is a feature under test.** Same inputs → same decisions is an NFR (reproducibility); flaky tests are bugs, not annoyances.
-3. **Fakes over mocks.** Hand-written fakes implementing the real interface (fake WS server, fake `Venue`, seeded DB) — no mocking frameworks. If a component is hard to fake, its interface is wrong; fix the interface.
+3. **Fakes over mocks.** Hand-written fakes implementing the real interface (fake WS server, fake `Venue`, seeded DB) — no mocking frameworks. If a component is hard to fake, its interface is wrong; fix the interface. **A fake must fail where the real dependency fails** — a fake more forgiving than the thing it stands in for turns its tests into decorations. `internal/db`'s fake ignored the context it was handed, so a write on a canceled context "succeeded" and `TestWriterFlushesOnContextCancel` passed over a real row-loss bug for two parts (Part 3 changelog entry in the [build plan](build-plan.md#changelog--decision-record)). When a fake takes a context, a deadline, a size limit or a sequence number, it enforces it.
 4. **Tests document behavior** — a reviewer should be able to read the rule tests for spec §8 and reconstruct the rule table.
 
 ## Go conventions
@@ -54,3 +54,4 @@ Every reliability claim in [architecture §8](architecture.md#8-reliability-desi
 - Hard stops and the kill switch are **never stubbed out** to make another test pass — fake the venue instead (CLAUDE.md safety rail).
 - A part is not done with skipped or `t.Skip`ped tests unless the skip is documented in the part summary with a reason and a follow-up.
 - CI/`make test` gate: `lint` + unit (race) green always; integration green before a part is called complete.
+- **A regression test is run against the unfixed code and observed to fail** before its fix is accepted. A test written after the fix that was never seen red proves only that the current code passes it.

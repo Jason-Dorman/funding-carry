@@ -400,6 +400,18 @@ Flow of truth:
 
 Graceful shutdown order: stop accepting decisions → cancel open orders → flush channels → persist state → FIX logout → close DB pool.
 
+**Cancellation stops producers, not writes in flight.** The root context is how a
+binary is told to stop *starting* work. Any I/O already in progress that the
+shutdown order depends on — the writer's flush, an order cancel, a FIX logout —
+must run on `context.WithoutCancel` with its own timeout, never on the root
+context. Handing the root context to a call that is already in flight means
+`SIGTERM` aborts it, the caller reports failure, and the drain-and-flush steps
+above never execute: shutdown corrupts precisely the state it exists to protect.
+The timeout is per-call, so a stuck dependency still cannot hang the process.
+This rule was written after `internal/db.Writer` violated it (see the Part 3
+entry in the [build plan changelog](build-plan.md#changelog--decision-record));
+every later part that performs I/O during shutdown is bound by it.
+
 ---
 
 ## 9. Observability

@@ -4,6 +4,14 @@ Notable changes to the system and its contracts. Structural decisions get an ADR
 
 ## [Unreleased]
 
+### Writer shutdown correctness — 2026-08-18 (Part 3)
+
+**Behavioral fix to a reliability guarantee.** `internal/db.Writer` handed the root context to pgx for its size- and interval-triggered flushes, so a `SIGTERM` arriving while a batch was in flight aborted the round trip, made `Run` return fatal, and skipped the drain-and-final-flush path entirely — losing rows producers had already been told were accepted. Every flush now runs on `context.WithoutCancel` bounded by `FlushTimeout`.
+
+The general rule is now in [architecture §8](docs/architecture.md#8-reliability-design) and binds every later part: **cancellation stops producers, never I/O already in flight.** Anything the shutdown order depends on — a flush, an order cancel, a FIX logout — gets a detached context with a per-call timeout.
+
+Two things worth noting for anyone auditing the test suite. The bug was found by *running* the Part 3 learning toy under backpressure rather than by reading the code, and the test that should have caught it (`TestWriterFlushesOnContextCancel`) passed for two parts because the fake database ignored the context it was handed. Fakes now fail a dead context the way a driver does, and regression tests are run against the unfixed code to confirm they fail there ([testing strategy](docs/testing-strategy.md)).
+
 ### Schema and persistence contracts — 2026-08-17 (Part 2)
 
 The v1 schema landed as embedded migrations, and with it three things other components and other languages now depend on:
