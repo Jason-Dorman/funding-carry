@@ -9,9 +9,9 @@
 // broken, so each is a mechanism rather than a convention:
 //
 //   - Connect registers the shopspring codec on every connection, making
-//     decimal.Decimal the native representation of a `numeric` column. Without
-//     it a value reaches Go through a float somewhere and loses digits with no
-//     error anywhere.
+//     decimal.Decimal the native representation of a `numeric` column. Values
+//     survive without it — the fallback is textual, not float — but scale does
+//     not: 4000.10 comes back with exponent -1. See the comment on Connect.
 //   - EncodeSnapshot writes decimals into `jsonb` as JSON strings, because
 //     Postgres keeps a bare JSON number exact while every consumer outside Go
 //     parses it as a double (ADR-0011).

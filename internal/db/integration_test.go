@@ -14,15 +14,18 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shopspring/decimal"
@@ -38,7 +41,14 @@ var testDatabaseURL string
 func beforeTests() {
 	admin := os.Getenv("DATABASE_URL")
 	if admin == "" {
-		return
+		// Building with the integration tag is an explicit request to run these
+		// tests. Skipping quietly would print "ok" and exit 0 for a run that
+		// executed nothing — a green tick that means the opposite of what it
+		// looks like, in CI most of all.
+		fmt.Fprintln(os.Stderr,
+			"integration setup: DATABASE_URL is not set. Run the suite with `make test-integration`, "+
+				"which points it at the Compose TimescaleDB on 127.0.0.1:15432.")
+		os.Exit(1)
 	}
 
 	ctx := context.Background()
@@ -95,7 +105,10 @@ func replaceDatabase(rawURL, database string) (string, error) {
 func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	if testDatabaseURL == "" {
-		t.Skip("DATABASE_URL is not set; run the integration suite with `make test-integration`")
+		// Unreachable: beforeTests exits when DATABASE_URL is unset. Kept as a
+		// failure rather than a skip so a future change to that cannot turn the
+		// whole suite into a silent pass.
+		t.Fatal("integration database was never prepared")
 	}
 
 	pool, err := Connect(t.Context(), testDatabaseURL)
@@ -614,25 +627,183 @@ func TestClosedVocabulariesAreEnforced(t *testing.T) {
 	}
 }
 
-func counterValue(t *testing.T, g prometheus.Gatherer, name, label string) float64 {
+// A flush is one implicit transaction: pgx sends the whole batch as a single
+// pipeline terminated by one sync, so Postgres either applies all of it or none
+// of it. The writer's retry policy is built on that — a statement failure the
+// server reports means the batch rolled back, which is what makes re-sending it
+// safe — so the property is tested rather than assumed.
+//
+// The giveaway is that the first statement reports success and still leaves no
+// row behind: reading a CommandComplete is not the same as having committed.
+func TestBatchIsAtomic(t *testing.T) {
+	pool := testPool(t)
+	ctx := t.Context()
+
+	const product = "ATOMICITY-TEST"
+	ts := time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+
+	good := VenueStateRow{TS: ts, ProductID: product}.row()
+	// Rejected by cb_venue_state_funding_source_check.
+	bad := VenueStateRow{TS: ts.Add(time.Second), ProductID: product, FundingSource: "guessed"}.row()
+	alsoGood := VenueStateRow{TS: ts.Add(2 * time.Second), ProductID: product}.row()
+
+	batch := &pgx.Batch{}
+	batch.Queue(insertStatement(good), good.values...)
+	batch.Queue(insertStatement(bad), bad.values...)
+	batch.Queue(insertStatement(alsoGood), alsoGood.values...)
+
+	results := pool.SendBatch(ctx, batch)
+	var failedAt int
+	var execErr error
+	for i := range batch.Len() {
+		if _, err := results.Exec(); err != nil {
+			failedAt, execErr = i+1, err
+			break
+		}
+	}
+	_ = results.Close()
+
+	if failedAt != 2 {
+		t.Fatalf("expected the second statement to be rejected, got failure at %d (%v)", failedAt, execErr)
+	}
+
+	// The server answered, which is the signal the writer keys its retry policy
+	// off. If this ever stops being a PgError, worthRetrying stops working.
+	var pgErr *pgconn.PgError
+	if !errors.As(execErr, &pgErr) {
+		t.Fatalf("expected a *pgconn.PgError from the server, got %T: %v", execErr, execErr)
+	}
+	if pgErr.Code != "23514" {
+		t.Errorf("SQLSTATE = %s, want 23514 (check_violation)", pgErr.Code)
+	}
+	if worthRetrying(execErr) {
+		t.Error("a check violation is deterministic: retrying it only spends the flush timeout")
+	}
+
+	var landed int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM cb_venue_state WHERE product_id = $1`, product).Scan(&landed); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if landed != 0 {
+		t.Fatalf("%d rows survived a failed batch; the flush is not atomic, and the "+
+			"writer's retry policy depends on it being so", landed)
+	}
+}
+
+// Every table takes the same row twice and keeps one. This is the property the
+// writer's retry depends on, checked against the real schema rather than against
+// the conflict clauses in isolation: a clause naming a key the database does not
+// have is a runtime error, not a compile error, and TestEveryRowTypeIsIdempotent
+// cannot see that.
+//
+// It also exercises the conflict-target inference Postgres does, which is fussy
+// about partial indexes and about the column list matching the index.
+func TestEveryInsertIsIdempotent(t *testing.T) {
+	pool := testPool(t)
+	ctx := t.Context()
+
+	const (
+		product  = "IDEMPOTENCY-TEST"
+		position = "01JZZZPOSITIONULID00000000"
+	)
+	ts := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	num := Num(decimal.RequireFromString("1.25"))
+
+	// positions first: fills and funding events point at it.
+	rows := []Row{
+		PositionRow{ID: position, OpenedAt: ts, Venue: VenuePaper,
+			SpotQty: decimal.RequireFromString("0.7"), PerpContracts: -7, Status: "OPEN"},
+		VenueStateRow{TS: ts, ProductID: product, FuturesMark: num},
+		sampleBar(product, ts),
+		BookSnapshotRow{TS: ts, ProductID: product, BestBid: num},
+		TradesAggRow{TS: ts, ProductID: product, BucketSecs: 180,
+			BuyVol: decimal.Zero, SellVol: decimal.Zero, TradeCount: 0},
+		FeatureRow{TS: ts, ProductID: product, FundingZScore: num},
+		BaseStateRow{TS: ts, SpotPx: num},
+		AccountStateRow{TS: ts, MarginRatio: num},
+		ProductRow{ProductID: product, ContractSize: num, UpdatedAt: ts},
+		DecisionRow{TS: ts, State: "HOLD", ReasonCodes: []string{"HOLD_OK"},
+			InputSnapshot: Snapshot(`{"funding_rate":"0.0001"}`)},
+		FillRow{TS: ts, PositionID: Opt(position), ClOrdID: "01JCLORDID", Venue: VenuePaper,
+			Leg: "perp", Side: "sell", Qty: decimal.RequireFromString("7"),
+			Px: num.Decimal, ExecState: "FILLED", VenueExecID: "exec-1"},
+		FundingEventRow{TS: ts, ProductID: product, Kind: FundingKindAccrual,
+			RateHourly: num, FundingSource: FundingSourceComputed,
+			Amount: decimal.RequireFromString("0.42")},
+		RiskEventRow{TS: ts, Kind: "HARD_STOP_MARGIN_RATIO"},
+		FIXSessionRow{SessionID: "FIX.4.4:CARRY->SIMV", StartedAt: ts},
+	}
+
+	if len(rows) != len(everyRowType()) {
+		t.Fatalf("this test covers %d row types but there are %d", len(rows), len(everyRowType()))
+	}
+
+	for _, r := range rows {
+		d := r.row()
+		t.Run(d.table, func(t *testing.T) {
+			stmt := insertStatement(d)
+
+			first, err := pool.Exec(ctx, stmt, d.values...)
+			if err != nil {
+				t.Fatalf("first insert: %v", err)
+			}
+			if first.RowsAffected() != 1 {
+				t.Fatalf("first insert affected %d rows, want 1", first.RowsAffected())
+			}
+
+			second, err := pool.Exec(ctx, stmt, d.values...)
+			if err != nil {
+				t.Fatalf("second insert (this is what a retry does): %v", err)
+			}
+			// cb_products upserts rather than doing nothing — rewriting the same
+			// values is still idempotent — so it reports one row either way.
+			if d.table != "cb_products" && second.RowsAffected() != 0 {
+				t.Fatalf("second insert affected %d rows, want 0: a retry would duplicate",
+					second.RowsAffected())
+			}
+
+			// Counted by the natural key rather than over the whole table: other
+			// tests in this suite write to these tables too, and a count(*) here
+			// made this test depend on the order it ran in.
+			where, args := whereNaturalKey(t, d)
+			var n int
+			if err := pool.QueryRow(ctx,
+				"SELECT count(*) FROM "+d.table+" WHERE "+where, args...).Scan(&n); err != nil {
+				t.Fatalf("count by key: %v", err)
+			}
+			if n != 1 {
+				t.Fatalf("%s holds %d rows matching the key it was inserted with, want 1",
+					d.table, n)
+			}
+		})
+	}
+}
+
+// keyColumns pulls the conflict target out of a row's ON CONFLICT clause.
+var keyColumns = regexp.MustCompile(`^ON CONFLICT \(([^)]*)\)`)
+
+// whereNaturalKey builds the predicate that selects exactly the row just
+// inserted, from the key the table declares as its identity. IS NOT DISTINCT
+// FROM rather than =, because a key column may legitimately be NULL —
+// funding_events.position_id on an observed-series row.
+func whereNaturalKey(t *testing.T, d rowData) (string, []any) {
 	t.Helper()
 
-	families, err := g.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
+	m := keyColumns.FindStringSubmatch(d.conflict)
+	if m == nil {
+		t.Fatalf("%s: cannot read a conflict target out of %q", d.table, d.conflict)
 	}
-	for _, family := range families {
-		if family.GetName() != name {
-			continue
-		}
-		for _, metric := range family.GetMetric() {
-			for _, pair := range metric.GetLabel() {
-				if pair.GetValue() == label {
-					return metric.GetCounter().GetValue()
-				}
-			}
-		}
+
+	var (
+		clauses []string
+		args    []any
+	)
+	for _, column := range strings.Split(m[1], ",") {
+		column = strings.TrimSpace(column)
+		i := indexOf(d.columns, column)
+		args = append(args, d.values[i])
+		clauses = append(clauses, fmt.Sprintf("%s IS NOT DISTINCT FROM $%d", column, len(args)))
 	}
-	t.Fatalf("no metric %s with label %s", name, label)
-	return 0
+	return strings.Join(clauses, " AND "), args
 }

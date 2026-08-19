@@ -12,6 +12,28 @@ The general rule is now in [architecture §8](docs/architecture.md#8-reliability
 
 Two things worth noting for anyone auditing the test suite. The bug was found by *running* the Part 3 learning toy under backpressure rather than by reading the code, and the test that should have caught it (`TestWriterFlushesOnContextCancel`) passed for two parts because the fake database ignored the context it was handed. Fakes now fail a dead context the way a driver does, and regression tests are run against the unfixed code to confirm they fail there ([testing strategy](docs/testing-strategy.md)).
 
+### Hardening from an adversarial review of Parts 1-3 — 2026-08-19
+
+A six-lens multi-agent review with a refutation stage on every finding. Contract- and operator-visible outcomes:
+
+- **`Secret` now redacts under `MarshalJSON`, `MarshalText` and `GoString`** as well as `String`/`LogValue`. slog resolves `LogValuer` only on the attribute value itself, so a `Secret` nested in a struct logged through the JSON handler — the committed container default — previously printed in full. Anything that renders config must be assumed to hit that path.
+- **Every published Compose port now binds `127.0.0.1`.** If you reached Grafana, Prometheus or TimescaleDB from another machine on your network, that stops working by design; Docker's port rules sit ahead of the host firewall, so the previous defaults were exposed regardless of `ufw`/`firewalld`.
+- **`go test -tags integration` with `DATABASE_URL` unset now fails instead of skipping.** It used to print `ok` for a run that executed nothing.
+- **[API spec §3.5](docs/api-spec.md#35-decimal-rules) corrected.** The shopspring pgx codec does not prevent a float conversion — the unregistered fallback is textual and exact. It preserves *scale*: without it `4000.10` returns with exponent −1. The old wording overstated the mechanism the "no float money" rule depends on.
+
+**Every insert is now idempotent** ([ADR-0012](docs/decisions/0012-idempotent-inserts-natural-keys.md), migration `000004_natural_keys`). Each of the fourteen tables carries the unique key that is the identity of one of its rows, and every insert uses `ON CONFLICT … DO NOTHING`. Consequences for anything writing to this schema:
+
+- **`positions.id` is now a client-minted ULID (`text`), not a database identity.** `fills.position_id` and `funding_events.position_id` follow it to `text`. Whatever opens a position assigns its id.
+- **`fills.venue_exec_id` is `NOT NULL`** — it is the identity of a fill. Every venue implementation supplies one.
+- **`ts` must be the sampling or tick boundary**, not `time.Now()`, on the series tables and `cb_features`; and `funding_events.ts` is the start of the funding hour for an accrual. A nanosecond-resolution timestamp makes every row unique and the key decorative.
+- **`rows_written_total` counts rows the database actually inserted**, from the command tag; `rows_conflicted_total` is new and counts the no-ops. A dashboard that summed submissions before now reads differently, and deliberately so.
+
+The writer re-sends a batch whose commit status is unknown again — safely, because a repeat is a no-op — so a dropped connection no longer costs a restart and a hole in the self-recorded funding series. This supersedes the paragraph below.
+
+**Previously: the writer no longer re-sends a batch whose commit status is unknown.** It used to retry any failure, including one raised after every statement had been acknowledged — which, if the batch had committed, inserted every row a second time into the nine tables with no unique constraint to absorb it. Re-sending is now limited to failures that prove nothing landed (`pgconn.SafeToRetry`, or a server error with a transient SQLSTATE), and deterministic rejections fail at once instead of burning three attempts. *Operator-visible:* a connection dropped mid-flush is now fatal rather than retried, so expect a restart where the writer previously recovered — the driver cannot distinguish "never sent" from "committed, acknowledgement lost", and a gap is recoverable where a duplicate is not.
+
+Open item: `DATABASE_URL` is a plain `string` on `config.Common` and carries the database password. Recommendation is to type it as `Secret` before Part 4.
+
 ### Schema and persistence contracts — 2026-08-17 (Part 2)
 
 The v1 schema landed as embedded migrations, and with it three things other components and other languages now depend on:

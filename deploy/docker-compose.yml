@@ -29,6 +29,12 @@ x-health-defaults: &health-defaults
   retries: 5
   start_period: 15s
 
+# Every published port is bound to 127.0.0.1. This is a local stack: Prometheus
+# scrapes the binaries over the Compose network, Grafana reads Prometheus and
+# TimescaleDB the same way, and nothing outside the host needs to reach any of
+# it. Left on 0.0.0.0 the defaults would put an anonymous-viewer Grafana and a
+# database owned by a committed password on every interface, past a host
+# firewall that Docker's iptables rules sit in front of.
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg17
@@ -37,11 +43,17 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     ports:
-      # Published on a non-default host port: 5432 is where a developer machine
-      # usually already has its own Postgres, and a silent collision would point
+      # Bound to loopback, not 0.0.0.0. Docker inserts published ports into the
+      # DOCKER iptables chain ahead of the host firewall's INPUT rules, so a bare
+      # "15432:5432" would expose the database to the whole network with ufw or
+      # firewalld still reporting it closed — and the role behind it is the
+      # database owner with a password committed to .env.example.
+      #
+      # 15432 rather than 5432 because a developer machine usually already has
+      # its own Postgres on the default port, and a silent collision would point
       # host-side tools (psql, `make test-integration`) at the wrong server.
       # Inside the Compose network the port is still 5432.
-      - "15432:5432"
+      - "127.0.0.1:15432:5432"
     volumes:
       - timescale-data:/var/lib/postgresql/data
     healthcheck:
@@ -59,7 +71,7 @@ services:
       args:
         SERVICE: ingest
     ports:
-      - "9101:9101"
+      - "127.0.0.1:9101:9101"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9101/healthz || exit 1"]
       <<: *health-defaults
@@ -72,7 +84,7 @@ services:
       args:
         SERVICE: carry
     ports:
-      - "9102:9102"
+      - "127.0.0.1:9102:9102"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9102/healthz || exit 1"]
       <<: *health-defaults
@@ -85,9 +97,9 @@ services:
       args:
         SERVICE: sim-venue
     ports:
-      - "9103:9103"
+      - "127.0.0.1:9103:9103"
       # FIX 4.4 acceptor, listening from Part 7.
-      - "5001:5001"
+      - "127.0.0.1:5001:5001"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9103/healthz || exit 1"]
       <<: *health-defaults
@@ -115,7 +127,7 @@ services:
       - ./deploy/prometheus:/etc/prometheus:ro
       - prometheus-data:/prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9090/-/healthy || exit 1"]
       <<: *health-defaults
@@ -130,7 +142,7 @@ services:
       - ./deploy/alertmanager:/etc/alertmanager:ro
       - alertmanager-data:/alertmanager
     ports:
-      - "9093:9093"
+      - "127.0.0.1:9093:9093"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9093/-/healthy || exit 1"]
       <<: *health-defaults
@@ -153,7 +165,7 @@ services:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana-data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       prometheus:
         condition: service_healthy

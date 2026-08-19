@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ErrWriterStopped is returned by Submit once the writer has begun shutting
@@ -169,6 +170,12 @@ func (w *Writer) Submit(ctx context.Context, r Row) error {
 func (w *Writer) Run(ctx context.Context) error {
 	err := w.run(ctx)
 	w.err = err
+	// Closing stop here, not only in Close, is what makes Submit's contract true
+	// on every exit path. Run can return three ways Close did not cause — a fatal
+	// flush from either trigger, or root-context cancellation — and with stop
+	// still open Submit would keep returning nil for rows queued into a channel
+	// whose only reader has gone. stopOnce makes this idempotent with Close.
+	w.stopOnce.Do(func() { close(w.stop) })
 	close(w.done)
 	return err
 }
@@ -260,11 +267,17 @@ func (w *Writer) flush(ctx context.Context) error {
 	}
 
 	batch := &pgx.Batch{}
+	// tables runs parallel to the queued statements so each command tag can be
+	// attributed back to the table it wrote.
+	tables := make([]string, 0, w.pending)
+	queued := make(map[string]int64, len(w.batches))
 	for _, key := range w.order {
 		b := w.batches[key]
 		for _, values := range b.values {
 			batch.Queue(b.stmt, values...)
+			tables = append(tables, b.table)
 		}
+		queued[b.table] += int64(len(b.values))
 	}
 
 	// Every flush runs on a context that cancellation cannot reach, bounded by
@@ -283,34 +296,56 @@ func (w *Writer) flush(ctx context.Context) error {
 	defer cancel()
 
 	start := time.Now()
-	err := w.send(writeCtx, batch)
+	applied, err := w.send(writeCtx, batch, tables)
 	w.m.observeBatch(time.Since(start).Seconds())
 	if err != nil {
 		return err
 	}
 
-	for _, key := range w.order {
-		b := w.batches[key]
-		if len(b.values) == 0 {
-			continue
+	for table, n := range queued {
+		// Two counters, because the difference is the interesting number: rows
+		// the database took, and rows it already had. A flush that is all
+		// conflicts is a retry landing on work already done — worth seeing.
+		w.m.addRows(table, applied[table])
+		if skipped := n - applied[table]; skipped > 0 {
+			w.m.addConflicts(table, skipped)
 		}
-		w.m.addRows(b.table, len(b.values))
+	}
+	for _, key := range w.order {
 		// Keep the statement and the backing array, drop the rows.
-		b.values = b.values[:0]
+		w.batches[key].values = w.batches[key].values[:0]
 	}
 	w.pending = 0
 	w.m.observeQueue(len(w.rows))
 	return nil
 }
 
-// send executes the batch, retrying a failure a bounded number of times before
-// giving up. The retry exists because a brief connection loss is recoverable and
-// a dropped batch is not; exhausting the attempts is fatal by design.
-func (w *Writer) send(ctx context.Context, batch *pgx.Batch) error {
-	var err error
+// send executes the batch, retrying a failure that another attempt might clear.
+//
+// Re-sending is safe because every insert carries ON CONFLICT ... DO NOTHING
+// against the natural key of its table, so a batch that turns out to have
+// committed already lands the second time as a no-op. That is the whole reason
+// the keys exist: without them the writer had to abandon any batch whose commit
+// status it could not determine, which bought correctness with availability at
+// the worst moment — a dropped connection became a restart, a restart became a
+// gap, and a gap in the self-recorded series (venue state, features, book
+// snapshots, trade aggregates) cannot be backfilled from anywhere, because those
+// series are computed here and exist nowhere else.
+//
+// TestEveryRowTypeIsIdempotent is what keeps that assumption true as tables are
+// added; without it this retry silently becomes the duplicate bug again.
+func (w *Writer) send(ctx context.Context, batch *pgx.Batch, tables []string) (map[string]int64, error) {
+	var (
+		applied map[string]int64
+		err     error
+	)
 	for attempt := 1; attempt <= w.opts.MaxAttempts; attempt++ {
-		if err = w.sendOnce(ctx, batch); err == nil {
-			return nil
+		if applied, err = w.sendOnce(ctx, batch, tables); err == nil {
+			return applied, nil
+		}
+		if !worthRetrying(err) {
+			return nil, fmt.Errorf("batch insert of %d rows will not succeed on a retry: %w",
+				batch.Len(), err)
 		}
 		if attempt == w.opts.MaxAttempts {
 			break
@@ -323,36 +358,86 @@ func (w *Writer) send(ctx context.Context, batch *pgx.Batch) error {
 		case <-timer.C:
 		case <-ctx.Done():
 			timer.Stop()
-			return fmt.Errorf("batch insert of %d rows abandoned after %d attempts: %w",
+			return nil, fmt.Errorf("batch insert of %d rows abandoned after %d attempts: %w",
 				batch.Len(), attempt, err)
 		}
 	}
-	return fmt.Errorf("batch insert of %d rows failed after %d attempts: %w",
+	return nil, fmt.Errorf("batch insert of %d rows failed after %d attempts: %w",
 		batch.Len(), w.opts.MaxAttempts, err)
 }
 
-func (w *Writer) sendOnce(ctx context.Context, batch *pgx.Batch) error {
+// sendOnce runs the batch once and reports how many rows each table actually
+// took. tables names the destination of every queued statement, in queue order,
+// so the command tags can be attributed as they are read.
+func (w *Writer) sendOnce(ctx context.Context, batch *pgx.Batch, tables []string) (map[string]int64, error) {
 	results := w.db.SendBatch(ctx, batch)
 
 	// Every queued statement's result must be read, in order, before the batch
 	// can be closed: the first failure aborts the rest, so it is the one worth
 	// reporting.
+	applied := make(map[string]int64, len(w.batches))
 	var execErr error
 	for i := range batch.Len() {
-		if _, err := results.Exec(); err != nil {
-			execErr = fmt.Errorf("statement %d of %d: %w", i+1, batch.Len(), err)
+		tag, e := results.Exec()
+		if e != nil {
+			execErr = fmt.Errorf("statement %d of %d: %w", i+1, batch.Len(), e)
 			break
 		}
+		// RowsAffected, not one-per-statement: an insert that hit its natural key
+		// reports zero, and counting it as a write would hide the retry storms
+		// idempotency makes possible behind a healthy-looking throughput line.
+		applied[tables[i]] += tag.RowsAffected()
 	}
 
 	closeErr := results.Close()
-	if execErr != nil {
-		return execErr
+
+	switch {
+	case execErr != nil:
+		return nil, execErr
+	case closeErr != nil:
+		// Every statement reported success, so the batch reached the point where
+		// only the commit was left. A failure here — the connection dropping
+		// between the last CommandComplete and the ReadyForQuery that follows the
+		// commit — leaves the rows possibly in the database and possibly not.
+		// Re-sending settles it, because a repeat is a no-op.
+		return nil, fmt.Errorf("commit status unknown after close: %w", closeErr)
 	}
-	if closeErr != nil {
-		return fmt.Errorf("close batch: %w", closeErr)
+	return applied, nil
+}
+
+// worthRetrying reports whether another attempt could succeed. Safety is not in
+// question — idempotent inserts make any repeat harmless — so the only thing
+// left to decide is whether the failure is one that a moment's wait can clear.
+func worthRetrying(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return transientServerError(pgErr.Code)
 	}
-	return nil
+	// Not an answer from the server: a connection lost mid-results, a pool that
+	// could not hand one over, a commit whose acknowledgement never arrived. Any
+	// of those can clear. (pgconn.SafeToRetry would say the same for the subset
+	// it recognises; it is subsumed here.)
+	return true
+}
+
+// transientServerError reports whether a SQLSTATE describes a condition a moment
+// of waiting can clear. Everything else — a constraint violation, a type
+// mismatch, a column that does not exist — is a property of the rows or of the
+// schema, and would fail identically on all three attempts while the flush
+// timeout ran down. A unique violation is in that list deliberately: with
+// ON CONFLICT everywhere it should be unreachable, and if it is ever raised the
+// conflict target and the index have diverged, which retrying cannot fix.
+func transientServerError(sqlstate string) bool {
+	switch sqlstate {
+	case "40001", // serialization_failure
+		"40P01", // deadlock_detected
+		"53300", // too_many_connections
+		"53400", // configuration_limit_exceeded
+		"55P03", // lock_not_available
+		"57P03": // cannot_connect_now
+		return true
+	}
+	return false
 }
 
 // insertStatement builds the parameterized INSERT for one row shape. Table and

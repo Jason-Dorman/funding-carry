@@ -32,8 +32,19 @@ type fakeDB struct {
 	batches  []sentBatch
 	ctxErrs  []error // ctx.Err() of the context each batch was written on
 	sent     chan struct{}
-	failures int   // number of leading sends that fail
+	failures int   // number of leading sends whose statements fail
 	failErr  error // the failure they report
+
+	// closeFailures fails the batch at Close instead of at Exec: every statement
+	// reports success and only the commit's acknowledgement is lost. That is the
+	// in-doubt case, and it is the one a fake has to be able to produce, because
+	// a test cannot ask a real database to drop a connection at that instant.
+	closeFailures int
+	closeErr      error
+
+	// noopAfter makes every batch from this one onwards report zero rows
+	// inserted, standing in for a re-sent batch landing on rows already written.
+	noopAfter int
 
 	// hold, when set, parks the first batch inside the fake until the test
 	// closes it, and entered reports that the writer has arrived there. Together
@@ -86,6 +97,12 @@ func (f *fakeDB) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
 	}
 	f.batches = append(f.batches, batch)
 
+	var closeErr error
+	if f.closeFailures > 0 {
+		f.closeFailures--
+		closeErr = f.closeErr
+	}
+
 	var err error
 	switch {
 	case ctx.Err() != nil:
@@ -105,7 +122,8 @@ func (f *fakeDB) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
 	default:
 	}
 
-	return &fakeResults{n: len(batch.statements), err: err}
+	noop := f.noopAfter > 0 && len(f.batches) >= f.noopAfter
+	return &fakeResults{n: len(batch.statements), err: err, closeErr: closeErr, noop: noop}
 }
 
 // contexts reports the liveness of every context the writer handed the database.
@@ -151,19 +169,26 @@ func (f *fakeDB) rowsFor(table string) int {
 }
 
 type fakeResults struct {
-	n   int
-	err error
+	n        int
+	err      error
+	closeErr error
+	// noop makes every statement report that it inserted nothing, which is what
+	// an ON CONFLICT ... DO NOTHING insert does when the row is already there.
+	noop bool
 }
 
 func (r *fakeResults) Exec() (pgconn.CommandTag, error) {
 	if r.err != nil {
 		return pgconn.CommandTag{}, r.err
 	}
+	if r.noop {
+		return pgconn.NewCommandTag("INSERT 0 0"), nil
+	}
 	return pgconn.NewCommandTag("INSERT 0 1"), nil
 }
 func (r *fakeResults) Query() (pgx.Rows, error) { return nil, errors.New("not used") }
 func (r *fakeResults) QueryRow() pgx.Row        { return nil }
-func (r *fakeResults) Close() error             { return nil }
+func (r *fakeResults) Close() error             { return r.closeErr }
 
 // ---------------------------------------------------------------------------
 
@@ -458,13 +483,15 @@ func TestWriterDrainsAndFinalFlushesAfterCancellationMidBatch(t *testing.T) {
 	}
 }
 
-// A transient failure is retried; the rows are not lost.
+// A transient failure the server itself reported is retried: the server answered,
+// which means it rolled the implicit transaction back, so re-sending cannot
+// duplicate anything.
 func TestWriterRetriesFailedBatch(t *testing.T) {
 	t.Parallel()
 
 	f := newFakeDB()
 	f.failures = 2
-	f.failErr = errors.New("connection reset")
+	f.failErr = &pgconn.PgError{Code: "40001", Message: "serialization failure"}
 
 	w, stop := startWriter(t, f, WriterOptions{
 		BatchSize:    1,
@@ -493,7 +520,10 @@ func TestWriterFailsFatallyWhenRetriesAreExhausted(t *testing.T) {
 
 	f := newFakeDB()
 	f.failures = 100
-	f.failErr = errors.New("connection refused")
+	// A failure that is safe to repeat, so the batch really does get all of its
+	// attempts. A bare error would be abandoned after the first, which is a
+	// different path — TestWriterDoesNotResendABatchWhoseCommitIsUnknown covers it.
+	f.failErr = &pgconn.PgError{Code: "40001", Message: "serialization failure"}
 
 	w := NewWriter(f, WriterOptions{
 		BatchSize:    1,
@@ -550,10 +580,10 @@ func TestInsertStatement(t *testing.T) {
 		want string
 	}{
 		{
-			name: "plain insert",
+			name: "insert keyed on the sample instant",
 			row:  BaseStateRow{},
 			want: "INSERT INTO base_state (ts, spot_px, wallet_eth, wallet_usdc, gas_gwei) " +
-				"VALUES ($1, $2, $3, $4, $5)",
+				"VALUES ($1, $2, $3, $4, $5) ON CONFLICT (ts) DO NOTHING",
 		},
 		{
 			name: "idempotent insert",
@@ -572,4 +602,204 @@ func TestInsertStatement(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Submit's contract has to hold on every path Run can exit by, not just the one
+// Close causes. A writer that has stopped must say so; returning nil for a row
+// queued into a channel with no reader reports a durable write that will never
+// happen.
+func TestSubmitIsRefusedAfterRunExitsOnItsOwn(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]func(t *testing.T) *Writer{
+		"fatal flush": func(t *testing.T) *Writer {
+			f := newFakeDB()
+			f.failures = 100
+			f.failErr = errors.New("connection refused")
+			w := NewWriter(f, WriterOptions{BatchSize: 1, MaxAttempts: 1}, discardLogger(), testMetrics())
+
+			done := make(chan error, 1)
+			go func() { done <- w.Run(context.Background()) }()
+			if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", time.Now())); err != nil {
+				t.Fatalf("submit: %v", err)
+			}
+			if err := <-done; err == nil {
+				t.Fatal("expected the writer to fail fatally")
+			}
+			return w
+		},
+		"root context canceled": func(t *testing.T) *Writer {
+			f := newFakeDB()
+			w := NewWriter(f, WriterOptions{FlushInterval: time.Hour}, discardLogger(), testMetrics())
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- w.Run(ctx) }()
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			return w
+		},
+	}
+
+	for name, exit := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			w := exit(t)
+
+			// context.Background, deliberately: a producer whose own context is
+			// still alive is the case that would otherwise get nil back.
+			err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", time.Now()))
+			if !errors.Is(err, ErrWriterStopped) {
+				t.Fatalf("Submit after Run returned %v, want ErrWriterStopped", err)
+			}
+			// And Close still works afterwards, reporting whatever Run reported.
+			_ = w.Close()
+		})
+	}
+}
+
+// The in-doubt case: every statement reported success and only the close failed,
+// so the batch may or may not have committed. Before the natural keys existed
+// this had to be abandoned, because re-sending a batch that had committed would
+// duplicate every row in it. Now it is retried, and the retry is a no-op if the
+// first attempt did land — which is the availability the keys were bought for.
+func TestWriterRetriesABatchWhoseCommitIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	f.closeFailures = 1 // the first attempt is in doubt; the second settles it
+	f.closeErr = errors.New("unexpected EOF")
+	f.noopAfter = 2 // and the second attempt finds the rows already there
+
+	registry := prometheus.NewRegistry()
+	w := NewWriter(f, WriterOptions{
+		BatchSize:    1,
+		MaxAttempts:  3,
+		RetryBackoff: time.Millisecond,
+	}, discardLogger(), NewWriterMetrics(registry, "test"))
+
+	done := make(chan error, 1)
+	go func() { done <- w.Run(context.Background()) }()
+
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", time.Now())); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("an in-doubt batch should now be recoverable, got %v", err)
+	}
+
+	if got := len(f.snapshot()); got != 2 {
+		t.Fatalf("batch was sent %d times, want 2 (the in-doubt attempt and the retry)", got)
+	}
+	// The retry inserted nothing, and the metrics say so rather than reporting a
+	// write that never happened.
+	if got := counterValue(t, registry, "test_rows_written_total", "cb_bars"); got != 0 {
+		t.Errorf("rows_written_total = %v, want 0: the retry landed on a row that was already there", got)
+	}
+	if got := counterValue(t, registry, "test_rows_conflicted_total", "cb_bars"); got != 1 {
+		t.Errorf("rows_conflicted_total = %v, want 1", got)
+	}
+}
+
+// A rejection the server will repeat is not worth three attempts. A constraint
+// violation is a property of the rows or the schema; retrying it only spends the
+// flush timeout before failing with the same error.
+func TestWriterDoesNotRetryAServerRejection(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeDB()
+	f.failures = 100
+	f.failErr = &pgconn.PgError{
+		Code:    "23514", // check_violation, e.g. an unknown funding_source
+		Message: `new row violates check constraint "cb_venue_state_funding_source_check"`,
+	}
+
+	w := NewWriter(f, WriterOptions{
+		BatchSize:   1,
+		MaxAttempts: 3,
+		// Short, so a regression fails on the attempt count below rather than
+		// hanging until the package timeout.
+		RetryBackoff: time.Millisecond,
+	}, discardLogger(), testMetrics())
+
+	done := make(chan error, 1)
+	go func() { done <- w.Run(context.Background()) }()
+
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", time.Now())); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+
+	err := <-done
+	if err == nil {
+		t.Fatal("expected a rejected batch to be fatal")
+	}
+	if !strings.Contains(err.Error(), "check constraint") {
+		t.Errorf("the server's reason should survive to the top, got %v", err)
+	}
+	if got := len(f.snapshot()); got != 1 {
+		t.Fatalf("batch was sent %d times, want 1", got)
+	}
+	_ = w.Close()
+}
+
+// The classification in one table, so the policy can be read rather than
+// inferred from three tests. Safety is no longer part of it — idempotent inserts
+// make any repeat harmless — so the only question left is whether another
+// attempt could succeed.
+func TestResendPolicy(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"serialization failure clears on its own", &pgconn.PgError{Code: "40001"}, true},
+		{"deadlock clears on its own", &pgconn.PgError{Code: "40P01"}, true},
+		{"connection limit clears on its own", &pgconn.PgError{Code: "53300"}, true},
+		{"check violation will repeat", &pgconn.PgError{Code: "23514"}, false},
+		{"unique violation means the conflict target is wrong", &pgconn.PgError{Code: "23505"}, false},
+		{"undefined column will repeat", &pgconn.PgError{Code: "42703"}, false},
+		{"wrapped server error is still classified", fmt.Errorf("statement 3 of 9: %w", &pgconn.PgError{Code: "40001"}), true},
+		{"a lost connection may come back", errors.New("unexpected EOF"), true},
+		{"an unknown commit is settled by repeating it", errors.New("commit status unknown after close"), true},
+		{"a context error is handled by the retry loop, not the policy", context.Canceled, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := worthRetrying(tc.err); got != tc.want {
+				t.Errorf("worthRetrying(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func counterValue(t *testing.T, g prometheus.Gatherer, name, label string) float64 {
+	t.Helper()
+
+	families, err := g.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, pair := range metric.GetLabel() {
+				if pair.GetValue() == label {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	t.Fatalf("no metric %s with label %s", name, label)
+	return 0
 }

@@ -11,13 +11,20 @@ import (
 
 // Connect opens the connection pool every binary shares.
 //
-// The one line that matters here is the codec registration. Without it, pgx
-// hands a `numeric` column to the generic pgtype.Numeric and a caller ends up
-// converting through float64 somewhere — which is exactly the failure the
-// "no float money" rule exists to prevent, and it is silent. Registering the
-// shopspring codec on every connection makes decimal.Decimal the native wire
-// representation of `numeric` in both directions, so a value's coefficient and
-// exponent survive the round trip unchanged (API spec section 3.5).
+// The one line that matters here is the codec registration, though not for the
+// reason it is tempting to give. Removing it and re-running the precision suite
+// (the experiment is worth repeating if this ever looks like dead weight) leaves
+// every value round trip passing, 2^53 + 1 included: without a registered codec
+// pgx falls back to shopspring's own sql.Scanner/driver.Valuer, which is textual
+// and does not lose digits. There is no float in that path.
+//
+// What does break is scale. Unregistered, a numeric stored as 4000.10 comes back
+// with exponent -1 rather than -2 — the value is right, the recorded precision is
+// not. Registering the codec makes decimal.Decimal the native representation of
+// `numeric` in both directions, so coefficient and exponent both survive, which
+// is what lets a mark or a fee be read back exactly as the venue quoted it
+// (API spec section 3.5). TestTrailingZerosSurviveAsScale is the test that fails
+// if this line is removed.
 //
 // pgx redacts the password when it reports a bad connection string, so wrapping
 // its error cannot leak a credential into a log line (spec section 9); the test
