@@ -15,7 +15,7 @@ Conventions defined once so every build part tests the same way. Per-part accept
 
 - Tests live beside code (`*_test.go`); fixtures in `testdata/` per package.
 - **Table-driven tests** for anything rule- or band-shaped: decision rules (one case per reason code, per build-plan Part 12), z-score bands, pressure levels, hard stops (one per stop kind), exec state machine transitions (including out-of-order and duplicate ExecReports).
-- **Golden files** for feature computation: fixed input series in `testdata/`, expected outputs committed. Regenerate with `go test -update`, and the regenerated diff is reviewed like code — a golden change without an explanation is a red flag.
+- **Golden files** for feature computation: fixed input series in `testdata/`, expected outputs committed. Regenerate with `go test -update`, and the regenerated diff is reviewed like code — a golden change without an explanation is a red flag. The same convention covers the column-to-field bindings in `internal/db/testdata/row_bindings.json`: a changed line there is a column that changed meaning.
 - **No wall clock, no real randomness in logic.** Time enters through an injected clock interface; randomness (sim jitter) through a seeded source. Tests never `time.Sleep` to synchronize — use channels/sync primitives.
 - **`goleak`** on every test involving goroutines (ingest streams, writer, FIX sessions, router).
 - **Money is `decimal` in tests too** — expected values written as strings, never float literals.
@@ -24,6 +24,7 @@ Conventions defined once so every build part tests the same way. Per-part accept
 ## Integration tests
 
 - Build tag `//go:build integration`, run via `make test-integration` against the Compose TimescaleDB (real hypertables, real migrations — the schema is a contract under test). `golangci-lint` lints with the tag set, so these files are not a blind spot.
+- **Building with the `integration` tag is a request to run them.** If `DATABASE_URL` is unset the suite exits non-zero with the command to use, rather than skipping: `go test -tags integration` printing `ok` for a run that executed nothing is a green tick meaning the opposite of what it looks like.
 - **The suite creates and drops its own database** (`carry_integration`) beside the one `TEST_DATABASE_URL` points at, and never writes to that one. Self-recorded market history is the system's primary asset ([ADR-0002](decisions/0002-one-timescaledb-instance.md)); a test run must not be able to delete weeks of it. It connects over the published host port `15432`, which is deliberately not `5432` so a Postgres already on the developer's machine cannot be mistaken for the stack's.
 - FIX integration: real quickfixgo initiator ↔ acceptor over localhost, including the restart/resend scenario (Part 8 acceptance) — kill the initiator process mid-fill, restart, assert no lost ExecReport.
 - Deterministic sim: `sim-venue` under a fixed seed produces byte-identical fill sequences.
@@ -40,7 +41,7 @@ Every reliability claim in [architecture §8](architecture.md#8-reliability-desi
 | Fault | Expected behavior |
 |---|---|
 | WS drop / flap mid-decision | reconnect + gap counted; risk sees staleness; no crash |
-| DB outage | writer backpressure then fatal (invariant), services restart clean |
+| DB outage | writer backpressure, then retries that cannot duplicate (every insert is idempotent, ADR-0012); a batch whose commit status is unknown is re-sent and lands as a no-op if it had committed. Only a failure the server will repeat is fatal |
 | FIX disconnect mid-partial | resend recovery, no lost/duplicated fills |
 | Venue reject storm | orders → REJECTED terminal, no stuck state, alert |
 | Cancel/replace race | state machine converges, CumQty monotonic |

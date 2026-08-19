@@ -79,7 +79,11 @@ func parseFlags(args []string) (options, error) {
 	fs := flag.NewFlagSet(service, flag.ContinueOnError)
 
 	var o options
-	fs.StringVar(&o.databaseURL, "database-url", os.Getenv("DATABASE_URL"), "TimescaleDB connection string")
+	// Deliberately not defaulted to os.Getenv("DATABASE_URL"): flag.PrintDefaults
+	// renders a string flag's default verbatim, and ContinueOnError calls it on
+	// -h and on any bad flag — which would print the database password to stderr.
+	// The environment is read after parsing instead.
+	fs.StringVar(&o.databaseURL, "database-url", "", "TimescaleDB connection string (default $DATABASE_URL)")
 	fs.StringVar(&o.metricsAddr, "metrics-addr", ":9109", "address for /metrics and /healthz")
 	fs.StringVar(&o.perpProduct, "perp", "ETP-20DEC30-CDE", "perp product id for the first fake feed")
 	fs.StringVar(&o.spotProduct, "spot", "ETH-USD", "spot product id for the second fake feed")
@@ -92,6 +96,9 @@ func parseFlags(args []string) (options, error) {
 
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
+	}
+	if o.databaseURL == "" {
+		o.databaseURL = os.Getenv("DATABASE_URL")
 	}
 	if o.databaseURL == "" {
 		return options{}, errors.New("no database: set DATABASE_URL or pass -database-url")

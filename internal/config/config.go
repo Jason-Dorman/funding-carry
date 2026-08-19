@@ -31,6 +31,17 @@ import (
 
 // divisionPrecision is the number of digits decimal.Div keeps.
 //
+// Both this and the JSON pin below are set to the values shopspring already
+// defaults to, which is worth saying plainly: neither assignment changes how the
+// library behaves today. They are locks, not settings. The globals are mutable
+// and package-scoped, so any dependency can move them at any time, and the two
+// things they control — how a ratio rounds, and whether money serializes as a
+// string — are both silent when they change. Pinning them here, in the package
+// every binary loads first, is what makes the default a decision rather than an
+// accident. TestDecimalGlobalsBehaveAsPinned checks the behaviour rather than
+// the variables, because reading a global back and comparing it to the constant
+// just assigned to it proves nothing.
+//
 // Div is the only decimal operation that is not exact — Add, Sub and Mul are
 // arbitrary precision — and the library controls it through a mutable
 // package-level global that any dependency could change at any time. Pinning it
@@ -57,17 +68,39 @@ func init() {
 }
 
 // Secret is a configuration value that must never appear in a log line, an error
-// message, or a %v of the struct that holds it. Both String and LogValue redact,
-// so the only way to read one is Reveal at the point of use.
+// message, or a rendering of the struct that holds it (spec section 9).
+//
+// Redaction has to cover every verb a credential can escape through, because the
+// gaps are not obvious and each one is silent. String and LogValue alone are not
+// enough: slog resolves LogValuer only on the attribute value itself, so a Secret
+// nested inside a struct falls through to encoding/json, and JSON is the logging
+// format containers run with. GoString covers %#v, and MarshalText covers the
+// encoders that reach for it before MarshalJSON. Every one of these is asserted
+// in config_test.go — the guarantee is only worth what its test covers.
+//
+// Reveal is the sole way out.
 type Secret string
 
 const redacted = "[REDACTED]"
 
 func (s Secret) String() string { return redacted }
 
+// GoString redacts under %#v, which prints the underlying string rather than
+// calling String.
+func (s Secret) GoString() string { return redacted }
+
 // LogValue implements slog.LogValuer, which is what keeps a Secret redacted when
-// a config struct is logged as a structured attribute.
+// it is logged as an attribute value in its own right.
 func (s Secret) LogValue() slog.Value { return slog.StringValue(redacted) }
+
+// MarshalJSON is what keeps a Secret redacted when it is *not* the attribute
+// value — nested in a config struct handed to slog's JSON handler, or passed to
+// encoding/json directly.
+func (s Secret) MarshalJSON() ([]byte, error) { return []byte(`"` + redacted + `"`), nil }
+
+// MarshalText covers encoders that prefer TextMarshaler, and makes a Secret used
+// as a JSON map key redact too.
+func (s Secret) MarshalText() ([]byte, error) { return []byte(redacted), nil }
 
 // Reveal returns the underlying value. Every call site is a place to check that
 // the secret is going to the venue and not to a log.

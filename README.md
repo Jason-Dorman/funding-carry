@@ -88,7 +88,10 @@ make replay           # 30-day backtest, refreshes Grafana
 services report healthy. Grafana is on `:3000`, Prometheus on `:9090`, Alertmanager
 on `:9093`, TimescaleDB on `:15432` (not the default `5432`, so it cannot collide
 with a Postgres already on the machine); the binaries expose `/metrics` on `:9101`
-(ingest), `:9102` (carry) and `:9103` (sim-venue).
+(ingest), `:9102` (carry) and `:9103` (sim-venue). Every published port binds
+`127.0.0.1` only — Docker's port rules sit in front of the host firewall, so the
+usual `0.0.0.0` default would put an anonymous-viewer Grafana and the database on
+every interface.
 
 `make migrate` runs a one-shot container that applies the embedded migrations and
 exits — bringing the stack up never changes the schema on its own. It is safe to

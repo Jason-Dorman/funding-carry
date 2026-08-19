@@ -110,3 +110,38 @@ func indexOf(columns []string, name string) int {
 	}
 	panic("no column named " + name + " in " + strings.Join(columns, ", "))
 }
+
+// The writer re-sends a batch whose commit status it could not determine, and
+// that is safe only because a repeated insert lands as a no-op. This is the
+// assumption behind it, checked mechanically: a table added later without a
+// conflict clause would silently turn that retry back into the duplicate-row
+// bug, and nothing else in the suite would notice.
+func TestEveryRowTypeIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	for _, r := range everyRowType() {
+		d := r.row()
+		t.Run(d.table, func(t *testing.T) {
+			t.Parallel()
+
+			if d.conflict == "" {
+				t.Fatalf("%s has no ON CONFLICT clause: the writer's retry would duplicate "+
+					"its rows. Give the table the unique key that is its real identity "+
+					"(API spec section 5.3), or say here why it has none",
+					d.table)
+			}
+			if !strings.HasPrefix(d.conflict, "ON CONFLICT (") {
+				t.Errorf("%s: conflict clause should name its key explicitly, got %q",
+					d.table, d.conflict)
+			}
+			// DO NOTHING or DO UPDATE both make a repeat harmless; a bare
+			// ON CONFLICT with neither would not compile as SQL, but an
+			// unqualified DO UPDATE that changed a value on every repeat would
+			// not be idempotent either.
+			if !strings.Contains(d.conflict, "DO NOTHING") && !strings.Contains(d.conflict, "DO UPDATE") {
+				t.Errorf("%s: conflict clause resolves to neither DO NOTHING nor DO UPDATE: %q",
+					d.table, d.conflict)
+			}
+		})
+	}
+}

@@ -24,5 +24,6 @@ One short file per decision that shaped the system. ADRs make the build's judgme
 | [0009](0009-perp-venue-coinbase.md) | Perp venue is Coinbase US perpetual-style futures, not Hyperliquid | accepted |
 | [0010](0010-embedded-migrations.md) | Migrations embedded in the binaries, applied by a one-shot `cmd/migrate` | accepted |
 | [0011](0011-decimal-json-encoding.md) | Decimals in `jsonb` columns are JSON strings, not JSON numbers | accepted |
+| [0012](0012-idempotent-inserts-natural-keys.md) | Every insert is idempotent, keyed on the row's natural identity; `positions.id` is a client-minted ULID | accepted |
 
 Pending (from spec §12 — will become ADRs when decided): Advanced Trade Go client (hand-rolled vs community, wk 1/Part 5), automated Base spot venue (DEX aggregator vs Coinbase spot + withdraw, wk 4), FIX beyond sim-venue (wk 7/Part 21), z-score minimum history, Rust port.

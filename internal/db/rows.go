@@ -112,6 +112,7 @@ func (r VenueStateRow) row() rowData {
 			r.FundingAnnualized, r.PremiumProxy, r.SpreadBps, r.OpenInterest,
 			r.MaintenanceWindow,
 		},
+		conflict: "ON CONFLICT (product_id, ts) DO NOTHING",
 	}
 }
 
@@ -173,6 +174,7 @@ func (r BookSnapshotRow) row() rowData {
 			r.BidPx, r.BidDepth, r.AskPx, r.AskDepth,
 			r.ImbalanceTopN, r.ImpactBidPx, r.ImpactAskPx,
 		},
+		conflict: "ON CONFLICT (product_id, ts) DO NOTHING",
 	}
 }
 
@@ -217,9 +219,10 @@ type BaseStateRow struct {
 
 func (r BaseStateRow) row() rowData {
 	return rowData{
-		table:   "base_state",
-		columns: []string{"ts", "spot_px", "wallet_eth", "wallet_usdc", "gas_gwei"},
-		values:  []any{r.TS, r.SpotPx, r.WalletETH, r.WalletUSDC, r.GasGwei},
+		table:    "base_state",
+		columns:  []string{"ts", "spot_px", "wallet_eth", "wallet_usdc", "gas_gwei"},
+		values:   []any{r.TS, r.SpotPx, r.WalletETH, r.WalletUSDC, r.GasGwei},
+		conflict: "ON CONFLICT (ts) DO NOTHING",
 	}
 }
 
@@ -255,6 +258,7 @@ func (r AccountStateRow) row() rowData {
 			r.ContractsHeld, r.AvgEntryPrice, r.UnrealizedPnL,
 			r.IntradayMarginEnabled,
 		},
+		conflict: "ON CONFLICT (ts) DO NOTHING",
 	}
 }
 
@@ -346,6 +350,7 @@ func (r FeatureRow) row() rowData {
 			text(r.CrowdedSide), text(r.PressureLevel), r.ExpectedPain,
 			r.ExhaustionFlag,
 		},
+		conflict: "ON CONFLICT (product_id, ts) DO NOTHING",
 	}
 }
 
@@ -427,12 +432,22 @@ func (r DecisionRow) row() rowData {
 			r.TS, r.State, r.TargetSpot, r.TargetContracts, r.ResidualDelta,
 			codes, r.Confidence, r.InputSnapshot,
 		},
+		conflict: "ON CONFLICT (ts) DO NOTHING",
 	}
 }
 
 // PositionRow is one carry, bucketed by venue so paper, sim and live P&L never
 // mix.
+//
+// ID is minted by the component that opens the position, not by the database.
+// A carry has no property that identifies it — its open time is a fact about it,
+// not its identity, and venue, size and price all repeat — so identity here is
+// assigned rather than discovered. A ULID (the convention ClOrdID already uses)
+// is known before the insert, which is what lets fills and funding events
+// reference a position without anyone reading an id back out of the database:
+// a read-back from a producer would be a second writer.
 type PositionRow struct {
+	ID                       string
 	OpenedAt                 time.Time
 	ClosedAt                 time.Time
 	Venue                    string // VenuePaper | VenueSim | VenueLive
@@ -452,17 +467,18 @@ func (r PositionRow) row() rowData {
 	return rowData{
 		table: "positions",
 		columns: []string{
-			"opened_at", "closed_at", "venue", "spot_qty", "perp_contracts",
+			"id", "opened_at", "closed_at", "venue", "spot_qty", "perp_contracts",
 			"avg_spot_px", "avg_perp_px", "accrued_funding",
 			"settlement_pending_funding", "fees", "slippage", "realized_pnl",
 			"status",
 		},
 		values: []any{
-			r.OpenedAt, stamp(r.ClosedAt), r.Venue, r.SpotQty, r.PerpContracts,
+			r.ID, r.OpenedAt, stamp(r.ClosedAt), r.Venue, r.SpotQty, r.PerpContracts,
 			r.AvgSpotPx, r.AvgPerpPx, r.AccruedFunding,
 			r.SettlementPendingFunding, r.Fees, r.Slippage, r.RealizedPnL,
 			r.Status,
 		},
+		conflict: "ON CONFLICT (id) DO NOTHING",
 	}
 }
 
@@ -470,16 +486,19 @@ func (r PositionRow) row() rowData {
 // a FIX resend inserts nothing new, because the venue's own execution id is
 // unique.
 type FillRow struct {
-	TS          time.Time
-	PositionID  *int64
-	ClOrdID     string
-	Venue       string
-	Leg         string // spot | perp
-	Side        string // buy | sell
-	Qty         decimal.Decimal
-	Px          decimal.Decimal
-	Fee         decimal.NullDecimal
-	ExecState   string // NEW | PARTIAL | FILLED | CANCELED | REJECTED
+	TS         time.Time
+	PositionID *string
+	ClOrdID    string
+	Venue      string
+	Leg        string // spot | perp
+	Side       string // buy | sell
+	Qty        decimal.Decimal
+	Px         decimal.Decimal
+	Fee        decimal.NullDecimal
+	ExecState  string // NEW | PARTIAL | FILLED | CANCELED | REJECTED
+	// VenueExecID is the venue's own id for this execution, and the identity of
+	// the row: FIX ExecID (tag 17) live and on sim, a minted id on paper. It is
+	// required, which is what makes replaying an ExecutionReport a no-op.
 	VenueExecID string
 	Raw         Snapshot
 }
@@ -493,9 +512,9 @@ func (r FillRow) row() rowData {
 		},
 		values: []any{
 			r.TS, r.PositionID, r.ClOrdID, r.Venue, r.Leg, r.Side, r.Qty,
-			r.Px, r.Fee, r.ExecState, text(r.VenueExecID), r.Raw,
+			r.Px, r.Fee, r.ExecState, r.VenueExecID, r.Raw,
 		},
-		conflict: "ON CONFLICT (venue, venue_exec_id) WHERE venue_exec_id IS NOT NULL DO NOTHING",
+		conflict: "ON CONFLICT (venue, venue_exec_id) DO NOTHING",
 	}
 }
 
@@ -504,12 +523,15 @@ func (r FillRow) row() rowData {
 // double as the observed funding series, and re-running the history backfill
 // inserts nothing new.
 type FundingEventRow struct {
+	// TS is the start of the funding hour for an ACCRUAL — the rate is a
+	// property of the hour, not of the moment it was computed — and the time the
+	// adjustment was observed for a SETTLEMENT.
 	TS            time.Time
 	ProductID     string
 	Kind          string // FundingKindAccrual | FundingKindSettlement
 	RateHourly    decimal.NullDecimal
 	FundingSource string
-	PositionID    *int64
+	PositionID    *string
 	Amount        decimal.Decimal // signed: positive = received
 	SettledBy     *int64
 	SpotMark      decimal.NullDecimal
@@ -527,7 +549,7 @@ func (r FundingEventRow) row() rowData {
 			r.TS, r.ProductID, r.Kind, r.RateHourly, text(r.FundingSource),
 			r.PositionID, r.Amount, r.SettledBy, r.SpotMark, r.Contracts,
 		},
-		conflict: "ON CONFLICT (product_id, kind, ts) WHERE position_id IS NULL DO NOTHING",
+		conflict: "ON CONFLICT (product_id, kind, ts, position_id) DO NOTHING",
 	}
 }
 
@@ -543,9 +565,10 @@ type RiskEventRow struct {
 
 func (r RiskEventRow) row() rowData {
 	return rowData{
-		table:   "risk_events",
-		columns: []string{"ts", "kind", "detail", "action_taken", "resolved_at"},
-		values:  []any{r.TS, r.Kind, r.Detail, text(r.ActionTaken), stamp(r.ResolvedAt)},
+		table:    "risk_events",
+		columns:  []string{"ts", "kind", "detail", "action_taken", "resolved_at"},
+		values:   []any{r.TS, r.Kind, r.Detail, text(r.ActionTaken), stamp(r.ResolvedAt)},
+		conflict: "ON CONFLICT (ts, kind) DO NOTHING",
 	}
 }
 
@@ -572,5 +595,6 @@ func (r FIXSessionRow) row() rowData {
 			r.SessionID, r.StartedAt, stamp(r.EndedAt), r.LastInSeq,
 			r.LastOutSeq, r.Disconnects,
 		},
+		conflict: "ON CONFLICT (session_id, started_at) DO NOTHING",
 	}
 }

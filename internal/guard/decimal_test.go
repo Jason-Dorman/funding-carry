@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
-	"strings"
 	"sync"
 	"testing"
 
@@ -96,30 +95,89 @@ func TestNoEqualityOperatorOnDecimal(t *testing.T) {
 	})
 }
 
-// Money never enters the system through a float. NewFromFloat and its siblings
-// are the only constructors that can carry binary rounding error into a decimal,
-// so they are banned outright; values come from strings, integers, or the
-// database.
-func TestNoDecimalConstructedFromFloat(t *testing.T) {
+// Money never enters the system through a float, and never leaves through one
+// either.
+//
+// The rule is expressed against the *signature* rather than against a list of
+// names. A name list only ever bans what someone thought of: it caught
+// NewFromFloat and missed Float64, InexactFloat64, and anything the library adds
+// later, so a value could be taken out to float64, arithmetic done on it there,
+// and a decimal rebuilt from the result with the guard silent throughout. Any
+// decimal function that mentions a float in its parameters or its results is a
+// door in or out, and all of them are shut.
+//
+// It also matches references, not just calls: `f := decimal.NewFromFloat` and a
+// call through f is the same door with a longer handle.
+func TestNoFloatCrossesTheDecimalBoundary(t *testing.T) {
 	t.Parallel()
 
 	inspectModule(t, func(pkg *packages.Package, node ast.Node) {
-		call, ok := node.(*ast.CallExpr)
+		ident, ok := node.(*ast.Ident)
 		if !ok {
 			return
 		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return
-		}
-		fn, ok := pkg.TypesInfo.Uses[sel.Sel].(*types.Func)
+		fn, ok := pkg.TypesInfo.Uses[ident].(*types.Func)
 		if !ok || fn.Pkg() == nil || fn.Pkg().Path() != decimalPkg {
 			return
 		}
-		if !strings.HasPrefix(fn.Name(), "NewFromFloat") {
+		sig, ok := fn.Type().(*types.Signature)
+		if !ok {
 			return
 		}
-		t.Errorf("%s: decimal.%s carries float rounding error — build decimals from strings or integers",
-			pkg.Fset.Position(call.Lparen), fn.Name())
+		if where := floatInSignature(sig); where != "" {
+			t.Errorf("%s: decimal.%s has a float64 in its %s — money does not cross that "+
+				"boundary in either direction; build decimals from strings or integers, "+
+				"and compare or format them as decimals",
+				pkg.Fset.Position(ident.Pos()), fn.Name(), where)
+		}
+	})
+}
+
+// floatInSignature reports where a float appears in a signature, if it does.
+func floatInSignature(sig *types.Signature) string {
+	if tupleHasFloat(sig.Params()) {
+		return "parameters"
+	}
+	if tupleHasFloat(sig.Results()) {
+		return "results"
+	}
+	return ""
+}
+
+func tupleHasFloat(tuple *types.Tuple) bool {
+	for i := range tuple.Len() {
+		basic, ok := types.Unalias(tuple.At(i).Type()).(*types.Basic)
+		if ok && (basic.Kind() == types.Float64 || basic.Kind() == types.Float32) {
+			return true
+		}
+	}
+	return false
+}
+
+// The equality rule has two more doors than the binary-expression check covers.
+// A switch on a decimal compares its tag against each case with ==, and a map
+// keyed by a decimal compares keys the same way. Both compile, both are silently
+// always-false, and neither is a BinaryExpr.
+func TestNoImplicitDecimalEquality(t *testing.T) {
+	t.Parallel()
+
+	inspectModule(t, func(pkg *packages.Package, node ast.Node) {
+		switch n := node.(type) {
+		case *ast.SwitchStmt:
+			// A tagless switch compares nothing; its cases are booleans.
+			if n.Tag == nil || !isDecimal(pkg.TypesInfo.TypeOf(n.Tag)) {
+				return
+			}
+			t.Errorf("%s: switch on a decimal.Decimal compares each case with ==, which is "+
+				"never true — use Equal or Cmp in an if chain",
+				pkg.Fset.Position(n.Switch))
+		case *ast.MapType:
+			if !isDecimal(pkg.TypesInfo.TypeOf(n.Key)) {
+				return
+			}
+			t.Errorf("%s: a map keyed by decimal.Decimal compares keys with ==, so two "+
+				"decimals parsed from the same string are different keys — key by String()",
+				pkg.Fset.Position(n.Pos()))
+		}
 	})
 }

@@ -206,9 +206,11 @@ Money is `decimal.Decimal` in Go and `numeric` in SQL, end to end (spec §11). T
 | Truncate toward zero when quantizing contracts, never `Floor` | A short is a negative contract count; `Floor(-7.9) = -8` rounds *up* into more risk | table test with negative cases, build plan Part 13 |
 | A decimal in a `jsonb` column is a JSON **string**, never a JSON number | Postgres keeps a bare JSON number exact, so nothing inside the system notices; the loss lands on every consumer outside Go — the Python backtester, `jq`, a browser reading a Grafana panel — which parse JSON numbers as IEEE-754 doubles. A decision's recorded inputs then stop matching the decision that was made from them | `decimal.MarshalJSONWithoutQuotes` pinned false in `internal/config`; `internal/db.EncodeSnapshot` refuses to encode if it is ever true; round trip through `jsonb` asserted in the integration suite ([ADR-0011](decisions/0011-decimal-json-encoding.md)) |
 
-`decimal` ↔ `numeric` is exact in both directions because `internal/db` registers the shopspring codec on every pgx connection, making `decimal.Decimal` the native representation of `numeric` rather than something reached through `pgtype.Numeric` and a float. The integration suite proves it with values a `float64` cannot hold (`2^53 + 1` and wider). Note that Postgres preserves a numeric's *scale* while `String()` drops trailing zeros: `0.10` stored and read back is still scale 2, and still renders as `0.1` — which is why money-facing output uses `StringFixed(n)`.
+`decimal` ↔ `numeric` is exact in both directions, proven by the integration suite with values a `float64` cannot hold (`2^53 + 1` and wider). `internal/db` registers the shopspring codec on every pgx connection, and it is worth being precise about what that buys, because the obvious explanation is wrong: removing the registration leaves every *value* round trip passing, since pgx then falls back to shopspring's own textual `sql.Scanner`/`driver.Valuer` and no float is involved on either path. What the codec preserves is **scale** — unregistered, a numeric stored as `4000.10` returns with exponent −1 instead of −2, so the value is right and the recorded precision is not. Registering it makes `decimal.Decimal` the native representation of `numeric`, and coefficient and exponent both survive.
 
-`Add`, `Sub` and `Mul` are exact at arbitrary precision. `Div` is not: it rounds to `decimal.DivisionPrecision`, a mutable package global pinned to 16 by `internal/config`'s `init` so division is identical across processes, tests and replays. Division is for **ratios** (margin ratio, basis, premium proxy); a value that must reconcile against a venue statement is added and multiplied, never divided.
+Scale matters separately from value because `String()` drops trailing zeros: `0.10` stored and read back is still scale 2 and still renders as `0.1`, which is why money-facing output uses `StringFixed(n)`.
+
+`Add`, `Sub` and `Mul` are exact at arbitrary precision. `Div` is not: it rounds to `decimal.DivisionPrecision`, a mutable package global pinned to 16 by `internal/config`'s `init` so division is identical across processes, tests and replays. Both that pin and the JSON one are set to the values shopspring already defaults to — they are locks against a dependency moving a mutable global, not changes in behaviour, and they are asserted through what they control (a ratio rounding to 16 places, a decimal marshalling as a string) rather than by reading the globals back. Division is for **ratios** (margin ratio, basis, premium proxy); a value that must reconcile against a venue statement is added and multiplied, never divided.
 
 For display, `String()` drops trailing zeros (`0.10` renders as `0.1`). Anything money-facing — reports, dashboards, reconciliation output — uses `StringFixed(n)`.
 
@@ -427,20 +429,37 @@ The schema carries the rules that must hold regardless of which process wrote th
 
 **Read paths.** `(product_id, ts DESC)` on every product-scoped series table — the venue state cache, the feature engine's warm start and the replay all read "the latest rows for this product". `base_state` needs none beyond the hypertable's own time index; it has no product dimension. `decisions` and `risk_events` are indexed on `(ts DESC)`, `risk_events` again on unresolved rows only, `positions` on open positions only, and `fills` on `(position_id, ts DESC)` and `cl_ord_id`.
 
-**Idempotency.** Three unique indexes are what let a backfill or a resend be replayed safely, with inserts written as `ON CONFLICT … DO NOTHING`:
+**Idempotency — every table, not just the backfilled ones.** Each table carries a unique key that is the identity of one of its rows, and every insert is written `ON CONFLICT … DO NOTHING`. This is what lets the writer re-send a batch whose commit status it could not determine ([ADR-0012](decisions/0012-idempotent-inserts-natural-keys.md)); it also makes the Part 5 backfills and Part 8 FIX resends replayable, which is what the first three keys were originally for.
 
-| Index | Makes idempotent |
-|---|---|
-| `cb_bars (product_id, tf, ts)` | candle backfill (Part 5) |
-| `cb_trades_agg (product_id, bucket_secs, ts)` | trade backfill (Part 5) |
-| `funding_events (product_id, kind, ts) WHERE position_id IS NULL` | funding-history backfill (Part 5) |
-| `fills (venue, venue_exec_id) WHERE venue_exec_id IS NOT NULL` | FIX resend after reconnect (Part 8) — an ExecutionReport delivered twice inserts one row |
+| Table | Identity | Makes idempotent |
+|---|---|---|
+| `cb_venue_state` | `(product_id, ts)` | poll re-sends, writer retries |
+| `cb_bars` | `(product_id, tf, ts)` | candle backfill (Part 5) |
+| `cb_book_snapshots` | `(product_id, ts)` | snapshot re-sends |
+| `cb_trades_agg` | `(product_id, bucket_secs, ts)` | trade backfill (Part 5) |
+| `cb_features` | `(product_id, ts)` | tick re-computation, warm restart |
+| `base_state`, `cb_account_state` | `(ts)` | poll re-sends |
+| `cb_products` | `(product_id)` (upsert) | product refresh |
+| `decisions` | `(ts)` | decision re-emission |
+| `positions` | `(id)` — a client-minted ULID | see below |
+| `fills` | `(venue, venue_exec_id)` | FIX resend after reconnect (Part 8) |
+| `funding_events` | `(product_id, kind, ts, position_id)`, `NULLS NOT DISTINCT` | funding-history backfill (Part 5) |
+| `risk_events` | `(ts, kind)` | event re-emission |
+| `fix_sessions` | `(session_id, started_at)` | session re-record |
+
+Three obligations come with that table, and none of them is enforceable by the schema alone:
+
+- **`ts` is the sampling boundary, not `time.Now()`.** For the series tables and `cb_features`, producers align the timestamp to the poll or tick boundary. A nanosecond-resolution clock reading makes every row unique, and the constraint becomes decorative. Parts 4–6 own this.
+- **`funding_events.ts` is the start of the funding hour** for an `ACCRUAL` — the rate is a property of the hour (venue doc §3), not of the moment it was computed. `position_id` is in the key because one hour legitimately produces both an observed-series row (`position_id NULL`) and a position-linked accrual; `NULLS NOT DISTINCT` is what makes the observed row collide with its own repeat.
+- **`fills.venue_exec_id` is `NOT NULL`.** Every `Venue` implementation supplies one: FIX `ExecID` (tag 17) live and on sim, a minted id on paper.
+
+`positions` is the one table with no natural key — a carry has no property that identifies it — so its identity is assigned rather than discovered: `id` is a client-minted ULID, the same convention as `ClOrdID`. That also removes the need to read a generated id back before `fills` and `funding_events` can reference it, which would have made a producer into a second writer.
 
 **Closed vocabularies** are `CHECK` constraints, so a value outside the set is rejected at write time rather than found in a dashboard: `funding_source ∈ {venue, computed}` (on `cb_venue_state`, `cb_features`, `funding_events`), `decisions.state`, `fills.leg`/`side`/`exec_state`, `positions.venue`, `funding_events.kind`, and `cb_features.crowded_side`/`pressure_level`. `risk_events.kind` is deliberately *not* constrained — it is an append-only vocabulary that grows with the risk engine, and a rejected insert there would lose the record of the event it describes.
 
 **Cross-column invariants.** `funding_events` enforces that a `SETTLEMENT` row carries no `rate_hourly`, no `funding_source` and no `settled_by`: a settlement is an observed cash movement, and a rate on one would make the accrual-versus-settlement reconciliation meaningless.
 
-`positions.id`, `decisions.id`, `fills.id`, `funding_events.id`, `risk_events.id` and `fix_sessions.id` are `bigint GENERATED ALWAYS AS IDENTITY`. Nothing yet reads a generated id back — the writer is append-only — so how a position's id reaches the fills that reference it is an open question recorded against Part 13 in the [build plan](build-plan.md#changelog--decision-record).
+`decisions.id`, `fills.id`, `funding_events.id`, `risk_events.id` and `fix_sessions.id` are `bigint GENERATED ALWAYS AS IDENTITY` — nothing references them, so nothing needs to know them in advance. `positions.id` is a `text` ULID assigned by the caller, which is what closes the question previously left open against Part 13.
 
 ---
 
@@ -448,7 +467,7 @@ The schema carries the rules that must hold regardless of which process wrote th
 
 All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-cardinality (`product`, `stream`, `venue`, `leg`, `component`).
 
-The three writer metrics (`rows_written_total`, `write_batch_seconds`, `write_queue_depth`) come from shared code in `internal/db` and take the prefix of whichever binary owns that writer, so `carry_rows_written_total` exists alongside the `ingest_` ones listed below. "Is this binary keeping up with its writes?" is a per-binary question.
+The four writer metrics (`rows_written_total`, `rows_conflicted_total`, `write_batch_seconds`, `write_queue_depth`) come from shared code in `internal/db` and take the prefix of whichever binary owns that writer, so `carry_rows_written_total` exists alongside the `ingest_` ones listed below. "Is this binary keeping up with its writes?" is a per-binary question. `rows_written_total` and `rows_conflicted_total` are deliberately separate: with `ON CONFLICT` on every insert, a re-sent batch is silent in every other signal, and a single counter adding the two together would report a retry storm as healthy throughput.
 
 One prefix is deliberately outside this catalogue: the Part 3 learning exercise in `research/onramp/` exports `onramp_*` series and nothing scrapes it. It is not a service, it is not in the Compose stack, and its metrics are not alertable — the exception is recorded here so it does not read as drift.
 
@@ -457,7 +476,8 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `ingest_last_seen_timestamp_seconds` | gauge | stream | unix ts of last message per stream |
 | `ingest_ws_reconnects_total` | counter | stream | reconnect count |
 | `ingest_ws_gaps_total` | counter | stream | detected gaps |
-| `ingest_rows_written_total` | counter | table | writer throughput |
+| `ingest_rows_written_total` | counter | table | rows the database actually inserted (from the command tag, not rows submitted) |
+| `ingest_rows_conflicted_total` | counter | table | rows the database already had: inserts that hit their natural key and did nothing |
 | `ingest_write_batch_seconds` | histogram | — | batch insert latency |
 | `ingest_write_queue_depth` | gauge | — | rows waiting on the writer's channel; a rising floor is backpressure |
 | `carry_funding_rate` | gauge | product, source | current hourly funding; `source` = venue\|computed |
@@ -553,7 +573,9 @@ Three values fail the load rather than being checked at trade time, because a co
 - `MAX_LEVERAGE` above 3 or non-positive — the overnight cap.
 - `DELTA_TOLERANCE_ETH` above half of `CONTRACT_SIZE_ETH` — the spot leg can always close residual delta smaller than half a contract, so a wider tolerance would accept delta the system could have removed.
 
-Credentials are typed as a redacting `Secret` in `internal/config`: `%v`, `String()` and `slog` attributes all render `[REDACTED]`, and the value is reachable only through an explicit `Reveal()` at the point of use.
+Credentials are typed as a redacting `Secret` in `internal/config`, reachable only through an explicit `Reveal()` at the point of use. Redaction covers `String()`, `GoString()` (`%#v`), `LogValue()` (slog attributes), `MarshalJSON` and `MarshalText` — the last two because slog resolves `LogValuer` only on the attribute value itself, so a `Secret` nested inside a struct handed to the JSON handler falls through to `encoding/json`, and JSON is the format containers log in. A `Secret` that redacted only under `fmt` and a top-level slog attribute would be redacted on every path except the one production uses; `TestSecretsAreRedacted` asserts all of them.
+
+`DATABASE_URL` is **not** a `Secret` — it is a plain `string` on `Common`, and it carries the database password. Nothing logs it today, and pgx redacts it in its own connection errors, but a `%v` of a whole config struct would print it. Typing it as a `Secret` is a change to the shape every later part consumes, so it is recorded here as an open item rather than made silently.
 
 ---
 

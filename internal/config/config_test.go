@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -54,13 +55,40 @@ func loadErr[T any](load func(lookupFunc) (*T, error)) func(lookupFunc) error {
 	}
 }
 
-// Importing config must pin the library's one mutable global, whatever a
-// dependency may have set it to.
-func TestDivisionPrecisionIsPinned(t *testing.T) {
+// Both pins are asserted through the behaviour they exist to fix, not through
+// the variables they set.
+//
+// Reading the global back and comparing it to the same constant the code just
+// assigned proves only that Go assignment works: shopspring's own defaults are
+// 16 and false, so deleting the entire init body left that test passing and it
+// was worth nothing. What the pins actually promise is that division rounds to a
+// known number of places and that a decimal serializes as a string, in this
+// process, after every dependency's init has run. Those are observable, so they
+// are what is checked — and either would fail if a dependency moved a global out
+// from under us, which is the only failure the pins exist to catch.
+func TestDecimalGlobalsBehaveAsPinned(t *testing.T) {
 	t.Parallel()
 
-	if got, want := decimal.DivisionPrecision, divisionPrecision; got != want {
-		t.Errorf("decimal.DivisionPrecision = %d, want %d", got, want)
+	// 1/3 to the pinned precision: 16 places, the last one rounded up.
+	quotient := decimal.RequireFromString("1").Div(decimal.RequireFromString("3"))
+	const wantQuotient = "0.3333333333333333"
+	if got := quotient.String(); got != wantQuotient {
+		t.Errorf("1/3 = %s, want %s — division is not rounding to %d places, so two "+
+			"processes can disagree about a ratio", got, wantQuotient, divisionPrecision)
+	}
+	if places := -quotient.Exponent(); int(places) != divisionPrecision {
+		t.Errorf("1/3 has %d decimal places, want %d", places, divisionPrecision)
+	}
+
+	// And a decimal marshals as a JSON string. A bare number here would be exact
+	// in Postgres and a float everywhere else (ADR-0011).
+	encoded, err := json.Marshal(decimal.RequireFromString("0.0000123456789012345678"))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := `"0.0000123456789012345678"`; string(encoded) != want {
+		t.Errorf("decimal marshalled as %s, want %s — a JSON number is read back as a "+
+			"float by every consumer outside Go", encoded, want)
 	}
 }
 
@@ -290,13 +318,22 @@ func TestDeltaToleranceAtExactlyHalfAContractIsAccepted(t *testing.T) {
 	}
 }
 
-// A secret must not be readable through any of the paths a value normally leaks
-// by: fmt verbs, error strings, or a structured log attribute.
+// A secret must not be readable through any path a value can leak by. The list
+// below is deliberately exhaustive rather than representative: this test
+// previously covered only the fmt verbs and a top-level slog attribute, all of
+// which already redacted, while three renderings that did not — %#v,
+// encoding/json, and a Secret nested inside a struct handed to slog's JSON
+// handler — went unasserted and leaked in full. JSON is the format containers
+// log in, so the untested path was the one production runs.
 func TestSecretsAreRedacted(t *testing.T) {
 	t.Parallel()
 
 	const real = "super-secret-cdp-key"
-	cfg, err := loadCarry(withEnv(map[string]string{"CB_API_PRIVATE_KEY": real}))
+	cfg, err := loadCarry(withEnv(map[string]string{
+		"CB_API_PRIVATE_KEY": real,
+		"WALLET_ADDRESS":     "0xWALLET",
+		"SESSION_KEY":        "0xSESSIONKEY",
+	}))
 	if err != nil {
 		t.Fatalf("loadCarry: %v", err)
 	}
@@ -309,14 +346,49 @@ func TestSecretsAreRedacted(t *testing.T) {
 		t.Error("IsSet() = false, want true")
 	}
 
-	// %v, %s and Sprint all route through String; the struct case is the one that
-	// matters most, since that is how a whole config accidentally reaches a log.
-	for name, rendered := range map[string]string{
-		"%v":       fmt.Sprintf("%v", secret),
-		"Sprint":   fmt.Sprint(secret),
-		"String()": secret.String(),
-		"struct":   fmt.Sprintf("%v", cfg.Secrets),
-	} {
+	// The verb is a variable so staticcheck does not fold `fmt.Sprintf("%s", x)`
+	// into `x.String()`. Exercising each verb's own formatting path is the point:
+	// %v, %s and %#v reach a Secret through three different interfaces.
+	verb := func(format string, v any) string { return fmt.Sprintf(format, v) }
+	asJSON := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return string(b)
+	}
+	logged := func(format string, args ...any) string {
+		var buf strings.Builder
+		NewLogger(LogConfig{Level: slog.LevelInfo, Format: format}, &buf).Info("starting", args...)
+		return buf.String()
+	}
+
+	// Every rendering must both hide the credential and say so. A rendering that
+	// merely omits it would pass the first check while quietly dropping a field.
+	renderings := map[string]string{
+		"%v":                     verb("%v", secret),
+		"%s":                     verb("%s", secret),
+		"%q":                     verb("%q", secret),
+		"%+v":                    verb("%+v", secret),
+		"%#v":                    verb("%#v", secret),
+		"Sprint":                 fmt.Sprint(secret),
+		"String()":               secret.String(),
+		"error":                  fmt.Errorf("connect with %v: %w", secret, errRequired).Error(),
+		"json.Marshal":           asJSON(secret),
+		"struct %v":              verb("%v", cfg.Secrets),
+		"struct %+v":             verb("%+v", cfg.Secrets),
+		"struct %#v":             verb("%#v", cfg.Secrets),
+		"struct json.Marshal":    asJSON(cfg.Secrets),
+		"whole config %v":        verb("%v", cfg),
+		"whole config json":      asJSON(cfg),
+		"slog text attr":         logged(FormatText, "key", secret),
+		"slog text struct":       logged(FormatText, "cfg", cfg.Secrets),
+		"slog json attr":         logged(FormatJSON, "key", secret),
+		"slog json struct":       logged(FormatJSON, "cfg", cfg.Secrets),
+		"slog json whole config": logged(FormatJSON, "cfg", cfg),
+	}
+
+	for name, rendered := range renderings {
 		if strings.Contains(rendered, real) {
 			t.Errorf("%s leaked the secret: %s", name, rendered)
 		}
@@ -325,11 +397,12 @@ func TestSecretsAreRedacted(t *testing.T) {
 		}
 	}
 
-	var buf strings.Builder
-	NewLogger(LogConfig{Level: slog.LevelInfo, Format: FormatJSON}, &buf).
-		Info("starting", "key", secret)
-	if strings.Contains(buf.String(), real) {
-		t.Errorf("slog attribute leaked the secret: %s", buf.String())
+	// The other two secrets travel the same paths; a rendering that redacts one
+	// field and not its neighbours would still be a leak.
+	for _, other := range []string{"0xWALLET", "0xSESSIONKEY"} {
+		if out := logged(FormatJSON, "cfg", cfg); strings.Contains(out, other) {
+			t.Errorf("slog json whole config leaked %s: %s", other, out)
+		}
 	}
 }
 
