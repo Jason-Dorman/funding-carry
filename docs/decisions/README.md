@@ -25,5 +25,7 @@ One short file per decision that shaped the system. ADRs make the build's judgme
 | [0010](0010-embedded-migrations.md) | Migrations embedded in the binaries, applied by a one-shot `cmd/migrate` | accepted |
 | [0011](0011-decimal-json-encoding.md) | Decimals in `jsonb` columns are JSON strings, not JSON numbers | accepted |
 | [0012](0012-idempotent-inserts-natural-keys.md) | Every insert is idempotent, keyed on the row's natural identity; `positions.id` is a client-minted ULID | accepted |
+| [0013](0013-websocket-client-coder.md) | `github.com/coder/websocket` is the WebSocket client, behind a three-method interface | accepted |
+| [0014](0014-one-sampler-owns-venue-state.md) | One component samples `cb_venue_state`; every producer feeds it rather than writing rows | accepted |
 
 Pending (from spec §12 — will become ADRs when decided): Advanced Trade Go client (hand-rolled vs community, wk 1/Part 5), automated Base spot venue (DEX aggregator vs Coinbase spot + withdraw, wk 4), FIX beyond sim-venue (wk 7/Part 21), z-score minimum history, Rust port.

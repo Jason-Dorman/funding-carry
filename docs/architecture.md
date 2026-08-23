@@ -107,25 +107,34 @@ The one-writer pattern is the load-bearing idea: many readers, typed channels, e
 
 ```mermaid
 graph LR
-    subgraph "goroutines"
-        G1[WS: mids]
-        G2[WS: l2Book]
-        G3[WS: trades]
-        G4[WS: candles]
-        G5["poller: REST<br/>funding, marks, positions, margin, meta"]
-        G6[poller: Base<br/>balances, spot px, gas]
+    subgraph "stream goroutines (one WS connection each)"
+        G1["ticker<br/>perp + spot"]
+        G2["level2 -> l2_data<br/>perp"]
+        G3["market_trades<br/>perp + spot"]
+        G4["candles 5m<br/>perp + spot"]
+        G5["status<br/>perp"]
     end
-    G1 --> CH[typed channels<br/>fan-in select loop]
+    subgraph "poller goroutines"
+        G6["REST<br/>funding, marks, positions, margin, meta"]
+        G7["Base<br/>balances, spot px, gas"]
+    end
+    G1 --> VS["venue-state sampler<br/>one writer of cb_venue_state"]
+    G5 --> VS
+    G6 --> VS
+    VS --> CH["writer channel<br/>bounded, typed rows"]
     G2 --> CH
     G3 --> CH
     G4 --> CH
-    G5 --> CH
     G6 --> CH
+    G7 --> CH
     CH --> W[writer goroutine<br/>batch INSERT via pgx]
     W --> DB[(TimescaleDB)]
-    G1 --> M[Prometheus:<br/>last_seen per stream<br/>gap counters]
+    G1 --> M[Prometheus:<br/>last_seen per stream<br/>reconnect + gap counters]
     G2 --> M
+    G3 --> M
+    G4 --> M
     G5 --> M
+    G6 --> M
 ```
 
 Rules, enforced in review:
@@ -137,7 +146,11 @@ Rules, enforced in review:
    What the retry policy still decides is whether another attempt *could* succeed, not whether it is safe. A server error the database will raise again — a check violation, a missing column — fails at once instead of spending the flush timeout; everything else is retried. `rows_written_total` counts what the command tag reports rather than what was submitted, with `rows_conflicted_total` beside it, so a retry landing on work already done is visible rather than reading as throughput.
 
 2. **`context` cancellation flows down the stack.** Root context → per-stream contexts. Graceful shutdown = cancel root, flush channels, close writer, log out FIX, close pool — in that order. The writer's final flush runs on a context cancellation cannot reach, so SIGTERM still persists the last batch.
-3. **Each stream owns its reconnect loop** with exponential backoff + jitter. Reconnects and detected gaps increment per-stream counters; a `last_seen` timestamp gauge per stream feeds the staleness flag that the risk engine consumes.
+3. **Each stream owns its connection and its reconnect loop**, with exponential backoff and jitter over the top half of the window — a delay drawn from the whole window would retry a venue that is refusing connections about as often as it retried politely, which is what the schedule exists to prevent. Reconnects and detected gaps increment per-stream counters; a `last_seen` timestamp gauge per stream feeds the staleness flag that the risk engine consumes.
+
+   **A reconnect is a reset, not a resume.** The venue carries no subscription across a socket and restarts its sequence numbering, so every stream resubscribes and drops everything derived from the old connection. The order book is the case that matters: one carried across a drop is missing every update that happened while the socket was down, and nothing in the resulting row could reveal it. The same reasoning skips the trade bucket that was open across the drop — a partial aggregate written under a whole bucket's key can never be corrected, because `ON CONFLICT … DO NOTHING` drops the correction. What is *not* reset is knowledge of what has already been persisted: candle bookkeeping survives, so the window the venue replays on resubscribe refills the hole rather than rewriting it.
+
+   **Every connection also subscribes to `heartbeats`.** One frame a second on every socket, whatever the market is doing, is what makes a single read deadline a dependable liveness check across streams with completely different natural rates — and it gives each stream's own goroutine a regular pulse, so the periodic work (book snapshot, trade-bucket close, silence check) needs no timer beside the read loop and no lock around state the read loop owns. Heartbeats never advance `last_seen`: a staleness gauge that they did advance would report every dead feed as healthy.
 4. **Errors on a feed are wrapped and surfaced, not swallowed** — but a feed error degrades to `stale`, it never crashes the binary. Only invariant violations (e.g. writer cannot reach DB after retries) are fatal.
 
 The `carry` binary is simpler: a ticker-driven loop (decision tick) plus the FIX session goroutines that quickfixgo manages, plus one DB writer for decisions/fills/events.
@@ -416,6 +429,32 @@ The timeout is per-call, so a stuck dependency still cannot hang the process.
 This rule was written after `internal/db.Writer` violated it (see the Part 3
 entry in the [build plan changelog](build-plan.md#changelog--decision-record));
 every later part that performs I/O during shutdown is bound by it.
+
+**The writer outlives the cancellation that stops its producers.** The rule above
+is about one call; this one is about the component's whole lifetime, and Part 4
+found it the hard way. `Writer.shutdown` drains the rows producers have already
+handed over, and that drain is only correct once the producers have stopped —
+otherwise a row accepted after the drain has passed sits in a channel whose only
+reader has gone, with its producer told `nil`. So a binary must **not** hand the
+writer its root context. The writer is started on `context.WithoutCancel` and
+stopped by `Close`, which is called after every producer goroutine has returned.
+Ordering then falls out of the wiring instead of depending on a race:
+
+```
+cancel root -> producers return -> writer.Close() -> drain -> final flush -> pool close
+```
+
+Two things enforce it rather than describing it. `Submit` returns
+`ErrWriterStopped` from the moment shutdown *begins*, not from the moment it
+finishes, so a producer that is still running is refused rather than silently
+dropped (`TestSubmitIsRejectedOnceShutdownBegins`). And a writer that dies
+fatally must cancel its producers, because a producer only learns the writer is
+gone by being told so from a `Submit` — and not every producer submits. In
+`cmd/ingest` the ticker and status streams hand their observations to the
+venue-state sampler and never call `Submit` at all; without that cancellation
+they read a socket forever after a fatal write, the process never exits, and the
+Compose restart policy the table above relies on never fires
+(`TestPipelineExitsWhenTheWriterDies`).
 
 ---
 

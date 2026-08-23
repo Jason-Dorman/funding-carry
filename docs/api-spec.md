@@ -18,30 +18,39 @@ The system exposes no public HTTP API in v1. This document therefore specifies e
 
 ## 1. Coinbase Advanced Trade APIs (consumed)
 
-Base URL `https://api.coinbase.com/api/v3/brokerage/`. Auth is a CDP API key with JWT bearer tokens (ES256), the same scheme for REST and WS. Perp product `ETP-20DEC30-CDE`, spot reference product `ETH-USD` — both read from config as `PERP_PRODUCT_ID` / `SPOT_PRODUCT_ID`, never hard-coded.
+Base URL `https://api.coinbase.com/api/v3/brokerage/`. Authenticated calls use a CDP API key with JWT bearer tokens (ES256), the same scheme for REST and WS. **Market data is not one of them:** the public REST market endpoints and every WebSocket market-data channel in §1.1 serve the perp product unauthenticated (verified 2026-08-20), so `cmd/ingest` holds no credential. Auth is needed for the account and order-entry surfaces — §1.2's `cfm/*` endpoints (Part 5) and §1.3 (Part 16). Perp product `ETP-20DEC30-CDE`, spot reference product `ETH-USD` — both read from config as `PERP_PRODUCT_ID` / `SPOT_PRODUCT_ID`, never hard-coded.
 
 Venue mechanics (contract size, funding formula, margin model, fee schedule, `TODO(verify)` items) live in **[venue-coinbase-perps.md](venue-coinbase-perps.md)** and are not restated here.
 
 ### 1.1 WebSocket channels (`internal/ingest`)
 
-One goroutine per subscribed channel; both the perp product and the spot reference product are subscribed. **[verify]** in Part 4 that each channel accepts `ETP-20DEC30-CDE`.
+One goroutine **and one connection** per subscribed channel. Verified against the live socket 2026-08-20: every channel below accepts `ETP-20DEC30-CDE`, and **market data needs no authentication** — no JWT is minted or sent by `cmd/ingest`. JWT arrives with the account endpoints (§1.2, Part 5) and order entry (§1.3, Part 16), which do require it.
 
 | Channel | Payload (intent) | Products | Persisted to |
 |---|---|---|---|
-| `ticker` | price, best bid/ask, 24h stats | perp + spot | `cb_venue_state` (mid, marks, spread) |
-| `level2` | book updates by price level | perp | `cb_book_snapshots` (top-N, periodic snapshot, not every update) |
+| `ticker` | price, best bid/ask, 24h stats | perp + spot | `cb_venue_state` (mid, spread) via the sampler, [ADR-0014](decisions/0014-one-sampler-owns-venue-state.md) |
+| `level2` | book updates by price level; arrives labelled **`l2_data`** | perp | `cb_book_snapshots` (top-N, periodic snapshot, not every update) |
 | `market_trades` | px, sz, side, time | perp + spot | `cb_trades_agg` (bucketed aggregates); feeds 3-min VWAP marks |
-| `candles` | OHLCV | perp + spot | `cb_bars` (completed candles only) |
-| `status` | product status, maintenance | perp | maintenance-window flag in venue state |
+| `candles` | OHLCV, **5-minute granularity only** | perp + spot | `cb_bars` with `tf='5m'` (completed candles only) |
+| `status` | product status | perp | maintenance-window flag in venue state |
+| `heartbeats` | 1/s liveness, no product | every connection | not persisted — see below |
 | `user` *(live only)* | order and fill updates | perp | `fills`, `ExecReport` stream for `cbVenue` |
 | `futures_balance_summary` *(live only)* | margin fields incl. `available_margin`, `liquidation_threshold` | account | margin ratio for the risk engine |
 
+**A candle is complete when a later one has been *observed*, not when a later one shares its message.** The channel sends a `snapshot` of ~100 candles on subscribe and then `update` messages carrying **exactly one** candle — the one currently forming, re-sent as its OHLCV moves. So on the five-minute roll the update carries only the new candle; the one that just closed is never mentioned again. A client that waits for a newer candle in the same message writes almost no bars, silently (build plan Part 4, found by the soak). Ingest keeps the newest start seen across messages and the latest version of each unwritten candle, which also means a bar is persisted with its final values rather than with whichever snapshot happened to mention it.
+
+**The `candles` channel serves five-minute candles and nothing else.** Subscribing with `granularity: "ONE_MINUTE"`, with `granularity: 60`, and with no granularity at all all returned candles 300 seconds apart. The plan's one-minute bars come from `GET products/{id}/candles`, which does honour the parameter (§1.2, Part 5); `cb_bars` keys on `(product_id, tf, ts)` so the two coexist rather than colliding.
+
+**Every connection also subscribes to `heartbeats`.** It is not persisted and it never advances a stream's `last_seen`. It exists so that every socket carries a frame a second regardless of how quiet its data channel is, which turns two problems into one mechanism: the read deadline becomes a reliable liveness check on every stream rather than only the busy ones, and the per-stream silence check and the time-driven handlers (book snapshot, trade-bucket close) run on the read goroutine without a timer or a mutex.
+
 Client obligations:
 
-- JWT refreshed before expiry; re-auth on reconnect.
-- Reconnect with exponential backoff + jitter; resubscribe all channels; count gaps.
-- Detect gaps per stream: candle-time discontinuity, trade-time regression, or heartbeat silence > threshold.
+- Reconnect with exponential backoff + jitter; **resubscribe every channel on the new connection** — the venue carries no subscription across a socket — and drop every piece of per-connection state, the order book above all.
+- Detect gaps per stream: envelope `sequence_num` discontinuity, candle-time discontinuity, trade-time regression between messages, or silence on the stream's own channel beyond a per-channel threshold.
+- Treat an error frame (`{"type":"error", …}`) as a dead connection. The venue answers an unknown channel name with `"authentication failure"` and then goes quiet, so a client that waited it out would sit connected and empty.
 - Honor rate-limit headers; back off rather than retry-storm.
+
+`sequence_num` counts frames on the **connection**, not on the channel — the subscription acknowledgement and the heartbeats share the counter with the data. With one connection per channel that is exactly the property gap detection wants.
 
 ### 1.2 REST poller
 
@@ -49,7 +58,7 @@ Polled on a ticker (default 5s for market/account context; hourly aligned for fu
 
 | Endpoint | Used for | Persisted to |
 |---|---|---|
-| `GET products?product_type=FUTURE&contract_expiry_type=PERPETUAL` (venue `FCM`), `GET products/{id}` | product metadata: contract size, tick, status, `future_product_details` | `cb_products` |
+| `GET products?product_type=FUTURE` (venue `FCM`), `GET products/{id}` | product metadata: contract size, tick, status, `future_product_details` | `cb_products` |
 | `GET products/{id}/candles` | candle backfill after gaps and on first run | `cb_bars` |
 | `GET products/{id}/product_book`, `best_bid_ask` | book/quote snapshot when WS is degraded | `cb_book_snapshots` |
 | `GET products/{id}/market_trades` | trade backfill; VWAP mark inputs | `cb_trades_agg` |
@@ -59,6 +68,8 @@ Polled on a ticker (default 5s for market/account context; hourly aligned for fu
 | `GET/POST/DELETE cfm/sweeps` | move idle margin back to spot | treasury (Part 18) |
 | Fees / transaction summary (`product_type=FUTURE`, `product_venue=FCM`) | live fee tier | `cb_products` fee fields |
 | Funding rate, if exposed | official hourly rate | `cb_venue_state.funding_rate_hourly` |
+
+**Do not filter that listing on `contract_expiry_type=PERPETUAL`.** The perp reports `EXPIRING` with a 2030-12-20 expiry (verified 2026-08-20, [venue doc §6](venue-coinbase-perps.md#6-api-surface-retail-advanced-trade)), so the filter the plan originally specified returns nothing. Select the product by `product_id`, which is config, not a filter.
 
 **Funding is a first-class open question, not a field lookup.** The retail API may not publish a funding rate for this product (`TODO(verify)`, venue doc §3). The ingest layer therefore always computes its own estimate and records which source was used:
 
@@ -216,7 +227,11 @@ For display, `String()` drops trailing zeros (`0.10` renders as `0.1`). Anything
 
 ### 3.6 Ingest channel messages
 
-One struct per stream (`MidTick`, `BookSnap`, `TradeBatch`, `CandleClose`, `VenueSample`, `BaseSample`), each carrying venue timestamp + receive timestamp (for staleness and latency measurement). All flow into the writer's fan-in `select`; the writer owns mapping structs → batched inserts.
+Each stream decodes its channel's frames into the row types `internal/db` defines and hands them to the writer through a one-method `Sink` interface declared in `internal/ingest` (the consumer). `db.Row`'s only method is unexported, so the set of shapes that can reach the database is enumerable by reading one file and a producer cannot invent one — which is why the mapping lives with the row types rather than in a second layer of per-stream structs.
+
+Every frame is decoded into a `Message` carrying the channel, the connection's `sequence_num`, the **venue timestamp** and the **receive timestamp**. Those two are what the earlier draft of this section called for and they are used as it intended: the venue timestamp is what `ingest_last_seen_timestamp_seconds` reports, so the staleness gauge measures the age of the data rather than the age of the socket, and the receive timestamp is what the silence check and the sampling boundaries run on.
+
+Handlers optionally implement `TimeKeeper` (`Tick(ctx, now)`), which the stream calls on **every** frame including heartbeats. Output that is due at a wall-clock boundary rather than on message arrival — a book snapshot every `BOOK_SNAP_SECS`, a trade bucket closing on the minute — runs there, on the stream's own goroutine, so nothing in the package needs a timer beside the read loop or a lock around state the read loop owns.
 
 ---
 
@@ -300,28 +315,28 @@ cb_venue_state (
 )
 
 cb_bars (
-  ts,                              -- bar close time
-  product_id text, tf text,        -- '1m', '1h'
+  ts,                              -- bar close time (the venue sends the open; ingest adds the interval)
+  product_id text, tf text,        -- '5m' from the WS candles channel, '1m' from REST (Part 5)
   open numeric, high numeric, low numeric, close numeric,
-  volume numeric, trade_count int
+  volume numeric, trade_count int  -- trade_count is NULL on WS bars: the channel does not carry one
 )
 
-cb_book_snapshots (
+cb_book_snapshots (                -- perp only; N = 10 levels a side
   ts, product_id text,
   best_bid numeric, best_ask numeric,
-  bid_depth numeric[], ask_depth numeric[],   -- top-N sizes
+  bid_depth numeric[], ask_depth numeric[],   -- top-N sizes, in contracts for the perp
   bid_px numeric[], ask_px numeric[],
-  imbalance_top_n numeric,
-  impact_bid_px numeric, impact_ask_px numeric
+  imbalance_top_n numeric,           -- (bid depth - ask depth) / total, over the stored levels
+  impact_bid_px numeric, impact_ask_px numeric  -- depth-weighted average of the stored levels
 )
 
 cb_trades_agg (
   ts,                              -- bucket end
-  product_id text, bucket_secs int,
-  buy_vol numeric, sell_vol numeric,
-  trade_count int, vwap numeric,
+  product_id text, bucket_secs int,  -- 60 from the WS stream; three buckets make the 3-min VWAP mark
+  buy_vol numeric, sell_vol numeric, -- by aggressor side; see the note below
+  trade_count int, vwap numeric,     -- vwap NULL when the bucket had no volume
   max_single_sz numeric,           -- sweep intensity input
-  sweep_count int
+  sweep_count int                  -- runs of >=2 same-side trades <=250ms apart
 )
 
 cb_features (
@@ -371,6 +386,14 @@ cb_account_state (                 -- polled account/margin snapshot; risk reads
   intraday_margin_enabled bool     -- asserted false in v1
 )
 ```
+
+**Two definitions that would otherwise be buried in code.** `impact_bid_px` / `impact_ask_px` are the depth-weighted average price of the same top-N levels the row stores, not the price to fill a fixed notional. A fixed notional needs a size constant that means nothing to a reader, and any size this system trades — a whole position is a handful of contracts against a touch holding hundreds — is consumed by the best level alone, so the column would restate `best_bid` and carry no information. Measuring over the stored depth makes the value move when the book's mass moves and makes it reproducible from `bid_px`/`bid_depth` by anyone reading the row. A **sweep** is a run of two or more trades on the same aggressor side within 250 ms of each other: one taker clearing several resting orders. It is deliberately a property of timing and side rather than of size, because size alone cannot separate a large resting fill from an aggressive one.
+
+**A series row is written only when something was observed.** Every producer in Parts 4–6 applies the same rule, because the alternative is worse than a hole: a row carried forward from stale state is indistinguishable from a fresh one, and it is what the basis, the premium and every downstream band get computed from. Concretely — `cb_venue_state` skips the quote half of a row once the ticker is more than three sample intervals stale, `cb_book_snapshots` stops being written once the level2 channel has gone that long without an update (a socket kept alive by heartbeats will otherwise tick forever against a frozen book), and `mid` is a midpoint or NULL, never the last trade price standing in for one. The perp's `maintenance_window` is the exception that proves the rule: it comes from the venue calendar and the `status` channel rather than from the quote, so it is still recorded when the ticker has gone stale — a halt is exactly when the ticker is most likely to have stopped too, and that is the moment the column exists for.
+
+**`buy_vol + sell_vol` is not the bucket's total volume.** The venue publishes a third aggressor side, `UNKNOWN_ORDER_SIDE`, and those trades count toward `trade_count`, `vwap` and `max_single_sz` — their price and size are on the wire — while adding to neither side of the split. Anything deriving a trade imbalance must take the split as the *known* portion, not as the whole. Rejecting such trades outright, which is what ingest did until 2026-08-22, discards real volume and shows up only as a gap counter moving.
+
+**A `cb_trades_agg` row with `trade_count = 0` is an observation, not a placeholder.** A minute in which nothing traded is recorded, so it stays distinguishable from a minute the ingest was not listening — the bucket spanning a reconnect is skipped and shows as a missing row, because a partial aggregate written under a whole bucket's key could never be corrected.
 
 ### 5.2 State tables
 
@@ -536,7 +559,7 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `SPOT_PRODUCT_ID` | all | `ETH-USD` |
 | `CONTRACT_SIZE_ETH` | carry, migrate, research | `0.10` — `make migrate` seeds it into `cb_products` until Part 5 reads the real value from the products endpoint |
 | `BASE_RPC_URL`, `ALCHEMY_API_KEY` | ingest, carry | — |
-| `POLL_REST_SECS`, `POLL_BASE_SECS`, `BOOK_SNAP_SECS` | ingest | 5 / 30 / 10 |
+| `POLL_REST_SECS`, `POLL_BASE_SECS`, `BOOK_SNAP_SECS` | ingest | 5 / 30 / 10 — `POLL_REST_SECS` is also the `cb_venue_state` sampling boundary, shared by the WS sampler and the Part 5 poller because both must agree on where a boundary is ([ADR-0014](decisions/0014-one-sampler-owns-venue-state.md)) |
 | `Z_ENTER`, `Z_EXIT`, `F_FLIP` | carry | 1.5 / 0.5 / 0 *(placeholders — real values private)* |
 | `K_COST_MULT` | carry | 2 |
 | `CARRY_HORIZON_HOURS` | carry | 168 — the `N` in `expected_carry_N_hours`; sets how long ENTER assumes the carry is held. Costs are a fixed round-trip toll while funding accrues per hour, so this parameter, not the notional cap, decides whether ENTER can ever be true *(see the break-even study, build plan R1)* |

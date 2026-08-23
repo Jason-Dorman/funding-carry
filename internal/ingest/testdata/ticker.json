@@ -1,0 +1,27 @@
+{
+  "channel": "ticker",
+  "events": [
+    {
+      "tickers": [
+        {
+          "best_ask": "2345",
+          "best_ask_quantity": "225",
+          "best_bid": "2344.5",
+          "best_bid_quantity": "1342",
+          "high_24_h": "2380",
+          "high_52_w": "4966",
+          "low_24_h": "2222.5",
+          "low_52_w": "1506",
+          "price": "2345.5",
+          "price_percent_chg_24_h": "4.17499444814568",
+          "product_id": "ETP-20DEC30-CDE",
+          "type": "ticker",
+          "volume_24_h": "1073585"
+        }
+      ],
+      "type": "snapshot"
+    }
+  ],
+  "sequence_num": 0,
+  "timestamp": "2026-08-21T02:59:31.822428781Z"
+}

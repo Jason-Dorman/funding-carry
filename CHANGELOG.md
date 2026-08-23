@@ -4,6 +4,43 @@ Notable changes to the system and its contracts. Structural decisions get an ADR
 
 ## [Unreleased]
 
+### Coinbase WebSocket ingest — 2026-08-20 (Part 4, in progress)
+
+`cmd/ingest` now reads live market data. Five streams — `ticker`, `level2`, `market_trades`, `candles`, `status` — each on its own connection and goroutine, feeding `cb_venue_state`, `cb_bars`, `cb_book_snapshots` and `cb_trades_agg` through the one writer. Three findings from the live venue change contracts other parts were written against:
+
+- **The WebSocket `candles` channel serves 5-minute candles only.** It ignores a `granularity` argument — verified with `"ONE_MINUTE"`, with `60`, and with none. WS bars are written with `tf='5m'`; the plan's 1-minute bars now come from the REST candles endpoint in Part 5. Anything reading `cb_bars` must filter on `tf` rather than assume one series.
+- **Market data needs no authentication.** All five channels serve `ETP-20DEC30-CDE` unauthenticated, so `cmd/ingest` holds no credential and mints no JWT. JWT moves to Part 5 (account endpoints) and Part 16 (order entry).
+- **The retail API publishes no funding rate for this product.** `future_product_details.perpetual_details.funding_rate` comes back as `""` with a null `funding_time`. The local estimator in Part 5 is therefore the primary source, not a fallback, and `funding_source` will read `computed`.
+
+Two decisions bind later parts. `cb_venue_state` has **one sampler** that every producer feeds ([ADR-0014](docs/decisions/0014-one-sampler-owns-venue-state.md)) — Part 5's poller adds observations to it rather than writing its own rows, because two producers writing on the same `(product_id, ts)` boundary would lose one to `ON CONFLICT … DO NOTHING` in a way that looks exactly like a healthy retry. And the WebSocket client is [`github.com/coder/websocket`](docs/decisions/0013-websocket-client-coder.md), behind a three-method interface, chosen because its reads take a context and so cancellation stays one mechanism rather than two.
+
+Smaller things that are visible from outside the package: every connection also subscribes to `heartbeats`, which never advance `ingest_last_seen_timestamp_seconds`; a `cb_trades_agg` row with `trade_count = 0` is a real observation of a minute with no trades, while a *missing* row is a bucket that spanned a reconnect; `impact_bid_px`/`impact_ask_px` are the depth-weighted average of the ten stored levels, reproducible from `bid_px`/`bid_depth` on the same row. There is a new `live` build tag for tests that hit the real venue, and captured venue frames are committed as golden fixtures under `internal/ingest/testdata/` (raw, except the level2 snapshot, which is trimmed to the top twenty levels a side).
+
+**Not yet accepted.** The 1-hour soak, the `kill -TERM` clean-flush demonstration and the mid-run network pull all need a running TimescaleDB, and `docker` is unavailable in the development WSL distro.
+
+### Two data-fidelity fixes from 22 hours of continuous running — 2026-08-22
+
+Both were found by auditing the recorded series against what should be there, not by tests, and both were silent.
+
+- **The venue-state sampler was dropping 6.4% of its boundaries** — 914 rows over 19 hours, always exactly one at a time. `time.Ticker` holds its period but not its phase against the wall clock, and the boundary was derived by truncating whatever time a tick arrived at; with the phase sitting near a boundary edge, a millisecond of jitter made a tick land just below the boundary it was meant for, truncate onto the previous one, and be rejected as a duplicate — taking its own boundary with it. The sampler now waits for each boundary rather than for a period. Timers fire at or after their deadline, never before, so the class is gone.
+- **Trades with `side: "UNKNOWN_ORDER_SIDE"` were being discarded entirely.** The venue really sends it — 330 trades in 22 hours. Rejecting the trade threw away its price and size along with its side, understating `trade_count`, `vwap` and `max_single_sz`. Such trades now count everywhere except the buy/sell split, which is the only part that is genuinely unknown. **Consequence for consumers: `buy_vol + sell_vol` is the *known* portion of a bucket's volume, not its total** ([API spec §5.1](docs/api-spec.md#51-hypertables)). A side outside the vocabulary is still an error, because that would mean the vocabulary moved.
+
+### Candle persistence corrected; level2 thresholds tuned from measurement — 2026-08-21 (Part 4 soak)
+
+**`cb_bars` was silently losing almost every bar.** The rule for "this candle is complete" looked for a newer candle in the same message. The venue sends a ~100-candle `snapshot` on subscribe and then `update` messages carrying exactly one candle — the forming one — so on each five-minute roll the candle that had just closed was never mentioned again and was never written. In thirty minutes of the soak `cb_bars` gained one row instead of twelve, with nothing in the logs. Completion now means "a strictly newer start has been observed", tracked across messages, and a bar carries the last values it was seen with.
+
+*Anyone who ran the previous build should re-check `cb_bars` for holes.* The bug self-heals on restart — the subscribe snapshot replays roughly eight hours of history, and those bars are written on reconnect — so gaps shorter than that filled themselves in and only longer outages left permanent holes.
+
+**`level2` silence thresholds were mistuned and are now measured.** The perp's book is fresh in 95% of samples but goes quiet for up to 51 seconds while perfectly healthy; the 30-second threshold counted false gaps and, through the book-staleness bound, removed real `cb_book_snapshots` rows during those lulls. Both now derive from one constant (`Level2Quiet = 2m`), which produced zero gaps across 44 minutes of open market.
+
+### Writer refuses rows once shutdown begins — 2026-08-20 (found in Part 4's review)
+
+**Behavioral fix to accepted Part 2 code, in the same area as the Part 3 fix below.** `internal/db.Writer` closed its `stop` channel only *after* shutdown had finished draining and flushing. For the whole width of that final round trip `Submit` still returned `nil` — and every row accepted there landed in a channel whose only reader had already passed the drain. The producer was told the row was safe; nothing was logged, no metric moved, and the row was gone. `stop` now closes before the drain, so `Submit`'s documented contract ("returns `ErrWriterStopped` once the writer has begun shutting down") is true of the implementation.
+
+*Operator-visible:* a producer still running during shutdown now gets `ErrWriterStopped` where it previously got `nil`. That is the point — a visible refusal instead of a silent loss.
+
+The companion rule is in [architecture §8](docs/architecture.md#8-reliability-design) and binds every binary: **a writer must not be given the root context.** Its drain is only correct once producers have stopped, so it runs on `context.WithoutCancel` and is stopped by `Close` after the last producer returns. And a writer that dies fatally must cancel its producers, because not every producer submits — in `cmd/ingest` two of the five streams never call `Submit`, and without that cancellation a fatal write left the process alive and hung with a dead database, still answering `/healthz` with 200.
+
 ### Writer shutdown correctness — 2026-08-18 (Part 3)
 
 **Behavioral fix to a reliability guarantee.** `internal/db.Writer` handed the root context to pgx for its size- and interval-triggered flushes, so a `SIGTERM` arriving while a batch was in flight aborted the round trip, made `Run` return fatal, and skipped the drain-and-final-flush path entirely — losing rows producers had already been told were accepted. Every flush now runs on `context.WithoutCancel` bounded by `FlushTimeout`.

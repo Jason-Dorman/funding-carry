@@ -170,11 +170,11 @@ func (w *Writer) Submit(ctx context.Context, r Row) error {
 func (w *Writer) Run(ctx context.Context) error {
 	err := w.run(ctx)
 	w.err = err
-	// Closing stop here, not only in Close, is what makes Submit's contract true
-	// on every exit path. Run can return three ways Close did not cause — a fatal
-	// flush from either trigger, or root-context cancellation — and with stop
-	// still open Submit would keep returning nil for rows queued into a channel
-	// whose only reader has gone. stopOnce makes this idempotent with Close.
+	// shutdown closes stop before it drains, so the orderly paths have already
+	// done this. It is repeated here for the one exit that does not go through
+	// shutdown — a fatal flush, from either trigger — after which Submit must
+	// stop returning nil for rows queued into a channel whose only reader has
+	// gone. stopOnce makes it idempotent with both.
 	w.stopOnce.Do(func() { close(w.stop) })
 	close(w.done)
 	return err
@@ -223,6 +223,21 @@ func (w *Writer) Close() error {
 // succeeded — and flushes once more. flush is what detaches the write from
 // cancellation, so this path needs no context of its own.
 func (w *Writer) shutdown(ctx context.Context) error {
+	// Closing stop first is what makes Submit's contract true. It used to be
+	// closed only after this function returned, which left the drain and the
+	// whole width of the final round trip as a window in which Submit still
+	// accepted rows — and every one of them landed in a channel whose only
+	// reader had already passed the drain below. The producer was told nil,
+	// nothing was logged, no metric moved, and the row was gone.
+	//
+	// That window is reachable on every shutdown where a producer is still
+	// running, which is every shutdown: a WebSocket frame already read when
+	// SIGTERM lands is dispatched on the canceled root context and submits from
+	// there. A producer must be told "stopped" rather than "accepted", so that
+	// the row it holds is a visible refusal instead of a silent loss.
+	// TestSubmitIsRejectedOnceShutdownBegins is the regression.
+	w.stopOnce.Do(func() { close(w.stop) })
+
 	for draining := true; draining; {
 		select {
 		case r := <-w.rows:
