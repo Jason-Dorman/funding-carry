@@ -39,7 +39,7 @@ CREATE INDEX cb_venue_state_product_ts_idx ON cb_venue_state (product_id, ts DES
 CREATE TABLE cb_bars (
     ts          timestamptz NOT NULL,   -- bar close time
     product_id  text        NOT NULL,
-    tf          text        NOT NULL,   -- '1m', '1h'
+    tf          text        NOT NULL,   -- '5m' from the WS candles channel, '1m' from REST
     open        numeric     NOT NULL,
     high        numeric     NOT NULL,
     low         numeric     NOT NULL,

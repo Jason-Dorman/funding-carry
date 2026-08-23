@@ -803,3 +803,61 @@ func counterValue(t *testing.T, g prometheus.Gatherer, name, label string) float
 	t.Fatalf("no metric %s with label %s", name, label)
 	return 0
 }
+
+// Submit's contract is that it returns ErrWriterStopped "once the writer has
+// begun shutting down". This is the test that the implementation keeps that
+// promise, and it exists because it did not: `stop` was closed only after
+// shutdown had finished draining and flushing, so for the whole width of the
+// final round trip Submit still accepted rows — and every one of them was left
+// in a channel whose only reader had already passed the drain.
+//
+// The producer is told nil. Nothing is logged, no metric moves, and the row is
+// gone. That is the exact failure mode the drain exists to prevent, reachable
+// on any shutdown where a producer is still running, which is every shutdown in
+// cmd/ingest: a frame already read when SIGTERM lands is dispatched on the
+// canceled root context and submits from there.
+func TestSubmitIsRejectedOnceShutdownBegins(t *testing.T) {
+	t.Parallel()
+
+	f := blockingFakeDB()
+	// A batch size nothing will reach, so the only flush is shutdown's.
+	w := NewWriter(f, WriterOptions{BatchSize: 1000, FlushInterval: time.Hour}, discardLogger(), testMetrics())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+
+	ts := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	if err := w.Submit(context.Background(), sampleBar("ETP-20DEC30-CDE", ts)); err != nil {
+		t.Fatalf("submit before shutdown: %v", err)
+	}
+
+	// Cancellation puts the writer into shutdown: it drains the queue and parks
+	// in the final flush, which is where the fake holds it.
+	cancel()
+	<-f.entered
+
+	// A producer that has not stopped yet hands over one more row. The context
+	// is deliberately a live one, so the only thing that can reject this row is
+	// the writer knowing it has begun shutting down.
+	late := sampleBar("ETP-20DEC30-CDE", ts.Add(time.Minute))
+	err := w.Submit(context.Background(), late)
+
+	close(f.hold)
+	if runErr := <-done; runErr != nil {
+		t.Fatalf("run: %v", runErr)
+	}
+
+	switch {
+	case errors.Is(err, ErrWriterStopped):
+		// Correct: refused, and the producer knows it.
+	case err != nil:
+		t.Fatalf("submit during shutdown returned an unexpected error: %v", err)
+	default:
+		// Accepted. The only way that is not a lost row is if it was written.
+		if got := f.rowsFor("cb_bars"); got != 2 {
+			t.Fatalf("Submit returned nil during shutdown and the row was never written: "+
+				"cb_bars rows = %d, want 2. The producer was told this row was safe.", got)
+		}
+	}
+}

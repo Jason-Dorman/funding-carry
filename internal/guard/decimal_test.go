@@ -24,6 +24,14 @@ var loadModule = sync.OnceValues(func() ([]*packages.Package, error) {
 		// The guard package sits two levels below the module root.
 		Dir:   "../..",
 		Tests: true,
+		// Without the tags, packages.Load type-checks only what builds in the
+		// default configuration, and every file behind a build tag is invisible
+		// to these rules. That silently excluded the two places the decimal
+		// contract matters most: internal/db's integration suite, which is where
+		// the numeric round trip is asserted, and internal/ingest's live suite.
+		// api-spec section 3.5 calls this a check "over the whole module", and it
+		// was not one.
+		BuildFlags: []string{"-tags=integration,live"},
 	}
 	return packages.Load(cfg, "./...")
 })

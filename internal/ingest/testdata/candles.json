@@ -1,0 +1,912 @@
+{
+  "channel": "candles",
+  "events": [
+    {
+      "candles": [
+        {
+          "close": "2328",
+          "high": "2332.5",
+          "low": "2325",
+          "open": "2332",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787250300",
+          "volume": "6518"
+        },
+        {
+          "close": "2312",
+          "high": "2326.5",
+          "low": "2311.5",
+          "open": "2326.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787250600",
+          "volume": "8384"
+        },
+        {
+          "close": "2312.5",
+          "high": "2318",
+          "low": "2312.5",
+          "open": "2312.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787250900",
+          "volume": "8452"
+        },
+        {
+          "close": "2316",
+          "high": "2317",
+          "low": "2309.5",
+          "open": "2312.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787251200",
+          "volume": "5775"
+        },
+        {
+          "close": "2319.5",
+          "high": "2320",
+          "low": "2314.5",
+          "open": "2316",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787251500",
+          "volume": "5307"
+        },
+        {
+          "close": "2320.5",
+          "high": "2323.5",
+          "low": "2318",
+          "open": "2319.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787251800",
+          "volume": "4059"
+        },
+        {
+          "close": "2317",
+          "high": "2321.5",
+          "low": "2316",
+          "open": "2319.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787252100",
+          "volume": "406"
+        },
+        {
+          "close": "2317.5",
+          "high": "2318",
+          "low": "2312.5",
+          "open": "2316.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787252400",
+          "volume": "1789"
+        },
+        {
+          "close": "2321",
+          "high": "2324.5",
+          "low": "2316",
+          "open": "2317.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787252700",
+          "volume": "3684"
+        },
+        {
+          "close": "2322",
+          "high": "2324.5",
+          "low": "2319.5",
+          "open": "2321",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787253000",
+          "volume": "2383"
+        },
+        {
+          "close": "2326",
+          "high": "2328",
+          "low": "2321.5",
+          "open": "2321.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787253300",
+          "volume": "1298"
+        },
+        {
+          "close": "2330",
+          "high": "2330.5",
+          "low": "2325.5",
+          "open": "2325.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787253600",
+          "volume": "2081"
+        },
+        {
+          "close": "2329",
+          "high": "2331",
+          "low": "2326",
+          "open": "2329.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787253900",
+          "volume": "1618"
+        },
+        {
+          "close": "2325.5",
+          "high": "2330",
+          "low": "2325",
+          "open": "2328.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787254200",
+          "volume": "2019"
+        },
+        {
+          "close": "2330",
+          "high": "2331.5",
+          "low": "2323.5",
+          "open": "2326.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787254500",
+          "volume": "3290"
+        },
+        {
+          "close": "2331.5",
+          "high": "2333.5",
+          "low": "2329.5",
+          "open": "2330",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787254800",
+          "volume": "2479"
+        },
+        {
+          "close": "2327.5",
+          "high": "2332.5",
+          "low": "2325",
+          "open": "2330.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787255100",
+          "volume": "9304"
+        },
+        {
+          "close": "2327",
+          "high": "2330",
+          "low": "2326",
+          "open": "2326.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787255400",
+          "volume": "7577"
+        },
+        {
+          "close": "2324",
+          "high": "2328",
+          "low": "2321",
+          "open": "2327.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787255700",
+          "volume": "12409"
+        },
+        {
+          "close": "2325",
+          "high": "2326.5",
+          "low": "2323",
+          "open": "2325",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787256000",
+          "volume": "10238"
+        },
+        {
+          "close": "2324",
+          "high": "2327.5",
+          "low": "2322.5",
+          "open": "2325",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787256300",
+          "volume": "4029"
+        },
+        {
+          "close": "2323",
+          "high": "2323",
+          "low": "2317.5",
+          "open": "2321.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787256900",
+          "volume": "1418"
+        },
+        {
+          "close": "2325.5",
+          "high": "2326",
+          "low": "2320",
+          "open": "2322.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787257200",
+          "volume": "1098"
+        },
+        {
+          "close": "2327",
+          "high": "2330",
+          "low": "2326",
+          "open": "2326",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787257500",
+          "volume": "924"
+        },
+        {
+          "close": "2329.5",
+          "high": "2331.5",
+          "low": "2328",
+          "open": "2328",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787257800",
+          "volume": "168"
+        },
+        {
+          "close": "2323",
+          "high": "2330",
+          "low": "2323",
+          "open": "2328.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787258100",
+          "volume": "556"
+        },
+        {
+          "close": "2320.5",
+          "high": "2322.5",
+          "low": "2319",
+          "open": "2321",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787258400",
+          "volume": "1344"
+        },
+        {
+          "close": "2320.5",
+          "high": "2321",
+          "low": "2318.5",
+          "open": "2320.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787258700",
+          "volume": "270"
+        },
+        {
+          "close": "2315",
+          "high": "2320.5",
+          "low": "2315",
+          "open": "2320.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787259000",
+          "volume": "442"
+        },
+        {
+          "close": "2319",
+          "high": "2320",
+          "low": "2316",
+          "open": "2316",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787259300",
+          "volume": "2937"
+        },
+        {
+          "close": "2317.5",
+          "high": "2318.5",
+          "low": "2316",
+          "open": "2317.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787259600",
+          "volume": "1310"
+        },
+        {
+          "close": "2318",
+          "high": "2318",
+          "low": "2313",
+          "open": "2317.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787259900",
+          "volume": "1496"
+        },
+        {
+          "close": "2322.5",
+          "high": "2324",
+          "low": "2318.5",
+          "open": "2318.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787260200",
+          "volume": "2741"
+        },
+        {
+          "close": "2320.5",
+          "high": "2327",
+          "low": "2320.5",
+          "open": "2323.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787260500",
+          "volume": "1484"
+        },
+        {
+          "close": "2316.5",
+          "high": "2320.5",
+          "low": "2315.5",
+          "open": "2320",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787260800",
+          "volume": "373"
+        },
+        {
+          "close": "2315",
+          "high": "2319",
+          "low": "2315",
+          "open": "2316.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787261100",
+          "volume": "308"
+        },
+        {
+          "close": "2321.5",
+          "high": "2328",
+          "low": "2314.5",
+          "open": "2315",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787261400",
+          "volume": "1936"
+        },
+        {
+          "close": "2317",
+          "high": "2323",
+          "low": "2317",
+          "open": "2321",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787261700",
+          "volume": "545"
+        },
+        {
+          "close": "2319.5",
+          "high": "2321.5",
+          "low": "2319.5",
+          "open": "2320.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787262000",
+          "volume": "374"
+        },
+        {
+          "close": "2319.5",
+          "high": "2324.5",
+          "low": "2319",
+          "open": "2320",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787262300",
+          "volume": "605"
+        },
+        {
+          "close": "2319",
+          "high": "2325",
+          "low": "2315",
+          "open": "2319",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787262600",
+          "volume": "1331"
+        },
+        {
+          "close": "2317.5",
+          "high": "2319.5",
+          "low": "2315.5",
+          "open": "2317",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787262900",
+          "volume": "736"
+        },
+        {
+          "close": "2310",
+          "high": "2321",
+          "low": "2307.5",
+          "open": "2319",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787263200",
+          "volume": "5117"
+        },
+        {
+          "close": "2314",
+          "high": "2319",
+          "low": "2310",
+          "open": "2310",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787263500",
+          "volume": "2443"
+        },
+        {
+          "close": "2312",
+          "high": "2316.5",
+          "low": "2312",
+          "open": "2314",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787263800",
+          "volume": "5193"
+        },
+        {
+          "close": "2308.5",
+          "high": "2312.5",
+          "low": "2308",
+          "open": "2311",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787264100",
+          "volume": "1385"
+        },
+        {
+          "close": "2315.5",
+          "high": "2316",
+          "low": "2308.5",
+          "open": "2308.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787264400",
+          "volume": "1888"
+        },
+        {
+          "close": "2315",
+          "high": "2317.5",
+          "low": "2314",
+          "open": "2315.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787264700",
+          "volume": "1265"
+        },
+        {
+          "close": "2315",
+          "high": "2315.5",
+          "low": "2310",
+          "open": "2315.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787265000",
+          "volume": "2808"
+        },
+        {
+          "close": "2315.5",
+          "high": "2316",
+          "low": "2313.5",
+          "open": "2314.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787265300",
+          "volume": "2645"
+        },
+        {
+          "close": "2314",
+          "high": "2314",
+          "low": "2312",
+          "open": "2313",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787265900",
+          "volume": "1686"
+        },
+        {
+          "close": "2317.5",
+          "high": "2319.5",
+          "low": "2314.5",
+          "open": "2314.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787266200",
+          "volume": "1342"
+        },
+        {
+          "close": "2314.5",
+          "high": "2319",
+          "low": "2313",
+          "open": "2319",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787266500",
+          "volume": "414"
+        },
+        {
+          "close": "2315.5",
+          "high": "2316.5",
+          "low": "2314",
+          "open": "2315",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787266800",
+          "volume": "584"
+        },
+        {
+          "close": "2318.5",
+          "high": "2319.5",
+          "low": "2317",
+          "open": "2317.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787267100",
+          "volume": "483"
+        },
+        {
+          "close": "2323",
+          "high": "2323",
+          "low": "2319",
+          "open": "2319",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787267400",
+          "volume": "1042"
+        },
+        {
+          "close": "2327",
+          "high": "2328",
+          "low": "2322",
+          "open": "2322",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787267700",
+          "volume": "1628"
+        },
+        {
+          "close": "2330",
+          "high": "2331",
+          "low": "2326.5",
+          "open": "2328",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787268000",
+          "volume": "3785"
+        },
+        {
+          "close": "2332.5",
+          "high": "2340.5",
+          "low": "2330",
+          "open": "2330",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787268300",
+          "volume": "4645"
+        },
+        {
+          "close": "2329.5",
+          "high": "2334",
+          "low": "2328.5",
+          "open": "2332",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787268600",
+          "volume": "1973"
+        },
+        {
+          "close": "2326.5",
+          "high": "2331.5",
+          "low": "2325.5",
+          "open": "2330",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787268900",
+          "volume": "1817"
+        },
+        {
+          "close": "2326",
+          "high": "2327.5",
+          "low": "2324",
+          "open": "2326.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787269200",
+          "volume": "3235"
+        },
+        {
+          "close": "2328.5",
+          "high": "2330",
+          "low": "2325",
+          "open": "2326",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787269500",
+          "volume": "1451"
+        },
+        {
+          "close": "2329",
+          "high": "2329",
+          "low": "2323.5",
+          "open": "2327",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787269800",
+          "volume": "4054"
+        },
+        {
+          "close": "2326.5",
+          "high": "2329.5",
+          "low": "2325.5",
+          "open": "2327.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787270400",
+          "volume": "2209"
+        },
+        {
+          "close": "2331.5",
+          "high": "2335.5",
+          "low": "2327",
+          "open": "2327",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787270700",
+          "volume": "3976"
+        },
+        {
+          "close": "2338.5",
+          "high": "2339",
+          "low": "2331",
+          "open": "2331",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787271000",
+          "volume": "7579"
+        },
+        {
+          "close": "2343",
+          "high": "2348.5",
+          "low": "2332.5",
+          "open": "2338.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787271300",
+          "volume": "9746"
+        },
+        {
+          "close": "2343",
+          "high": "2346",
+          "low": "2339",
+          "open": "2340",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787271600",
+          "volume": "14660"
+        },
+        {
+          "close": "2337",
+          "high": "2348",
+          "low": "2337",
+          "open": "2343",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787271900",
+          "volume": "4947"
+        },
+        {
+          "close": "2344",
+          "high": "2351.5",
+          "low": "2337.5",
+          "open": "2339.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787272200",
+          "volume": "7599"
+        },
+        {
+          "close": "2339.5",
+          "high": "2344",
+          "low": "2335",
+          "open": "2343",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787272500",
+          "volume": "1096"
+        },
+        {
+          "close": "2338",
+          "high": "2339",
+          "low": "2332.5",
+          "open": "2339",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787272800",
+          "volume": "8759"
+        },
+        {
+          "close": "2346.5",
+          "high": "2349.5",
+          "low": "2335",
+          "open": "2338",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787273100",
+          "volume": "4006"
+        },
+        {
+          "close": "2340.5",
+          "high": "2350.5",
+          "low": "2340.5",
+          "open": "2345.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787273400",
+          "volume": "9394"
+        },
+        {
+          "close": "2340",
+          "high": "2341.5",
+          "low": "2335",
+          "open": "2340",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787273700",
+          "volume": "2049"
+        },
+        {
+          "close": "2343",
+          "high": "2344.5",
+          "low": "2338",
+          "open": "2340",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787274000",
+          "volume": "4212"
+        },
+        {
+          "close": "2345.5",
+          "high": "2346.5",
+          "low": "2340",
+          "open": "2341.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787274300",
+          "volume": "3579"
+        },
+        {
+          "close": "2345.5",
+          "high": "2349",
+          "low": "2343.5",
+          "open": "2346",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787274600",
+          "volume": "2666"
+        },
+        {
+          "close": "2358",
+          "high": "2366",
+          "low": "2345.5",
+          "open": "2345.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787274900",
+          "volume": "14000"
+        },
+        {
+          "close": "2346.5",
+          "high": "2357",
+          "low": "2339",
+          "open": "2357",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787275200",
+          "volume": "7888"
+        },
+        {
+          "close": "2352.5",
+          "high": "2352.5",
+          "low": "2343.5",
+          "open": "2345",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787275500",
+          "volume": "2482"
+        },
+        {
+          "close": "2361",
+          "high": "2370.5",
+          "low": "2349",
+          "open": "2353",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787275800",
+          "volume": "21747"
+        },
+        {
+          "close": "2356",
+          "high": "2360.5",
+          "low": "2352.5",
+          "open": "2359",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787276100",
+          "volume": "8250"
+        },
+        {
+          "close": "2357",
+          "high": "2361.5",
+          "low": "2354.5",
+          "open": "2359",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787276400",
+          "volume": "2411"
+        },
+        {
+          "close": "2376",
+          "high": "2380",
+          "low": "2356.5",
+          "open": "2357.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787276700",
+          "volume": "9281"
+        },
+        {
+          "close": "2367",
+          "high": "2375",
+          "low": "2365.5",
+          "open": "2373.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787277000",
+          "volume": "4293"
+        },
+        {
+          "close": "2360",
+          "high": "2366.5",
+          "low": "2360",
+          "open": "2364",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787277300",
+          "volume": "2638"
+        },
+        {
+          "close": "2354",
+          "high": "2359.5",
+          "low": "2343.5",
+          "open": "2359.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787277600",
+          "volume": "4194"
+        },
+        {
+          "close": "2354.5",
+          "high": "2362.5",
+          "low": "2350.5",
+          "open": "2353.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787277900",
+          "volume": "4167"
+        },
+        {
+          "close": "2354",
+          "high": "2355",
+          "low": "2346.5",
+          "open": "2355",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787278200",
+          "volume": "3082"
+        },
+        {
+          "close": "2350",
+          "high": "2354",
+          "low": "2347.5",
+          "open": "2354",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787278500",
+          "volume": "2076"
+        },
+        {
+          "close": "2349",
+          "high": "2353",
+          "low": "2347.5",
+          "open": "2348.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787278800",
+          "volume": "314"
+        },
+        {
+          "close": "2360.5",
+          "high": "2360.5",
+          "low": "2353.5",
+          "open": "2353.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787279100",
+          "volume": "205"
+        },
+        {
+          "close": "2360",
+          "high": "2365.5",
+          "low": "2353.5",
+          "open": "2359",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787279400",
+          "volume": "853"
+        },
+        {
+          "close": "2358",
+          "high": "2360.5",
+          "low": "2356.5",
+          "open": "2359",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787279700",
+          "volume": "1514"
+        },
+        {
+          "close": "2355",
+          "high": "2359",
+          "low": "2355",
+          "open": "2358",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787280000",
+          "volume": "2745"
+        },
+        {
+          "close": "2348",
+          "high": "2355.5",
+          "low": "2345.5",
+          "open": "2355",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787280300",
+          "volume": "4427"
+        },
+        {
+          "close": "2345",
+          "high": "2350.5",
+          "low": "2344.5",
+          "open": "2348.5",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787280600",
+          "volume": "975"
+        },
+        {
+          "close": "2345",
+          "high": "2347",
+          "low": "2345",
+          "open": "2345",
+          "product_id": "ETP-20DEC30-CDE",
+          "start": "1787280900",
+          "volume": "815"
+        }
+      ],
+      "type": "snapshot"
+    }
+  ],
+  "sequence_num": 0,
+  "timestamp": "2026-08-21T02:59:32.399980379Z"
+}

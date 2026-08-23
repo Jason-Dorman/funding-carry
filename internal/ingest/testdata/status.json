@@ -1,0 +1,24 @@
+{
+  "channel": "status",
+  "events": [
+    {
+      "products": [
+        {
+          "base_currency": "",
+          "base_increment": "1",
+          "display_name": "",
+          "id": "ETP-20DEC30-CDE",
+          "min_market_funds": "0",
+          "product_type": "FUTURE",
+          "quote_currency": "USD",
+          "quote_increment": "0.01",
+          "status": "online",
+          "status_message": ""
+        }
+      ],
+      "type": "snapshot"
+    }
+  ],
+  "sequence_num": 0,
+  "timestamp": "2026-08-21T02:59:32.573892322Z"
+}

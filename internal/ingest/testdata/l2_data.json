@@ -1,0 +1,253 @@
+{
+  "channel": "l2_data",
+  "events": [
+    {
+      "product_id": "ETP-20DEC30-CDE",
+      "type": "snapshot",
+      "updates": [
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1342",
+          "price_level": "2344.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "2391",
+          "price_level": "2344",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1670",
+          "price_level": "2343.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "2147",
+          "price_level": "2343",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1611",
+          "price_level": "2342.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1987",
+          "price_level": "2342",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1426",
+          "price_level": "2341.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1979",
+          "price_level": "2341",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1493",
+          "price_level": "2340.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "4419",
+          "price_level": "2340",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1459",
+          "price_level": "2339.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1294",
+          "price_level": "2339",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1340",
+          "price_level": "2338.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1342",
+          "price_level": "2338",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1292",
+          "price_level": "2337.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1236",
+          "price_level": "2337",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1283",
+          "price_level": "2336.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1226",
+          "price_level": "2336",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1274",
+          "price_level": "2335.5",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "3843",
+          "price_level": "2335",
+          "side": "bid"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1372",
+          "price_level": "2345.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1875",
+          "price_level": "2346",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "2153",
+          "price_level": "2346.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "2977",
+          "price_level": "2347",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1731",
+          "price_level": "2347.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "2131",
+          "price_level": "2348",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1641",
+          "price_level": "2348.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1990",
+          "price_level": "2349",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1550",
+          "price_level": "2349.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "4422",
+          "price_level": "2350",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1478",
+          "price_level": "2350.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1386",
+          "price_level": "2351",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1377",
+          "price_level": "2351.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1423",
+          "price_level": "2352",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1366",
+          "price_level": "2352.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1299",
+          "price_level": "2353",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1250",
+          "price_level": "2353.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1308",
+          "price_level": "2354",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "1348",
+          "price_level": "2354.5",
+          "side": "offer"
+        },
+        {
+          "event_time": "2026-08-21T02:59:31.945081Z",
+          "new_quantity": "3827",
+          "price_level": "2355",
+          "side": "offer"
+        }
+      ]
+    }
+  ],
+  "sequence_num": 0,
+  "timestamp": "2026-08-21T02:59:31.992627147Z"
+}

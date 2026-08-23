@@ -6,10 +6,12 @@
 version: "2"
 
 run:
-  # The integration suite is code too, and it is where the schema contract is
-  # asserted. Without this, its files are invisible to the linter.
+  # The integration and live suites are code too — one asserts the schema
+  # contract, the other the venue's payloads. Without this, their files are
+  # invisible to the linter.
   build-tags:
     - integration
+    - live
 
 linters:
   # standard = errcheck, govet, ineffassign, staticcheck, unused.
