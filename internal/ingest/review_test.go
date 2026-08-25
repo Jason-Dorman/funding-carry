@@ -2,8 +2,14 @@ package ingest
 
 import (
 	"context"
+
+	"github.com/prometheus/client_golang/prometheus"
+
 	"testing"
 	"time"
+
+	"github.com/Jason-Dorman/funding-carry/internal/coinbase"
+	"github.com/Jason-Dorman/funding-carry/internal/db"
 )
 
 // Regression tests from the adversarial review of 2026-08-20. Each one was run
@@ -393,5 +399,190 @@ func TestUntilNextBoundaryNeverWakesEarly(t *testing.T) {
 		if !woke.Equal(woke.Truncate(interval)) {
 			t.Errorf("waking at %s, which is not a boundary", woke)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Part 5 review regressions (2026-08-24)
+// ---------------------------------------------------------------------------
+
+// Every Part 5 goroutine must observe cancellation.
+//
+// The only shutdown test in this package built Ingest with a nil RESTClient and
+// a nil Account, so `New` constructed none of the marks sampler, the funding
+// runner, the REST poller or the account poller — and the four Run loops Part 5
+// added were never started by any test, let alone asserted to stop.
+func TestPartFiveGoroutinesStopOnCancellation(t *testing.T) {
+	opts := testOptions(t, &scriptedDialer{})
+	opts.RESTClient = NewRESTClient("http://127.0.0.1:1/", nil) // refuses instantly
+	opts.Account = stubAccount{}
+	opts.Backfill = 0 // the backfill has its own tests; this one is about the loops
+
+	in := New(opts, &fakeSink{}, NewMetrics(prometheus.NewRegistry()), testLogger())
+
+	if in.marks == nil || in.funding == nil || in.poller == nil || in.account == nil {
+		t.Fatalf("Part 5 components not constructed: marks=%v funding=%v poller=%v account=%v",
+			in.marks != nil, in.funding != nil, in.poller != nil, in.account != nil)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); in.Run(ctx) }()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after cancellation: a Part 5 goroutine ignores the root context, " +
+			"so the writer could never drain safely")
+	}
+}
+
+// stubAccount answers the account poller without a credential or a network.
+type stubAccount struct{}
+
+func (stubAccount) BalanceSummary(ctx context.Context) (coinbase.Account, error) {
+	return coinbase.Account{}, ctx.Err()
+}
+func (stubAccount) Positions(ctx context.Context) ([]coinbase.Position, error) { return nil, ctx.Err() }
+func (stubAccount) IntradayMarginEnabled(ctx context.Context) (bool, error)    { return false, ctx.Err() }
+
+// A stale trading session must stop asserting maintenance.
+//
+// The session used to be a bare bool that, once set, was never cleared. A REST
+// outage beginning while the market was shut would have pinned
+// maintenance_window true for as long as the poller stayed down — blocking every
+// entry on a reading of a market that had since reopened.
+func TestAStaleSessionStopsAssertingMaintenance(t *testing.T) {
+	sink := &fakeSink{}
+	v := newSampler(t, sink)
+
+	at := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC) // a Thursday, outside the break
+	v.now = func() time.Time { return at }
+	v.ObserveSession(testPerp, Session{IsOpen: false})
+	v.Observe(testPerp, quote(t, "99.5", "100.5", "100", at))
+
+	if err := v.sample(context.Background(), at); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	if !venueRows(t, sink)[testPerp].MaintenanceWindow {
+		t.Fatal("a fresh closed session did not set maintenance_window")
+	}
+
+	later := at.Add(maxSessionAge + time.Minute)
+	sink2 := &fakeSink{}
+	v.sink = sink2
+	v.Observe(testPerp, quote(t, "99.5", "100.5", "100", later))
+	if err := v.sample(context.Background(), later); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+	if venueRows(t, sink2)[testPerp].MaintenanceWindow {
+		t.Error("a stale session still asserted maintenance_window: entries would stay blocked " +
+			"on a reading of a market that has since reopened")
+	}
+}
+
+// The venue publishes a funding rate, and when it does it wins.
+//
+// This system read perpetual_details.funding_rate — permanently empty for this
+// contract — and concluded the venue published nothing, for two build parts. The
+// populated field is one level up. The estimate stays in funding_rate_est as the
+// independent cross-check the reconciliation measures.
+func TestTheVenuesRateTakesPrecedenceOverTheEstimate(t *testing.T) {
+	sink := &fakeSink{}
+	v := newSampler(t, sink)
+
+	at := epoch
+	v.Observe(testPerp, quote(t, "99.5", "100.5", "100", at))
+	v.ObserveFunding(testPerp, Funding{
+		HourStart: HourOf(at), Rate: dec(t, "0.0001"), Annualized: dec(t, "0.876"),
+	}, "computed")
+	v.ObserveVenueFunding(testPerp, db.Num(dec(t, "0.000019")), at, at)
+
+	if err := v.sample(context.Background(), at); err != nil {
+		t.Fatalf("sample: %v", err)
+	}
+
+	row := venueRows(t, sink)[testPerp]
+	if got := row.FundingRateHourly.Decimal.String(); got != "0.000019" {
+		t.Errorf("funding_rate_hourly = %s, want the venue's 0.000019", got)
+	}
+	if row.FundingSource != db.FundingSourceVenue {
+		t.Errorf("funding_source = %q, want %q", row.FundingSource, db.FundingSourceVenue)
+	}
+	if got := row.FundingRateEst.Decimal.String(); got != "0.0001" {
+		t.Errorf("funding_rate_est = %s, want the local estimate 0.0001 preserved", got)
+	}
+}
+
+// signalSink reports each write so a test can wait on a channel rather than spin.
+type signalSink struct {
+	inner Sink
+	wrote chan struct{}
+}
+
+func (s signalSink) Submit(ctx context.Context, r db.Row) error {
+	err := s.inner.Submit(ctx, r)
+	if err == nil {
+		select {
+		case s.wrote <- struct{}{}:
+		default:
+		}
+	}
+	return err
+}
+
+// The funding runner must actually emit at an hour boundary.
+//
+// Every other test drove Emit directly, so nothing exercised Run — and in
+// production the first hour boundary after a restart passed with no row and no
+// log line at all.
+func TestFundingRunnerEmitsAtTheHourBoundary(t *testing.T) {
+	sink := &fakeSink{}
+	state := newSampler(t, sink)
+
+	// A clock offset so that "now" sits just before the top of the hour and then
+	// advances with real time. Nudging a frozen clock from the test goroutine
+	// races the runner's own first read of it: lose that race and the runner
+	// computes its wait from the far side of the boundary and sleeps an hour.
+	hour := time.Date(2026, 8, 24, 13, 0, 0, 0, time.UTC)
+	base, started := hour.Add(-60*time.Millisecond), time.Now()
+	now := func() time.Time { return base.Add(time.Since(started)) }
+	r := NewFundingRunner(testPerp, maintenanceWindow(t), state, sink, testLogger(), now)
+
+	wrote := make(chan struct{}, 1)
+	r.sink = signalSink{inner: sink, wrote: wrote}
+
+	// A full previous hour of marks, so the boundary has something to compute.
+	prev := hour.Add(-time.Hour)
+	spot := dec(t, "2000")
+	for i := 1; i <= SamplesPerHour; i++ {
+		f := spot.Add(spot.Mul(dec(t, "0.0024")))
+		r.Observe(MarkSample{At: prev.Add(time.Duration(i) * SampleInterval), FuturesMark: f, SpotMark: spot})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); r.Run(ctx) }()
+
+	select {
+	case <-wrote:
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("the hour boundary passed and the runner wrote nothing: Run never called Emit")
+	}
+	cancel()
+	<-done
+
+	rows := accrualRows(t, sink)
+	if len(rows) == 0 {
+		t.Fatal("no accrual row was written")
+	}
+	if !rows[0].TS.Equal(prev) {
+		t.Errorf("emitted hour %s, want the hour that just ended, %s", rows[0].TS, prev)
+	}
+	if rows[0].FundingSource != db.FundingSourceComputed {
+		t.Errorf("funding_source = %q, want computed", rows[0].FundingSource)
 	}
 }

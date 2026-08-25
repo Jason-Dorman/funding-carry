@@ -55,6 +55,10 @@ type TradesHandler struct {
 	// file happens in a place where the bound is obvious.
 	bucketSecs int32
 	sink       Sink
+	// marks receives each closed bucket, so the VWAP the funding estimator
+	// marks against is the identical number that was persisted. Nil when the
+	// REST half is not running.
+	marks *Marks
 
 	state map[string]*productTrades
 }
@@ -112,12 +116,13 @@ const (
 )
 
 // NewTradesHandler builds the trade aggregator for the given products.
-func NewTradesHandler(products []string, interval time.Duration, sink Sink) *TradesHandler {
+func NewTradesHandler(products []string, interval time.Duration, sink Sink, marks *Marks) *TradesHandler {
 	h := &TradesHandler{
 		products:   products,
 		interval:   interval,
 		bucketSecs: clampInt32(int(interval / time.Second)),
 		sink:       sink,
+		marks:      marks,
 		state:      make(map[string]*productTrades, len(products)),
 	}
 	for _, p := range products {
@@ -312,7 +317,11 @@ func (h *TradesHandler) closeBucket(ctx context.Context, product string, p *prod
 	delete(p.open, start)
 	p.next = start.Add(h.interval)
 
-	return submit(ctx, h.sink, aggregate(product, start.Add(h.interval), h.bucketSecs, b))
+	row := aggregate(product, start.Add(h.interval), h.bucketSecs, b)
+	if h.marks != nil {
+		h.marks.ObserveBucket(row)
+	}
+	return submit(ctx, h.sink, row)
 }
 
 // aggregate reduces one bucket to its row. A bucket with no trades is still a

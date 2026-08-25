@@ -1,9 +1,13 @@
 # Basis Carry System — Reconciled Build Spec
 
-**Version:** 3.1 (supersedes `hyperliquid_signal_app_system_spec.md`, `hyperliquid_updated_system_spec.md`, `hyperliquid_formulas_thresholds.md`, `perps-carry-mvp-spec.md`, and `SPEC.md` — the last of which described a Rust / offshore-venue / bridge design that no longer applies; anything still valid from it is folded into §4)
+**Version:** 3.2 (supersedes `hyperliquid_signal_app_system_spec.md`, `hyperliquid_updated_system_spec.md`, `hyperliquid_formulas_thresholds.md`, `perps-carry-mvp-spec.md`, and `SPEC.md` — the last of which described a Rust / offshore-venue / bridge design that no longer applies; anything still valid from it is folded into §4)
 **Authority:** this file is the only build spec. If an older spec surfaces, it is superseded, not a second opinion.
 **Owner:** Jason
 **Status:** Build-ready for v1. Sections marked *v2* are deferred.
+
+**Amendment record.** This spec is written before the venue is met, so contact with it changes some of what is written here. Amendments are made on PO direction, marked inline as *(amended vN, date)*, and never silently: a spec that quietly agrees with whatever was built stops being a spec. Each one is also a dated entry in the [build-plan changelog](build-plan.md#changelog--decision-record) with the evidence behind it.
+
+- **v3.2 (2026-08-24)** — six corrections from building Parts 4 and 5 against the live venue: the venue *does* publish a funding rate (§4); the backfill is gap-driven on every start rather than a first-run script, and derives funding from candles because `fundingHistory` does not publish (§6.1); the WebSocket client and JWT choices are settled (§3, closing open item 1); JWT signing is EdDSA/Ed25519, not ES256 (§3); the package layout gained `internal/config` and `internal/coinbase` and a fourth binary (§6.11); and `funding_source` carries a third value (§7).
 
 ---
 
@@ -52,7 +56,7 @@ Ordering rule specific to this build: **wallet history is the deliverable that c
 
 **Explicitly deferred:** Rust. It remains the stronger signal for pure prop-shop trading-systems roles. If the target narrows to that lane, port the execution hot path to Rust as a second, separate artifact. Do not run two systems languages in this repo.
 
-**Go libraries:** `pgx` (Postgres), `gorilla/websocket` or `nhooyr/websocket`, `prometheus/client_golang`, `quickfixgo/quickfix`, `ethereum/go-ethereum` (`ethclient`, `abigen`) for Base, and a Coinbase Advanced Trade client — there is no official Go SDK, so a thin hand-rolled REST+WS wrapper with CDP JWT auth (`golang-jwt`, ES256) is the working assumption; decide in wk 1 (§12). Alchemy Smart Wallet / ERC-4337 calls go over JSON-RPC (Alchemy's SDK is TypeScript; use raw RPC from Go).
+**Go libraries:** `pgx` (Postgres), `prometheus/client_golang`, `quickfixgo/quickfix`, `ethereum/go-ethereum` (`ethclient`, `abigen`) for Base. *(Amended v3.2, 2026-08-24 — the working assumptions here are now decisions, and two of the three changed.)* The WebSocket client is **`coder/websocket`**, chosen over `gorilla` because its reads take a `context` and cancellation therefore stays one mechanism rather than two ([ADR-0013](decisions/0013-websocket-client-coder.md)). The Coinbase Advanced Trade client is **hand-rolled**, with the credential isolated in its own package so the market-data path cannot reach it ([ADR-0016](decisions/0016-hand-rolled-coinbase-client.md), closing open item 1). JWT signing is **EdDSA over Ed25519**, not `golang-jwt`/ES256: the CDP portal marks ECDSA as legacy, and the signing is ~50 lines over `crypto/ed25519` with no dependency. Alchemy Smart Wallet / ERC-4337 calls go over JSON-RPC (Alchemy's SDK is TypeScript; use raw RPC from Go).
 
 **Tooling:** Claude Code, spec-driven. Each milestone section is handed to Claude Code as a task; every diff is reviewed before commit.
 
@@ -89,7 +93,7 @@ The facts that actually shape the design:
 - **Contracts are quantized.** One contract = 0.10 ETH, integer contracts only. Perp size cannot be trimmed finely; the Base spot leg is the fine-grained leg used to bring net delta to ≈ 0.
 - **Funding is hourly**, computed from a 1-hour TWAP of 3-minute futures-vs-spot premium scaled by 1/24, smoothed 75/25 against the previous hour. Positive funding: longs pay shorts.
 - **Funding accrues hourly but settles as cash adjustments twice daily**, so accrued-but-unsettled funding is a tracked position field, not an instant balance change.
-- **The retail API may not publish a funding rate** for this product. The system therefore **computes its own hourly estimate** from the published formula and reconciles it against funding actually applied to the account. This is a design requirement, not an optimization.
+- **The retail API publishes an hourly funding rate, and the system computes its own beside it.** *(Amended v3.2, 2026-08-24.)* The rate is at `future_product_details.funding_rate`; an identically named field one level deeper in `perpetual_details` is permanently empty, and reading that one led this project to record "no rate is published" as a verified fact for two build parts. The local estimate is not made redundant by the discovery — it is what makes the venue's number checkable, it is the only route to *history* (the venue publishes the current rate and nothing before it), and the difference between the two is what the reconciliation measures. `funding_rate_hourly` takes the venue's rate with `funding_source='venue'`; `funding_rate_est` is always the local computation. Computing it remains a design requirement, not an optimization.
 - **Price references are futures mark and spot mark** (both Coinbase VWAP/TWAP constructions). There is no oracle. `basis = (futures_mark − spot_mark) / spot_mark`.
 - **Margin health is read, not derived.** The venue returns `margin_ratio = available_margin / liquidation_threshold`; the risk engine consumes it directly rather than computing a liquidation price.
 - **Leverage is windowed.** Up to 10× intraday *only if opted in*; lower overnight. v1 does not opt in and sizes ≤ 3× on overnight margin, so the intraday/overnight transition can never trigger a margin call.
@@ -147,7 +151,7 @@ Single `carry` binary hosts feature engine → funding-pressure engine → decis
 - One goroutine per Coinbase WS channel (`ticker`, `level2`, `market_trades`, `candles`, plus `status`) for the perp product and for `ETH-USD` spot, and one poller goroutine for REST-only data (product metadata, funding history if exposed, account balance summary, positions), each publishing to a typed channel. One writer goroutine batches inserts.
 - Base poller: wallet spot balance, ETH/USDC price for basis reference, gas.
 - Reconnect with backoff, sequence/gap detection per stream, `last_seen` heartbeat metric per stream, stale-feed flag consumed by risk.
-- Backfill script for historical funding and candles via REST on first run; note that history depth may be limited — **self-recorded data is the primary history.**
+- Historical recovery is **gap-driven and runs on every start**, not a first-run script: it reads what is stored, downloads only the ranges missing from it, and does nothing when nothing is missing — so a container down for an hour recovers that hour by itself. Funding history is *derived* from candles rather than fetched, because `fundingHistory` does not publish for this product. Derived series are computed from **stored** data, not from the download, so the result is reproducible; and they carry their provenance, because a value built from coarser inputs is not the same measurement as one recorded live. The six steps are [architecture §7.1](architecture.md#71-historical-recovery--the-backfill-pattern), and any future backfill follows them. History depth may be limited — **self-recorded data is the primary history.** *(Amended v3.2, 2026-08-24.)*
 - Persist: every completed candle, periodic L2 snapshots (top N), trade aggregates, every funding / futures-mark / spot-mark sample.
 
 ### 6.2 Venue state (`internal/venue/`)
@@ -210,7 +214,7 @@ Alertmanager: FIX session down, WS gap > 30s, delta breach, hard-stop trigger, m
 Replays candles + funding + book snapshots chronologically from TimescaleDB. Applies funding hourly with twice-daily settlement, fees, slippage, mark-based risk, and contract quantization. Metrics: total return, expectancy, max DD, Sharpe, profit factor, funding earned/paid per trade, PnL split (price / funding / fees / slippage), margin near-miss count, slippage vs quoted spread. Acceptance rule: **not accepted unless profitable after fees, slippage, and funding.** `make replay` runs 30 days end to end and refreshes Grafana. An optional notebook may read **public Hyperliquid data for cross-venue funding comparison only** — read-only, out of the production path, no trading.
 
 ### 6.11 Runtime
-Layout: `cmd/ingest`, `cmd/carry`, `cmd/sim-venue`, `internal/{ingest,venue,features,pressure,carry,risk,exec,fix,metrics,treasury}`, `research/`, `deploy/` (Compose, Grafana, Prometheus, Alertmanager). Single `go.mod`.
+Layout: `cmd/ingest`, `cmd/carry`, `cmd/sim-venue`, `cmd/migrate`, `internal/{ingest,venue,features,pressure,carry,risk,exec,fix,metrics,treasury,config,db,coinbase,guard}`, `research/`, `deploy/` (Compose, Grafana, Prometheus, Alertmanager). Single `go.mod`. *(Amended v3.2 — four packages and a binary this list did not name: `config` loads each binary's typed configuration, `db` is the shared persistence layer, `coinbase` isolates the credential away from the market-data path, `guard` holds module-wide invariant tests, and `cmd/migrate` applies the schema as a one-shot rather than as a startup side effect.)*
 Compose services: `ingest`, `carry`, `sim-venue`, `timescaledb`, `prometheus`, `grafana`, `alertmanager`. `make up`, `make replay`, `make test`.
 Config: env + gitignored `.env.private`. Research and live configs separable.
 
@@ -221,6 +225,8 @@ Config: env + gitignored `.env.private`. Research and live configs separable.
 Hypertables: `cb_venue_state` (ts, product_id, futures_mark, spot_mark, mid, funding_rate_hourly, funding_rate_est, funding_source, premium_proxy, spread_bps, open_interest), `cb_bars`, `cb_book_snapshots` (best bid/ask, depth_1..N, imbalance_top_n, impact_bid_px, impact_ask_px), `cb_trades_agg`, `cb_features` (Tier 1–3 + risk features), `base_state` (ts, spot_px, wallet_eth, wallet_usdc, gas_gwei), `cb_account_state` (ts, available_margin, liquidation_threshold, margin_ratio, cfm_usd_balance, cbi_usd_balance, futures_buying_power, contracts_held, avg_entry_price, unrealized_pnl, intraday_margin_enabled) — the polled account snapshot the risk engine reads margin ratio from and treasury reconciles against.
 
 State tables: `cb_products`, `decisions` (ts, state, target_spot, target_contracts, reason_codes, confidence, input_snapshot_json), `positions`, `fills`, `funding_events`, `risk_events`, `fix_sessions`.
+
+`funding_source` is a closed set of three: **`venue`** (published by the venue), **`computed`** (this system's estimate from live three-minute VWAP marks) and **`backfilled`** (the same formula on one-minute candle closes, for history recorded before the system was running). The third exists because a value derived from coarser inputs is not the same measurement even when the formula is identical, and merging them would leave the z-score, the backtest and the reconciliation each averaging two different things with nothing to warn them ([ADR-0015](decisions/0015-backfilled-funding-provenance.md)). *(Amended v3.2, 2026-08-24 — was two values.)*
 
 `funding_events` records **both sides of funding**: `kind='ACCRUAL'` rows for what was computed hourly and `kind='SETTLEMENT'` rows for the cash adjustments actually observed twice daily, linked by `settled_by`. Reconciliation compares the two; storing only the accrual would make it unfalsifiable.
 
@@ -286,7 +292,7 @@ Rules for the wallet column: it never goes backwards, and if a code milestone sl
 
 - Why funding carry exists on perps and what breaks it: basis blowout, funding flip, margin exhaustion, crowd exhaustion.
 - Coinbase US perp-style futures mechanics: contract sizing and quantization, hourly funding computed from a premium TWAP with 75/25 smoothing, twice-daily funding settlement, margin-ratio-based liquidation, intraday vs overnight margin windows — and how these differ from offshore perps.
-- Computing and reconciling a funding rate locally when the venue does not publish one to your API tier.
+- Computing a funding rate locally from the venue's own formula and reconciling it against the rate the venue publishes and the cash actually applied to the account — which is also the only way to obtain the history the signal needs, since the venue publishes the current rate and nothing before it.
 - FIX session lifecycle, sequence recovery, ExecutionReport state machine.
 - Delta-neutral position management with a quantized leg and a continuous leg, hard stops, and a reason-coded decision log.
 - Reliability engineering on a live feed: gap detection, backoff, one-writer pattern, graceful shutdown.
@@ -302,9 +308,9 @@ Go patterns to be able to explain by the end: one writer goroutine; `context` ca
 
 ## 12. Open items
 
-1. Coinbase Advanced Trade Go client: community package vs thin hand-rolled REST+WS wrapper with CDP JWT auth. Decide wk 1 after reading the auth code.
+1. ~~Coinbase Advanced Trade Go client: community package vs thin hand-rolled REST+WS wrapper with CDP JWT auth.~~ **Closed 2026-08-24** — hand-rolled, credential isolated in `internal/coinbase`, JWT EdDSA over Ed25519 ([ADR-0016](decisions/0016-hand-rolled-coinbase-client.md)).
 2. Live spot venue for the automated Base leg: DEX aggregator vs Coinbase Advanced Trade spot + withdraw to Base. Decide wk 4, informed by manual carries. **Weigh the wallet column, not just slippage:** with the Coinbase-spot route the buy itself is off-chain and only the withdrawal appears on Base, so the on-chain story thins to periodic transfers — which cuts against §1's ordering rule. Better fills would have to be worth that.
 3. FIX beyond the sim venue: Coinbase Derivatives Exchange offers FIX/SBE/UDP to institutional participants via FCMs. Investigate at wk 7 whether any sandbox is reachable for an individual; otherwise `sim-venue` remains the FIX counterparty and the FIX loop stays as-is.
-4. Threshold fitting: minimum recorded history before trusting z-scores (target ≥ 30 days self-recorded).
-5. The `TODO(verify)` items in [venue-coinbase-perps.md](venue-coinbase-perps.md) — official funding-rate exposure, fee tier, overnight margin per contract, settlement times, fractional-contract rejection. Confirm in wk 1 and update that file.
+4. Threshold fitting: minimum recorded history before trusting z-scores (target ≥ 30 days self-recorded). **The clock starts 2026-08-24** — the earlier recording was reset on PO direction because it carried three known defect classes, and is quarantined at [`research/quarantine/`](../research/quarantine/README.md). Earliest date this item can be closed: **2026-09-23**.
+5. The `TODO(verify)` items in [venue-coinbase-perps.md](venue-coinbase-perps.md). **Closed 2026-08-24:** official funding-rate exposure (published, at `future_product_details.funding_rate`) and overnight margin per contract (`{long 0.24525, short 0.33475}`, from the public product payload). **Still open:** fee tier, settlement times, fractional-contract rejection — all of which need an account or a live order.
 6. Rust port: revisit only if job targets narrow to prop-shop trading systems.

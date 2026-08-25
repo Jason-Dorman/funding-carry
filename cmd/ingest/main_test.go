@@ -188,7 +188,7 @@ func TestPipelineExitsWhenTheWriterDies(t *testing.T) {
 	go func() {
 		// A root context that is never canceled: the only thing that can end
 		// this run is the writer failing.
-		done <- pipeline(context.Background(), testConfig(t), failingSender{},
+		done <- pipeline(context.Background(), testConfig(t), failingSender{}, nil,
 			&tickingDialer{interval: 5 * time.Millisecond}, testLogger())
 	}()
 
@@ -220,7 +220,8 @@ func TestPipelineShutsDownCleanlyOnCancellation(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- pipeline(ctx, testConfig(t), sender, &tickingDialer{interval: 5 * time.Millisecond}, testLogger())
+		done <- pipeline(ctx, testConfig(t), sender, nil,
+			&tickingDialer{interval: 5 * time.Millisecond}, testLogger())
 	}()
 
 	// Wait until the sampler has actually written something, so the shutdown

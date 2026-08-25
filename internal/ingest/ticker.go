@@ -14,12 +14,15 @@ import (
 type TickerHandler struct {
 	products []string
 	state    *VenueState
+	// marks is the funding estimator's mid feed, and is nil when the REST half
+	// of ingest is not running (Part 4 alone).
+	marks *Marks
 }
 
 // NewTickerHandler subscribes both products: the perp is what is traded, and the
 // spot reference is what the basis and the funding estimate are measured against.
-func NewTickerHandler(products []string, state *VenueState) *TickerHandler {
-	return &TickerHandler{products: products, state: state}
+func NewTickerHandler(products []string, state *VenueState, marks *Marks) *TickerHandler {
+	return &TickerHandler{products: products, state: state, marks: marks}
 }
 
 // Subscribe names the channel and the products this handler wants.
@@ -53,6 +56,11 @@ func (h *TickerHandler) Handle(_ context.Context, msg Message) error {
 				continue
 			}
 			h.state.Observe(t.ProductID, q)
+			if h.marks != nil {
+				// The same quote feeds the mid-TWAP fallback the venue's mark
+				// definition falls back to when nothing trades.
+				h.marks.ObserveQuote(t.ProductID, q)
+			}
 		}
 	}
 	return errors.Join(errs...)
