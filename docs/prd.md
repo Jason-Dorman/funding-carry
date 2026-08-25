@@ -52,7 +52,7 @@ Grouped by component; spec section references in parentheses.
 - FR-1.2 Poll Base wallet balances, spot reference price, gas.
 - FR-1.3 Reconnect with backoff; per-stream gap detection and `last_seen` heartbeat; stale flag consumed by risk.
 - FR-1.4 Persist completed candles, periodic top-N book snapshots, trade aggregates, every funding / futures-mark / spot-mark sample. One writer goroutine per binary.
-- FR-1.5 Backfill historical funding and candles via REST on first run; note limited history depth.
+- FR-1.5 Backfill historical candles via REST and derive the funding series from them. **On every start, gap-driven**: read what is stored, fetch only what is missing, do nothing when nothing is missing — so a restart after downtime recovers by itself. Derived series are computed from stored data, not from the download, and carry their provenance. The pattern is [architecture §7](architecture.md#71-historical-recovery--the-backfill-pattern). *(Amended 2026-08-24: originally "on first run"; see the build-plan changelog.)*
 - FR-1.6 Compute an hourly funding-rate estimate locally from the venue formula, record `funding_source` (venue or computed), and reconcile accruals against the twice-daily cash adjustments.
 
 **FR-2 Features & pressure (§6.3–6.4)**

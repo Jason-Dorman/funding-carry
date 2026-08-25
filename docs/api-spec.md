@@ -18,7 +18,7 @@ The system exposes no public HTTP API in v1. This document therefore specifies e
 
 ## 1. Coinbase Advanced Trade APIs (consumed)
 
-Base URL `https://api.coinbase.com/api/v3/brokerage/`. Authenticated calls use a CDP API key with JWT bearer tokens (ES256), the same scheme for REST and WS. **Market data is not one of them:** the public REST market endpoints and every WebSocket market-data channel in §1.1 serve the perp product unauthenticated (verified 2026-08-20), so `cmd/ingest` holds no credential. Auth is needed for the account and order-entry surfaces — §1.2's `cfm/*` endpoints (Part 5) and §1.3 (Part 16). Perp product `ETP-20DEC30-CDE`, spot reference product `ETH-USD` — both read from config as `PERP_PRODUCT_ID` / `SPOT_PRODUCT_ID`, never hard-coded.
+Base URL `https://api.coinbase.com/api/v3/brokerage/`. Authenticated calls use a CDP **Secret** API key with JWT bearer tokens signed **EdDSA (Ed25519)**, the same scheme for REST and WS. *(Corrected 2026-08-23: this section said ES256, and the key was very nearly created to match it. The CDP portal marks ECDSA as being for legacy SDKs and recommends Ed25519; venue facts are the venue's to state, not this document's. A Client API key is a public browser-side identifier and cannot sign at all.)* Ed25519 also removes an operational hazard the ECDSA path carried: its key material is a single base64 string rather than a multi-line PEM, so it survives an `env_file` — which does not support multi-line values — without newline escaping. **Market data is not one of them:** the public REST market endpoints and every WebSocket market-data channel in §1.1 serve the perp product unauthenticated (verified 2026-08-20), so `cmd/ingest` holds no credential. Auth is needed for the account and order-entry surfaces — §1.2's `cfm/*` endpoints (Part 5) and §1.3 (Part 16). Perp product `ETP-20DEC30-CDE`, spot reference product `ETH-USD` — both read from config as `PERP_PRODUCT_ID` / `SPOT_PRODUCT_ID`, never hard-coded.
 
 Venue mechanics (contract size, funding formula, margin model, fee schedule, `TODO(verify)` items) live in **[venue-coinbase-perps.md](venue-coinbase-perps.md)** and are not restated here.
 
@@ -59,23 +59,23 @@ Polled on a ticker (default 5s for market/account context; hourly aligned for fu
 | Endpoint | Used for | Persisted to |
 |---|---|---|
 | `GET products?product_type=FUTURE` (venue `FCM`), `GET products/{id}` | product metadata: contract size, tick, status, `future_product_details` | `cb_products` |
-| `GET products/{id}/candles` | candle backfill after gaps and on first run | `cb_bars` |
+| `GET products/{id}/candles` | candle backfill — gap-driven, on every start, not just the first ([architecture §7](architecture.md#71-historical-recovery--the-backfill-pattern)) | `cb_bars` |
 | `GET products/{id}/product_book`, `best_bid_ask` | book/quote snapshot when WS is degraded | `cb_book_snapshots` |
-| `GET products/{id}/market_trades` | trade backfill; VWAP mark inputs | `cb_trades_agg` |
+| `GET products/{id}/ticker` | recent trades — **not** `market_trades`, which 404s; the WS channel and the REST path have different names (verified 2026-08-22) | `cb_trades_agg` |
 | `GET cfm/balance_summary` | `available_margin`, `liquidation_threshold`, buying power, CBI/CFM balances | `cb_account_state` → margin ratio, treasury |
 | `GET cfm/positions`, `cfm/positions/{id}` | `number_of_contracts`, `side`, `avg_entry_price`, `unrealized_pnl` | `cb_account_state`, `positions` reconciliation |
-| `GET cfm/intraday/current_margin_window`, `margin_setting` | confirm intraday margin is **off**, read overnight margin | risk config assertion |
+| `GET cfm/intraday/current_margin_window`, `margin_setting` | confirm intraday margin is **off**, read overnight margin | risk config assertion. **`margin_setting` returns `setting` as a bare string**, not the nested object the field name implies (verified 2026-08-24) — decoding it as an object fails on every poll and leaves `intraday_margin_enabled` NULL, i.e. nobody checking the one setting v1 requires to be off |
 | `GET/POST/DELETE cfm/sweeps` | move idle margin back to spot | treasury (Part 18) |
 | Fees / transaction summary (`product_type=FUTURE`, `product_venue=FCM`) | live fee tier | `cb_products` fee fields |
-| Funding rate, if exposed | official hourly rate | `cb_venue_state.funding_rate_hourly` |
+| `GET market/products/{id}` → `future_product_details.funding_rate` / `funding_time` / `funding_interval` | the venue's own hourly rate (verified populated 2026-08-24) | `cb_venue_state.funding_rate_hourly`, `funding_source='venue'` |
 
 **Do not filter that listing on `contract_expiry_type=PERPETUAL`.** The perp reports `EXPIRING` with a 2030-12-20 expiry (verified 2026-08-20, [venue doc §6](venue-coinbase-perps.md#6-api-surface-retail-advanced-trade)), so the filter the plan originally specified returns nothing. Select the product by `product_id`, which is config, not a filter.
 
-**Funding is a first-class open question, not a field lookup.** The retail API may not publish a funding rate for this product (`TODO(verify)`, venue doc §3). The ingest layer therefore always computes its own estimate and records which source was used:
+**The venue publishes an hourly funding rate, and the system computes its own beside it.** The rate is at `future_product_details.funding_rate` — **not** inside `perpetual_details`, where identically named fields sit permanently empty for this contract (venue doc §3; misread for two build parts). Both are recorded, because their difference is the reconciliation:
 
 - `funding_rate_est` — computed hourly from the venue's published formula: 3-minute futures mark (VWAP, falling back to mid TWAP) and spot mark from the spot product, a 1-hour TWAP of `(futures_mark − spot_mark)/spot_mark/24`, then `0.75 × premium + 0.25 × previous`.
 - `funding_rate_hourly` — the venue-published rate when available, otherwise a copy of `funding_rate_est`.
-- `funding_source` — `"venue"` or `"computed"`.
+- `funding_source` — `"venue"`, `"computed"`, or `"backfilled"` for an hour reconstructed from candle history ([ADR-0015](decisions/0015-backfilled-funding-provenance.md)).
 - Reconciliation: accrued funding is compared against the cash adjustments actually applied to the account (twice daily), exposed as `carry_funding_reconciliation_error`.
 
 No rate is published for an hour the market is closed (Friday 17:00–18:00 ET maintenance); that hour records a gap, not a zero.
@@ -306,7 +306,7 @@ cb_venue_state (
   mid numeric,
   funding_rate_hourly numeric,     -- venue-published if available, else = est
   funding_rate_est numeric,        -- always computed locally, venue doc §3 formula
-  funding_source text,             -- 'venue' | 'computed'
+  funding_source text,             -- 'venue' | 'computed' | 'backfilled'
   funding_annualized numeric,      -- rate * 24 * 365
   premium_proxy numeric,           -- (futures_mid - spot_mark) / spot_mark
   spread_bps numeric,
@@ -343,7 +343,7 @@ cb_features (
   ts, product_id text,
   -- Tier 1
   funding_rate_hourly numeric, funding_rate_est numeric,
-  funding_source text, funding_annualized numeric,
+  funding_source text, funding_annualized numeric,   -- 'venue' | 'computed' | 'backfilled'
   funding_zscore numeric,
   cumulative_funding numeric, expected_carry_n_hours numeric,
   futures_mark numeric, spot_mark numeric, basis numeric,
@@ -427,7 +427,7 @@ fills (id PK, ts, position_id FK, cl_ord_id text, venue text, leg text,
 funding_events (id PK, ts, product_id text,
                 kind text,                -- 'ACCRUAL' (hourly, computed) | 'SETTLEMENT' (cash adjustment observed)
                 rate_hourly numeric,      -- ACCRUAL only
-                funding_source text,      -- ACCRUAL only: 'venue' | 'computed'
+                funding_source text,      -- ACCRUAL only: 'venue' | 'computed' | 'backfilled'
                 position_id FK NULL,      -- NULL for observed-only samples
                 amount numeric,           -- signed: + = received
                 settled_by FK NULL,       -- ACCRUAL -> the SETTLEMENT row that cleared it
@@ -445,6 +445,8 @@ Conventions: `positions.venue` separates paper/sim/live P&L buckets; `funding_ev
 **Both sides of funding are rows.** `kind='ACCRUAL'` rows are what the system computed hourly; `kind='SETTLEMENT'` rows are cash adjustments actually observed on the account, twice daily. An accrual points at the settlement that cleared it via `settled_by` (NULL while pending), `positions.settlement_pending_funding` carries the unsettled sum, and the difference between matched accruals and their settlement is exactly what `carry_funding_reconciliation_error` measures. Storing only one side would make the reconciliation unfalsifiable.
 
 `cb_account_state` is the polled truth behind the risk engine's margin ratio and the treasury's balance reconciliation — the system never derives a liquidation price of its own.
+
+**`margin_ratio` is NULL when there is no position, and that is not the same as zero.** An account holding nothing reports a real `available_margin` and a `liquidation_threshold` of **0** (verified 2026-08-24), so the ratio is undefined and the column is NULL. Anything reading it — the Part 13 floor above all — must treat NULL as "nothing at risk". Reading it as zero would look like imminent liquidation on an account with no exposure at all.
 
 ### 5.3 Constraints and indexes
 
@@ -478,7 +480,7 @@ Three obligations come with that table, and none of them is enforceable by the s
 
 `positions` is the one table with no natural key — a carry has no property that identifies it — so its identity is assigned rather than discovered: `id` is a client-minted ULID, the same convention as `ClOrdID`. That also removes the need to read a generated id back before `fills` and `funding_events` can reference it, which would have made a producer into a second writer.
 
-**Closed vocabularies** are `CHECK` constraints, so a value outside the set is rejected at write time rather than found in a dashboard: `funding_source ∈ {venue, computed}` (on `cb_venue_state`, `cb_features`, `funding_events`), `decisions.state`, `fills.leg`/`side`/`exec_state`, `positions.venue`, `funding_events.kind`, and `cb_features.crowded_side`/`pressure_level`. `risk_events.kind` is deliberately *not* constrained — it is an append-only vocabulary that grows with the risk engine, and a rejected insert there would lose the record of the event it describes.
+**Closed vocabularies** are `CHECK` constraints, so a value outside the set is rejected at write time rather than found in a dashboard: `funding_source ∈ {venue, computed, backfilled}` (on `cb_venue_state`, `cb_features`, `funding_events`; widened by migration `000005`, [ADR-0015](decisions/0015-backfilled-funding-provenance.md)), `decisions.state`, `fills.leg`/`side`/`exec_state`, `positions.venue`, `funding_events.kind`, and `cb_features.crowded_side`/`pressure_level`. `risk_events.kind` is deliberately *not* constrained — it is an append-only vocabulary that grows with the risk engine, and a rejected insert there would lose the record of the event it describes.
 
 **Cross-column invariants.** `funding_events` enforces that a `SETTLEMENT` row carries no `rate_hourly`, no `funding_source` and no `settled_by`: a settlement is an observed cash movement, and a rate on one would make the accrual-versus-settlement reconciliation meaningless.
 
@@ -559,6 +561,7 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `SPOT_PRODUCT_ID` | all | `ETH-USD` |
 | `CONTRACT_SIZE_ETH` | carry, migrate, research | `0.10` — `make migrate` seeds it into `cb_products` until Part 5 reads the real value from the products endpoint |
 | `BASE_RPC_URL`, `ALCHEMY_API_KEY` | ingest, carry | — |
+| `BACKFILL_WINDOW` | ingest | `1080h` (45 days) — how far back history must reach; `0` disables it. **The backfill runs on every start and is gap-driven:** it reads what is already stored, downloads only the ranges missing from it, and costs one query when nothing is missing (0.24 s observed, against ~70 s for a full download). A container down for an hour recovers that hour by itself; one that restarts twice in a minute does no network work the second time. The z-score needs ~30 days; the venue serves candles back to the perp's launch, but re-pulling a year on every restart is pointless once the first run has stored it ([ADR-0015](decisions/0015-backfilled-funding-provenance.md)) |
 | `POLL_REST_SECS`, `POLL_BASE_SECS`, `BOOK_SNAP_SECS` | ingest | 5 / 30 / 10 — `POLL_REST_SECS` is also the `cb_venue_state` sampling boundary, shared by the WS sampler and the Part 5 poller because both must agree on where a boundary is ([ADR-0014](decisions/0014-one-sampler-owns-venue-state.md)) |
 | `Z_ENTER`, `Z_EXIT`, `F_FLIP` | carry | 1.5 / 0.5 / 0 *(placeholders — real values private)* |
 | `K_COST_MULT` | carry | 2 |

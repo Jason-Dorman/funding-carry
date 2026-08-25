@@ -45,6 +45,27 @@ type VenueState struct {
 	perpOnline bool
 	statusSeen bool
 
+	// funding, marks and openInterest are the Part 5 half of a row: everything
+	// the REST poller and the funding estimator contribute. They live here, and
+	// not in their own writer, because cb_venue_state has exactly one writer and
+	// two producers colliding on (product_id, ts) would silently lose one
+	// (ADR-0014).
+	funding  map[string]fundingObservation
+	marks    map[string]markObservation
+	openInts map[string]decimal.NullDecimal
+
+	// venueFunding is the rate the venue itself publishes, when it does. It
+	// takes precedence over the local estimate for funding_rate_hourly, and the
+	// estimate stays in funding_rate_est as the independent cross-check the
+	// reconciliation is measured against — which is exactly the split the schema
+	// was designed for (API spec section 5.1).
+	venueFunding map[string]venueFundingObservation
+
+	// session is the venue's own trading calendar for the perp, from the REST
+	// product payload.
+	session     Session
+	sessionSeen time.Time
+
 	// lastBoundary is owned by the sampling goroutine alone. It is what keeps two
 	// ticks that land in the same window from producing two rows for one
 	// boundary: the second would be discarded by the database as a conflict,
@@ -72,6 +93,24 @@ type Quote struct {
 // visible; a repeated row is a lie, which is not.
 const maxQuoteAge = 3
 
+// maxMarkAge and maxFundingAge are how stale each Part 5 contribution may be
+// before it stops appearing on a row. Both follow the same rule as the quote: a
+// value carried forward past its useful life is indistinguishable from a fresh
+// one, and these two are what the basis and the carry are computed from.
+//
+// A mark is a three-minute measurement, so two windows is already late. A rate
+// is hourly and is legitimately the same number all hour, so it is allowed to
+// describe the hour it belongs to and the one after it — beyond that the
+// estimator has failed to produce a new one and the series should show it.
+const (
+	maxMarkAge    = 2 * SampleInterval
+	maxFundingAge = 2 * time.Hour
+	// A session is polled every POLL_REST_SECS and changes at most twice a week,
+	// so a minute of tolerance is generous; beyond that the poller is down and
+	// the calendar is the only signal left.
+	maxSessionAge = time.Minute
+)
+
 // NewVenueState builds the sampler.
 func NewVenueState(perp, spot string, interval time.Duration, w config.MaintenanceWindow,
 	sink Sink, log *slog.Logger, now func() time.Time,
@@ -80,15 +119,98 @@ func NewVenueState(perp, spot string, interval time.Duration, w config.Maintenan
 		now = time.Now
 	}
 	return &VenueState{
-		perpProduct: perp,
-		spotProduct: spot,
-		interval:    interval,
-		maintenance: w,
-		sink:        sink,
-		log:         log.With("component", "venue_state"),
-		now:         now,
-		quotes:      make(map[string]Quote, 2),
+		perpProduct:  perp,
+		spotProduct:  spot,
+		interval:     interval,
+		maintenance:  w,
+		sink:         sink,
+		log:          log.With("component", "venue_state"),
+		now:          now,
+		quotes:       make(map[string]Quote, 2),
+		funding:      make(map[string]fundingObservation, 1),
+		marks:        make(map[string]markObservation, 2),
+		openInts:     make(map[string]decimal.NullDecimal, 1),
+		venueFunding: make(map[string]venueFundingObservation, 1),
 	}
+}
+
+// fundingObservation is the most recent hourly rate and where it came from.
+type fundingObservation struct {
+	funding Funding
+	source  string
+}
+
+// markObservation is the most recent three-minute mark pair and the premium
+// derived from it.
+type markObservation struct {
+	futures decimal.NullDecimal
+	spot    decimal.NullDecimal
+	premium decimal.NullDecimal
+	at      time.Time
+}
+
+// ObserveFunding records the hourly rate. Called from the funding runner.
+func (v *VenueState) ObserveFunding(product string, f Funding, source string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.funding[product] = fundingObservation{funding: f, source: source}
+}
+
+// ObserveMarks records the three-minute marks and the premium between them.
+// Called from the mark sampler.
+func (v *VenueState) ObserveMarks(product string, futures, spot decimal.Decimal, at time.Time) {
+	premium := decimal.NullDecimal{}
+	if !spot.IsZero() {
+		premium = decimal.NullDecimal{Decimal: futures.Sub(spot).Div(spot), Valid: true}
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.marks[product] = markObservation{
+		futures: db.Num(futures), spot: db.Num(spot), premium: premium, at: at,
+	}
+}
+
+// ObserveSession records the venue's own trading calendar for the contract.
+//
+// It is a better maintenance signal than the configured weekly window, because
+// it names this week's actual close rather than a rule, and better than the
+// status channel, which was observed reporting "online" straight through the
+// Friday break (Part 4 soak, 2026-08-21). All three are combined rather than
+// ranked: the flag is true if any of them says the market is shut.
+func (v *VenueState) ObserveSession(product string, s Session) {
+	if product != v.perpProduct {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.session, v.sessionSeen = s, v.now()
+}
+
+// venueFundingObservation is a rate the venue published, with the time it says
+// it applies to.
+type venueFundingObservation struct {
+	rate decimal.NullDecimal
+	at   time.Time
+	seen time.Time
+}
+
+// ObserveVenueFunding records the venue's own hourly rate. Called from the REST
+// poller.
+func (v *VenueState) ObserveVenueFunding(product string, rate decimal.NullDecimal, at, seen time.Time) {
+	if !rate.Valid {
+		return
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.venueFunding[product] = venueFundingObservation{rate: rate, at: at, seen: seen}
+}
+
+// ObserveOpenInterest records the figure from the REST product payload, which
+// is the only place it appears.
+func (v *VenueState) ObserveOpenInterest(product string, oi decimal.NullDecimal) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.openInts[product] = oi
 }
 
 // Observe records the latest quote for a product. Called from the ticker
@@ -195,7 +317,6 @@ func (v *VenueState) sample(ctx context.Context, at time.Time) error {
 func (v *VenueState) rowFor(product string, ts, at time.Time) (db.VenueStateRow, bool) {
 	v.mu.Lock()
 	q, haveQuote := v.quotes[product]
-	perpOnline, statusSeen := v.perpOnline, v.statusSeen
 	v.mu.Unlock()
 
 	fresh := haveQuote && at.Sub(q.At) <= time.Duration(maxQuoteAge)*v.interval
@@ -206,20 +327,76 @@ func (v *VenueState) rowFor(product string, ts, at time.Time) (db.VenueStateRow,
 		row.Mid = mid
 		row.SpreadBps = spreadBps(q, mid)
 	}
+
+	v.applyPartFiveLocked(&row, product, at)
+
 	if product == v.perpProduct {
-		// Two independent reasons the market is not tradable, and the flag is
-		// true if either says so. The configured window is the venue's published
-		// weekly break; the status channel is the venue saying so itself, which
-		// also covers an unscheduled halt. Before the status channel has said
-		// anything, only the calendar is consulted rather than assuming offline —
-		// a false maintenance flag at startup would block entries for no reason.
-		row.MaintenanceWindow = v.maintenance.Contains(ts) || (statusSeen && !perpOnline)
+		row.MaintenanceWindow = v.inMaintenance(ts, at)
 	}
 
 	if !fresh && !row.MaintenanceWindow {
 		return db.VenueStateRow{}, false
 	}
 	return row, true
+}
+
+// applyPartFiveLocked adds the columns the REST poller and the funding
+// estimator contribute: the marks and the premium between them, the hourly rate
+// with its provenance, and open interest. Each is subject to its own staleness
+// rule, because each has its own source and its own natural cadence.
+func (v *VenueState) applyPartFiveLocked(row *db.VenueStateRow, product string, at time.Time) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if mk, ok := v.marks[product]; ok && at.Sub(mk.at) <= maxMarkAge {
+		row.FuturesMark, row.SpotMark, row.PremiumProxy = mk.futures, mk.spot, mk.premium
+	}
+	// The two rates are independent and the schema keeps them apart on purpose:
+	// funding_rate_est is always what this system computed, funding_rate_hourly
+	// is the venue's when the venue has one. Their difference is what
+	// carry_funding_reconciliation_error measures, and it can only be measured
+	// if the estimate is never quietly overwritten by the venue's number.
+	if fo, ok := v.funding[product]; ok && at.Sub(fo.funding.HourStart) <= maxFundingAge {
+		row.FundingRateEst = db.Num(fo.funding.Rate)
+		row.FundingRateHourly = db.Num(fo.funding.Rate)
+		row.FundingSource = fo.source
+		row.FundingAnnualized = db.Num(fo.funding.Annualized)
+	}
+	if vf, ok := v.venueFunding[product]; ok && at.Sub(vf.seen) <= maxFundingAge {
+		row.FundingRateHourly = vf.rate
+		row.FundingSource = db.FundingSourceVenue
+		row.FundingAnnualized = db.Num(vf.rate.Decimal.Mul(hoursPerYear))
+	}
+	// Open interest comes from the same poll as the session and ages with it:
+	// carrying a figure forward through an outage would show a market whose
+	// positioning had not moved for as long as the poller was down.
+	if oi, ok := v.openInts[product]; ok && !v.sessionSeen.IsZero() && at.Sub(v.sessionSeen) <= maxSessionAge {
+		row.OpenInterest = oi
+	}
+}
+
+// inMaintenance combines the three signals that say the perp is not tradable.
+//
+// The flag is true if any of them says so, and they are combined rather than
+// ranked because each covers what the others miss. The configured window is the
+// venue's published weekly break. The venue's own session names this week's
+// actual close rather than a rule. The status channel covers an unscheduled
+// halt — and was observed reporting "online" straight through the Friday break
+// in the Part 4 soak, which is why it cannot be the only one. Both polled
+// signals age out; the calendar cannot go stale.
+func (v *VenueState) inMaintenance(ts, at time.Time) bool {
+	if v.maintenance.Contains(ts) {
+		return true
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	if v.statusSeen && !v.perpOnline {
+		return true
+	}
+	sessionFresh := !v.sessionSeen.IsZero() && at.Sub(v.sessionSeen) <= maxSessionAge
+	return sessionFresh && !v.session.IsOpen
 }
 
 var two = decimal.NewFromInt(2)

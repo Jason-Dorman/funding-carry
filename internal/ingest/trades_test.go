@@ -35,7 +35,7 @@ func aggRows(t *testing.T, sink *fakeSink) []db.TradesAggRow {
 // the bucket beginning at `epoch`.
 func admittedHandler(t *testing.T, sink *fakeSink, products ...string) *TradesHandler {
 	t.Helper()
-	h := NewTradesHandler(products, TradeBucketSecs*time.Second, sink)
+	h := NewTradesHandler(products, TradeBucketSecs*time.Second, sink, nil)
 	// The first Tick admits at the *next* whole boundary, so aggregation starts
 	// at epoch when the handler is first ticked one bucket earlier.
 	if err := h.Tick(context.Background(), epoch.Add(-time.Minute)); err != nil {
@@ -132,7 +132,7 @@ func TestTradesWriteAnEmptyBucket(t *testing.T) {
 
 func TestTradesSkipTheBucketInProgressAtStartup(t *testing.T) {
 	sink := &fakeSink{}
-	h := NewTradesHandler([]string{testPerp}, TradeBucketSecs*time.Second, sink)
+	h := NewTradesHandler([]string{testPerp}, TradeBucketSecs*time.Second, sink, nil)
 	ctx := context.Background()
 
 	// Startup lands mid-bucket.

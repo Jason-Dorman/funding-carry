@@ -9,7 +9,7 @@ This document describes *how* the system is built: processes, concurrency, data 
 
 ## 1. System context
 
-The system runs a delta-neutral funding carry: **long spot ETH on Base, short the ETH perpetual-style future on Coinbase**, collecting funding while it is positive. A funding-pressure engine times entries, exits, and hold-offs. Everything the system observes is self-recorded, because retail history depth is limited and the venue may not publish a funding rate to this API tier — **our own database is the primary history**. Venue mechanics live in [venue-coinbase-perps.md](venue-coinbase-perps.md); this doc does not restate them.
+The system runs a delta-neutral funding carry: **long spot ETH on Base, short the ETH perpetual-style future on Coinbase**, collecting funding while it is positive. A funding-pressure engine times entries, exits, and hold-offs. Everything the system observes is self-recorded, because retail history depth is limited and the venue publishes the current funding rate but no history of it — **our own database is the primary history**, and what can be recovered is recovered by the [backfill pattern](#71-historical-recovery--the-backfill-pattern) rather than waited for. Venue mechanics live in [venue-coinbase-perps.md](venue-coinbase-perps.md); this doc does not restate them.
 
 ```mermaid
 graph TD
@@ -139,7 +139,9 @@ graph LR
 
 Rules, enforced in review:
 
-1. **One writer per binary.** Stream goroutines never call the DB. They publish typed structs to channels; the writer batches inserts (interval- and size-triggered flush) and sends each flush as a single pgx batch, which Postgres runs in one implicit transaction — so a flush lands whole or not at all, in one round trip (demonstrated in `TestBatchIsAtomic`, not assumed). The channel is bounded: when it fills, producers block, which is the backpressure that keeps an unreachable database from turning into unbounded memory.
+1. **One writer per binary.** Stream goroutines never call the DB.
+
+   **Reading is a narrow, named exception.** The rule exists to keep *writes* serialized through one goroutine, so insert order, batching and failure handling have exactly one home; a read is none of those. `internal/db.Reader` exists for one caller — the backfill, which has to know what it already holds before deciding what to download, and would otherwise re-fetch forty-five days to discover that forty-five days are present. It also buys something less obvious: a reconstruction computed from *stored* bars is a function of the database, so anyone can recompute it and get the same answer, where one computed from a particular download is a function of what that call happened to return. For the series the whole signal rests on, reproducibility is worth more than the simplicity of not reading. They publish typed structs to channels; the writer batches inserts (interval- and size-triggered flush) and sends each flush as a single pgx batch, which Postgres runs in one implicit transaction — so a flush lands whole or not at all, in one round trip (demonstrated in `TestBatchIsAtomic`, not assumed). The channel is bounded: when it fills, producers block, which is the backpressure that keeps an unreachable database from turning into unbounded memory.
 
    **A failed flush is re-sent, and re-sending is safe by construction.** Every insert carries `ON CONFLICT … DO NOTHING` against the natural key of its table ([ADR-0012](decisions/0012-idempotent-inserts-natural-keys.md)), so a batch that turns out to have already committed lands the second time as a no-op. That matters because a send can fail in a state where the outcome is unknowable — every statement acknowledged, the connection lost before the commit's acknowledgement — and the driver cannot tell that from "never sent". Without the keys the writer had to abandon those batches, which bought correctness with availability at the worst moment: a dropped connection became a restart, a restart became a gap, and a gap in the self-recorded series (`cb_venue_state`, `cb_features`, `cb_book_snapshots`, `cb_trades_agg`) is unrecoverable, because those series are computed here and exist nowhere else to backfill from.
 
@@ -397,6 +399,35 @@ Flow of truth:
 - `ingest` writes raw observations (`cb_venue_state`, `cb_bars`, `cb_book_snapshots`, `cb_trades_agg`, `base_state`, `cb_account_state`).
 - `carry` writes derived and stateful rows (`cb_features`, `decisions`, `positions`, `fills`, `funding_events`, `risk_events`).
 - The Python backtester **reads the same tables** and replays them chronologically; `make replay` runs 30 days end-to-end and refreshes Grafana.
+
+---
+
+### 7.1 Historical recovery — the backfill pattern
+
+Every backfill in this system follows the same shape, and it is written here rather than in one part's section because Parts 6, 19 and 20 each have a plausible reason to want one.
+
+**1. Decide what is recoverable at all, and say so.** Two kinds of series live in this database, and the difference is not a detail:
+
+| | Recoverable | Why |
+|---|---|---|
+| `cb_bars`, `cb_trades_agg` | Yes | The venue re-serves them. Candles reach back to the contract's launch |
+| `funding_events` | Derivable | The venue publishes only the *current* rate, but the estimator's inputs are candles ([ADR-0015](decisions/0015-backfilled-funding-provenance.md)) |
+| `cb_venue_state`, `cb_book_snapshots`, `cb_features` | **No** | Self-recorded. The book at a past instant exists nowhere else |
+| `cb_account_state`, `base_state` | **No** | Point-in-time account and wallet state, only from when polling started |
+
+A part that wants a backfill must first place its series in that table. "No" is a legitimate answer and means downtime is permanent loss — which is why the stack is meant to stay up.
+
+**2. Run on every start, and be gap-driven.** Not "on first run": read what is stored, download only the ranges missing from it, and do nothing when nothing is missing. A start with complete history costs one query (~1s observed, against ~70s for an unconditional download of the same window), which is what makes it safe to leave enabled rather than something an operator has to remember. A container down for an hour then recovers that hour by itself.
+
+**3. Judge coverage on a dense series, never a sparse one.** Absence only means "not downloaded" where a row is expected every interval. `ETH-USD` trades every minute, so a missing minute is a real hole; the perp is sparse and a missing minute usually means nobody traded. Ingest judges coverage on spot and applies the answer to both products. Getting this backwards makes a backfill either re-download forever or never notice a gap.
+
+**4. Compute derived series from what is STORED, not from what was just downloaded.** This is the one that is easy to get wrong and expensive to detect. A single download is only as complete as that one call — measured at 45,525 perp candles against the 46,655 the store had accumulated — so a derivation from it silently inherits its holes. Reading the store instead makes the result **reproducible**: anyone can recompute from the database and get the same number. For the funding series that took independent-reimplementation agreement from 931/985 hours to 1,000/1,002.
+
+**5. Mark provenance when the inputs differ.** A value derived from coarser inputs is not the same measurement as one recorded live, even when the formula is identical. `funding_source = 'backfilled'` exists so that no consumer has to guess, and so a series computed with arithmetic later found to be wrong can be deleted and regenerated with one statement — which has already been needed twice.
+
+**6. Idempotency is the whole safety net.** Every insert is `ON CONFLICT … DO NOTHING` against the natural key ([ADR-0012](decisions/0012-idempotent-inserts-natural-keys.md)), so a re-run costs conflicts rather than duplicates, and precedence settles the right way round on its own: a recorded row is already there when a reconstruction tries, so recording always beats reconstruction.
+
+Reading the database is otherwise reserved to `carry`; `internal/db.Reader` is the named exception that makes steps 2 and 4 possible, and it is read-only (§3, rule 1).
 
 ---
 

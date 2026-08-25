@@ -31,11 +31,11 @@ func venueRows(t *testing.T, sink *fakeSink) map[string]db.VenueStateRow {
 	t.Helper()
 	rows := map[string]db.VenueStateRow{}
 	for _, r := range sink.collected() {
-		row, ok := r.(db.VenueStateRow)
-		if !ok {
-			t.Fatalf("unexpected row type %T on the venue-state sink", r)
+		// A sink is shared across producers in the wired system, so other row
+		// types are expected here rather than a mistake.
+		if row, ok := r.(db.VenueStateRow); ok {
+			rows[row.ProductID] = row
 		}
-		rows[row.ProductID] = row
 	}
 	return rows
 }

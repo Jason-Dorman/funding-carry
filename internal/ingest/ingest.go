@@ -68,6 +68,29 @@ type Options struct {
 	// failure reconnects one channel.
 	Dialer Dialer
 
+	// RESTClient enables the Part 5 poller, the funding estimator and the
+	// backfill. Nil runs the WebSocket half alone, which is what Part 4 was.
+	RESTClient *RESTClient
+
+	// Account enables cb_account_state polling. Nil when no CDP credential is
+	// configured: the public stack must start and run without one, so the
+	// account half is absent rather than broken.
+	Account AccountSource
+
+	// Backfill, when positive, is how far back to reconstruct history on
+	// startup. Zero skips it.
+	//
+	// It runs on every start and costs nothing when there is nothing to do: the
+	// backfiller reads what is already stored and downloads only the ranges that
+	// are missing. That is what makes it safe to leave on — a container that has
+	// been down for an hour recovers that hour by itself, and one that restarts
+	// twice in a minute does no network work the second time.
+	Backfill time.Duration
+
+	// BarStore lets the backfill see what is already recorded. Nil makes every
+	// run download the whole window.
+	BarStore BarStore
+
 	// Backoff and now are overridden by tests; production leaves them zero.
 	Backoff Backoff
 	now     func() time.Time
@@ -76,9 +99,15 @@ type Options struct {
 // Ingest is the WebSocket half of cmd/ingest: five streams and the venue-state
 // sampler they feed.
 type Ingest struct {
-	streams []*Stream
-	state   *VenueState
-	log     *slog.Logger
+	streams  []*Stream
+	state    *VenueState
+	marks    *Marks
+	funding  *FundingRunner
+	poller   *Poller
+	account  *AccountPoller
+	backfill *Backfill
+	window   time.Duration
+	log      *slog.Logger
 }
 
 // New builds the streams. It starts nothing; Run does that.
@@ -98,19 +127,38 @@ func New(opts Options, sink Sink, m *Metrics, log *slog.Logger) *Ingest {
 	// spot market does not close.
 	both := []string{opts.PerpProduct, opts.SpotProduct}
 
+	in := &Ingest{state: state, log: log, window: opts.Backfill}
+
+	// The Part 5 chain, built only when there is a REST client to feed it:
+	// marks -> funding -> the venue-state sampler and the funding ledger.
+	if opts.RESTClient != nil {
+		in.funding = NewFundingRunner(opts.PerpProduct, opts.Maintenance, state, sink, log, now)
+		in.marks = NewMarks(opts.PerpProduct, opts.SpotProduct, func(s MarkSample) {
+			state.ObserveMarks(opts.PerpProduct, s.FuturesMark, s.SpotMark, s.At)
+			in.funding.Observe(s)
+		}, log, now)
+		in.poller = NewPoller(opts.PerpProduct, opts.RESTClient, state, sink, opts.SampleInterval, log, now)
+		if opts.Backfill > 0 {
+			in.backfill = NewBackfill(opts.PerpProduct, opts.SpotProduct, opts.RESTClient,
+				opts.BarStore, sink, opts.Maintenance, log)
+		}
+	}
+	if opts.Account != nil {
+		in.account = NewAccountPoller(opts.Account, opts.PerpProduct, sink, opts.SampleInterval, log, now)
+	}
+
 	specs := []struct {
 		name    string
 		handler Handler
 		silence time.Duration
 	}{
-		{channelTicker, NewTickerHandler(both, state), tickerSilence},
+		{channelTicker, NewTickerHandler(both, state, in.marks), tickerSilence},
 		{channelLevel2, NewLevel2Handler(opts.PerpProduct, opts.BookSnapInterval, sink), level2Silence},
-		{channelMarketTrades, NewTradesHandler(both, TradeBucketSecs*time.Second, sink), tradesSilence},
+		{channelMarketTrades, NewTradesHandler(both, TradeBucketSecs*time.Second, sink, in.marks), tradesSilence},
 		{channelCandles, NewCandlesHandler(both, sink), candlesSilence},
 		{channelStatus, NewStatusHandler(opts.PerpProduct, state, log), statusSilence},
 	}
 
-	in := &Ingest{state: state, log: log}
 	for _, s := range specs {
 		in.streams = append(in.streams, NewStream(s.name, s.handler, opts.Dialer, m.Stream(s.name), log,
 			StreamOptions{Silence: s.silence, Backoff: opts.Backoff, now: now}))
@@ -126,6 +174,11 @@ func New(opts Options, sink Sink, m *Metrics, log *slog.Logger) *Ingest {
 // Returning only after the last goroutine has stopped is what lets the caller
 // close the writer safely: the writer's drain assumes its producers are done.
 func (in *Ingest) Run(ctx context.Context) {
+	in.runBackfill(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+
 	var wg sync.WaitGroup
 
 	wg.Add(1)
@@ -133,6 +186,25 @@ func (in *Ingest) Run(ctx context.Context) {
 		defer wg.Done()
 		in.state.Run(ctx)
 	}()
+
+	for _, r := range []struct {
+		name string
+		run  func(context.Context)
+	}{
+		{"marks", runOf(in.marks)},
+		{"funding", runOf(in.funding)},
+		{"rest_poller", runOf(in.poller)},
+		{"account_poller", runOf(in.account)},
+	} {
+		if r.run == nil {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.run(ctx)
+		}()
+	}
 
 	for _, s := range in.streams {
 		wg.Add(1)
@@ -153,4 +225,52 @@ func (in *Ingest) names() []string {
 		names[i] = s.Name()
 	}
 	return names
+}
+
+// runBackfill recovers history before the live streams start, and hands the
+// newest reconstructed rate to the funding runner.
+//
+// It blocks on purpose: it is a one-shot recovery, and letting the live streams
+// start first would only race it for the same rows. Every insert is idempotent,
+// so a recorded row beats a reconstructed one whichever order they arrive in —
+// this is about not doing the work twice, not about correctness.
+func (in *Ingest) runBackfill(ctx context.Context) {
+	if in.backfill == nil {
+		return
+	}
+	res, err := in.backfill.Run(ctx, time.Now().UTC(), in.window)
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil {
+		in.log.Warn("backfill incomplete", "error", err, "bars", res.Bars, "hours", res.Hours)
+	} else {
+		in.log.Info("backfill complete",
+			"bars_considered", res.Bars, "bars_downloaded", res.Fetched,
+			"gap_ranges", res.Gaps, "funding_hours", res.Hours,
+			"unmarkable_hours", res.Skipped, "from", res.From, "to", res.To)
+	}
+
+	// Seed the smoothing so the first live hour continues the series instead of
+	// starting it again from its own raw premium.
+	if res.HaveLast && in.funding != nil {
+		in.funding.Seed(res.Last.Rate, res.Last.HourStart)
+		in.log.Info("funding smoothing seeded from the backfill",
+			"hour", res.Last.HourStart, "rate", res.Last.Rate.StringFixed(10))
+	}
+}
+
+// runner is anything with a Run loop bound to the root context.
+type runner interface{ Run(ctx context.Context) }
+
+// runOf returns the Run method of a possibly-nil component. A nil typed pointer
+// in an interface is not a nil interface, so the nil-ness has to be checked on
+// the concrete value before it is wrapped — the classic Go trap, and the reason
+// this helper exists rather than a plain interface field.
+func runOf[T runner](v T) func(context.Context) {
+	var zero T
+	if any(v) == any(zero) {
+		return nil
+	}
+	return v.Run
 }

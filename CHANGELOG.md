@@ -18,6 +18,45 @@ Smaller things that are visible from outside the package: every connection also 
 
 **Not yet accepted.** The 1-hour soak, the `kill -TERM` clean-flush demonstration and the mid-run network pull all need a running TimescaleDB, and `docker` is unavailable in the development WSL distro.
 
+### The backfill is self-healing, and the funding series now verifies — 2026-08-24
+
+**On every start, ingest checks what history is present and recovers what is missing.** The backfill reads `cb_bars`, downloads only the ranges absent from it, and reconstructs from the two together. A start with nothing missing costs **0.24 s and no HTTP requests** (previously ~70 s and ~370 requests, unconditionally), so it is safe to leave on: a container down for an hour recovers that hour by itself.
+
+**The same change fixed a real fidelity problem.** Computing from the *stored* bars rather than from one download matters because a single download is incomplete — 45,525 perp candles against the 46,655 the store had accumulated. Measured against an independent reimplementation of the venue's formula, agreement went from **931 of 985 hours to 1,000 of 1,002**. It also makes the series reproducible: anyone can recompute it from `cb_bars` and get the same number, which was not previously true of the system's primary asset.
+
+**A latent failure was also found and fixed:** the smoothed rate grew 16 decimal digits every hour (18 at hour 1, 15,810 by hour 980), because `alpha` carried `DivisionPrecision`'s sixteen places into an exact multiplication inside a recursion. PostgreSQL `numeric` stops at 16,383 places, so the series was roughly six weeks of continuous running from an insert the database would refuse — a fatal writer error. Storage for the column fell from 486 kB to 8,865 bytes.
+
+*Operationally:* `BACKFILL_WINDOW` now means "how far back history must reach", not "how much to download each start". `internal/db.Reader` is a new, narrow read path — the first thing besides the writer to touch the database, documented as an exception in [architecture §3](docs/architecture.md#3-concurrency-model-ingest).
+
+### The venue does publish a funding rate — corrected — 2026-08-24 (Part 5 review)
+
+**A verified "fact" in this project was wrong.** The docs recorded that Coinbase publishes no funding rate for `ETP-20DEC30-CDE`, on the strength of `future_product_details.perpetual_details.funding_rate` coming back empty. It publishes one at `future_product_details.funding_rate` — one level up, same field name, `0.000019`/hr (~16.6% annualised), with `funding_time` and `funding_interval` beside it.
+
+*What changes for consumers:* `funding_rate_hourly` now carries the venue's rate with `funding_source='venue'`, and `funding_rate_est` is always the local computation. That split is what the schema was designed for, and their difference is what `carry_funding_reconciliation_error` will measure. The candle backfill is unaffected — the venue publishes only the current rate, so reconstruction is still the only route to history.
+
+The same payload also publishes `overnight_margin_rate` (`{long 0.24525, short 0.33475}`), closing a `TODO(verify)` that had been waiting on an account, plus `index_price` and `settlement_price`.
+
+**Two arithmetic bugs in the estimator, found by the same review.** Every funding hour was averaging the wrong twenty three-minute windows — a sample is stamped with its window's *end*, so the hour filter took one window from the previous hour and dropped the last of its own, shifting the series by three minutes (the regression test showed a 22× premium error from one leaked window). And every live mark dropped the final minute of its own window, because the sampler fired before the last trade bucket had closed. Anything computed from `funding_rate_est` before this date should be recomputed.
+
+### The funding series exists, with 45 days of history — 2026-08-24 (Part 5)
+
+`cmd/ingest` now computes the funding rate the venue does not publish, and reconstructs the history it was not running for.
+
+- **45 days of funding history, backfilled from candles.** `fundingHistory` does not publish for this product, but one-minute candles do — back to the perp's launch — and the estimator's only inputs are a futures mark and a spot mark. One startup wrote 110,294 `cb_bars` rows at `tf='1m'` and **981 funding hours**, averaging +8.80% annualised. The z-score has a warm start on day one instead of day thirty ([ADR-0015](docs/decisions/0015-backfilled-funding-provenance.md)).
+- **Reconstructed hours are marked `funding_source='backfilled'`** (migration `000005`). They are the venue's formula on coarser inputs — candle closes rather than trade VWAPs — so **anything consuming the funding series must decide what to do with them**. A z-score fitted across the boundary mixes two measurements.
+- **`cb_account_state` is live**, polled from a view-only Ed25519 CDP key, with intraday margin asserted off every poll.
+- **`margin_ratio` is NULL, not zero, when there is no position.** The venue reports `liquidation_threshold = 0`, so the ratio is undefined. Anything reading it must treat NULL as "nothing at risk" — read as zero it looks like imminent liquidation on an empty account.
+- **`buy_vol + sell_vol`** remains the *known* portion of a bucket's volume, and `funding_events` ACCRUAL rows for the observed series carry `amount = 0` and `position_id` NULL: the rate is the payload, the money column belongs to rows written against a position.
+- New config `BACKFILL_WINDOW` (default 45 days; `0` disables).
+
+Open item #1 from spec §12 is closed: the Advanced Trade client is hand-rolled, with the credential isolated in its own package ([ADR-0016](docs/decisions/0016-hand-rolled-coinbase-client.md)).
+
+### JWT signing is EdDSA (Ed25519), not ES256 — 2026-08-23 (Part 5)
+
+**Contract correction, caught before any key existed.** [API spec §1](docs/api-spec.md#1-coinbase-advanced-trade-apis-consumed) specified ES256, and the onboarding checklist had been written to match it. The CDP portal marks ECDSA as being for legacy SDKs and recommends Ed25519; a document of ours does not get to overrule the venue about the venue. Authenticated calls now sign EdDSA over an Ed25519 key.
+
+Two practical consequences. `CB_API_PRIVATE_KEY` is a single base64 string rather than a multi-line PEM, so it needs no newline escaping to survive Compose's `env_file`. And signing needs only `crypto/ed25519` from the standard library, where the ECDSA path would have wanted a JWT dependency.
+
 ### Two data-fidelity fixes from 22 hours of continuous running — 2026-08-22
 
 Both were found by auditing the recorded series against what should be there, not by tests, and both were silent.

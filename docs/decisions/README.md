@@ -27,5 +27,13 @@ One short file per decision that shaped the system. ADRs make the build's judgme
 | [0012](0012-idempotent-inserts-natural-keys.md) | Every insert is idempotent, keyed on the row's natural identity; `positions.id` is a client-minted ULID | accepted |
 | [0013](0013-websocket-client-coder.md) | `github.com/coder/websocket` is the WebSocket client, behind a three-method interface | accepted |
 | [0014](0014-one-sampler-owns-venue-state.md) | One component samples `cb_venue_state`; every producer feeds it rather than writing rows | accepted |
+| [0015](0015-backfilled-funding-provenance.md) | Funding history is reconstructed from candles and marked `backfilled` | accepted |
+| [0016](0016-hand-rolled-coinbase-client.md) | Hand-rolled Advanced Trade client; the credential is isolated in `internal/coinbase` | accepted |
 
-Pending (from spec §12 — will become ADRs when decided): Advanced Trade Go client (hand-rolled vs community, wk 1/Part 5), automated Base spot venue (DEX aggregator vs Coinbase spot + withdraw, wk 4), FIX beyond sim-venue (wk 7/Part 21), z-score minimum history, Rust port.
+**Decision memos** — analysis prepared for a PO decision, promoted to an ADR once decided:
+
+| Memo | Question | State |
+|---|---|---|
+| [Base spot venue](memo-base-spot-venue.md) | DEX aggregator vs Coinbase spot + withdraw for the automated spot leg (spec §12 item 2, gates Part 17) | awaiting PO decision |
+
+Pending (from spec §12 — will become ADRs when decided): automated Base spot venue (DEX aggregator vs Coinbase spot + withdraw, wk 4), FIX beyond sim-venue (wk 7/Part 21), z-score minimum history, Rust port.

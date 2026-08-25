@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Jason-Dorman/funding-carry/internal/coinbase"
 	"github.com/Jason-Dorman/funding-carry/internal/config"
 	"github.com/Jason-Dorman/funding-carry/internal/db"
 	"github.com/Jason-Dorman/funding-carry/internal/ingest"
@@ -65,10 +66,33 @@ func run() error {
 		"poll_rest", cfg.Poll.REST.String(),
 		"poll_base", cfg.Poll.Base.String(),
 		"book_snapshot", cfg.Poll.BookSnap.String(),
+		"backfill", cfg.Backfill.String(),
 		"maintenance_break", cfg.Maintenance.String(),
 	)
 
-	return pipeline(ctx, cfg, pool, ingest.WSDialer{URL: cfg.Coinbase.WSURL}, log)
+	return pipeline(ctx, cfg, pool, db.NewReader(pool), ingest.WSDialer{URL: cfg.Coinbase.WSURL}, log)
+}
+
+// accountSource builds the authenticated account client, or nil.
+//
+// Nil is a supported state, not a failure: the public stack must start and run
+// without a credential, so an absent key means the account half is absent. A
+// key that is present but malformed is the opposite — that is an operator
+// mistake, and it fails the startup rather than degrading quietly into the same
+// state as having no key at all.
+func accountSource(cfg *config.Ingest, log *slog.Logger) (ingest.AccountSource, error) {
+	name, key := cfg.Secrets.CBAPIKeyName, cfg.Secrets.CBAPIPrivateKey
+	if !name.IsSet() && !key.IsSet() {
+		log.Info("no CDP credential; cb_account_state polling is off",
+			"add", "CB_API_KEY_NAME and CB_API_PRIVATE_KEY in .env.private")
+		return nil, nil
+	}
+	signer, err := coinbase.NewSigner(name.Reveal(), key.Reveal())
+	if err != nil {
+		return nil, fmt.Errorf("cdp credential: %w", err)
+	}
+	log.Info("CDP credential loaded; cb_account_state polling is on")
+	return coinbase.NewClient(signer), nil
 }
 
 // rowSender is the database as this binary's writer needs it: one batched send.
@@ -82,7 +106,9 @@ type rowSender interface {
 // pipeline wires the goroutines and blocks until they have all stopped. Read the
 // statements backwards and they are the shutdown order from architecture
 // section 8: cancel, streams stop, writer drains and flushes, pool closes.
-func pipeline(ctx context.Context, cfg *config.Ingest, sender rowSender, dialer ingest.Dialer, log *slog.Logger) error {
+func pipeline(ctx context.Context, cfg *config.Ingest, sender rowSender, store ingest.BarStore,
+	dialer ingest.Dialer, log *slog.Logger,
+) error {
 	srv := metrics.NewServer(cfg.MetricsAddr, log)
 
 	// The metrics endpoint outlives the root context deliberately. The writer's
@@ -125,6 +151,12 @@ func pipeline(ctx context.Context, cfg *config.Ingest, sender rowSender, dialer 
 		_ = writer.Run(context.WithoutCancel(ctx))
 	}()
 
+	account, err := accountSource(cfg, log)
+	if err != nil {
+		stopStreams()
+		return err
+	}
+
 	streams := ingest.New(ingest.Options{
 		PerpProduct:      cfg.PerpProductID,
 		SpotProduct:      cfg.SpotProductID,
@@ -132,6 +164,12 @@ func pipeline(ctx context.Context, cfg *config.Ingest, sender rowSender, dialer 
 		BookSnapInterval: cfg.Poll.BookSnap,
 		Maintenance:      cfg.Maintenance,
 		Dialer:           dialer,
+		RESTClient:       ingest.NewRESTClient(cfg.Coinbase.APIURL, nil),
+		// The backfill reads what is already stored so it can download only what
+		// is missing, which is what lets it run on every start.
+		BarStore: store,
+		Account:  account,
+		Backfill: cfg.Backfill,
 	}, writer, ingest.NewMetrics(srv.Registry()), log)
 
 	// Run returns only once every stream goroutine has stopped, which is the

@@ -206,9 +206,15 @@ type Secrets struct {
 // Ingest configures cmd/ingest: market data in, TimescaleDB out.
 type Ingest struct {
 	Common
-	Coinbase    CoinbaseEndpoints
-	Base        BaseEndpoints
-	Poll        PollIntervals
+	Coinbase CoinbaseEndpoints
+	Base     BaseEndpoints
+	Poll     PollIntervals
+	// Backfill is how far back to reconstruct history on startup. Zero disables
+	// it. The default covers the thirty days a funding z-score needs plus a
+	// margin, rather than the thirteen months the venue will serve: pulling a
+	// year on every restart is a lot of requests for history that is already in
+	// the database after the first run.
+	Backfill    time.Duration
 	Maintenance MaintenanceWindow
 	Secrets     Secrets
 }
@@ -268,6 +274,7 @@ func loadIngest(lookup lookupFunc) (*Ingest, error) {
 			Base:     l.Seconds("POLL_BASE_SECS", 30*time.Second),
 			BookSnap: l.Seconds("BOOK_SNAP_SECS", 10*time.Second),
 		},
+		Backfill:    l.Duration("BACKFILL_WINDOW", defaultBackfillWindow),
 		Maintenance: l.Window("MAINTENANCE_BREAK", defaultMaintenanceBreak),
 		Secrets:     l.secrets(),
 	}
@@ -348,6 +355,7 @@ func loadMigrateCmd(lookup lookupFunc) (*MigrateCmd, error) {
 const (
 	defaultMaintenanceBreak = "Fri 17:00-18:00 America/New_York"
 	defaultContractSizeETH  = "0.10"
+	defaultBackfillWindow   = 45 * 24 * time.Hour
 	pressureWeightCount     = 3
 )
 

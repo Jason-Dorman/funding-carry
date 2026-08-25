@@ -50,7 +50,7 @@ func fixtureMessage(t *testing.T, name string) Message {
 func TestLiveTickerFrameDecodes(t *testing.T) {
 	sink := &fakeSink{}
 	state := newSampler(t, sink)
-	h := NewTickerHandler([]string{testPerp, testSpot}, state)
+	h := NewTickerHandler([]string{testPerp, testSpot}, state, nil)
 
 	msg := fixtureMessage(t, "ticker.json")
 	if msg.Channel != channelTicker {
@@ -120,7 +120,7 @@ func TestLiveLevel2FrameDecodes(t *testing.T) {
 
 func TestLiveMarketTradesFrameDecodes(t *testing.T) {
 	sink := &fakeSink{}
-	h := NewTradesHandler([]string{testPerp, testSpot}, TradeBucketSecs*time.Second, sink)
+	h := NewTradesHandler([]string{testPerp, testSpot}, TradeBucketSecs*time.Second, sink, nil)
 	ctx := context.Background()
 
 	msg := fixtureMessage(t, "market_trades.json")
@@ -232,9 +232,9 @@ func TestLiveHeartbeatFrameIsNotDataForAnyStream(t *testing.T) {
 	// Every handler must ignore it, or the staleness gauge on every stream would
 	// advance once a second whatever the market was doing.
 	for _, h := range []Handler{
-		NewTickerHandler([]string{testPerp}, nil),
+		NewTickerHandler([]string{testPerp}, nil, nil),
 		NewLevel2Handler(testPerp, time.Second, nil),
-		NewTradesHandler([]string{testPerp}, time.Minute, nil),
+		NewTradesHandler([]string{testPerp}, time.Minute, nil, nil),
 		NewCandlesHandler([]string{testPerp}, nil),
 		NewStatusHandler(testPerp, nil, testLogger()),
 	} {

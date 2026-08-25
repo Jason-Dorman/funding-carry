@@ -34,6 +34,12 @@ type rowData struct {
 const (
 	FundingSourceVenue    = "venue"
 	FundingSourceComputed = "computed"
+	// FundingSourceBackfilled marks an hour reconstructed from candle history
+	// rather than recorded live: the venue's own formula on one-minute candle
+	// closes instead of three-minute VWAPs of trades. Same formula, coarser
+	// inputs, different error profile — which is why it is not 'computed'
+	// (ADR-0015).
+	FundingSourceBackfilled = "backfilled"
 
 	FundingKindAccrual    = "ACCRUAL"
 	FundingKindSettlement = "SETTLEMENT"
@@ -89,7 +95,7 @@ type VenueStateRow struct {
 	Mid               decimal.NullDecimal
 	FundingRateHourly decimal.NullDecimal
 	FundingRateEst    decimal.NullDecimal
-	FundingSource     string // FundingSourceVenue | FundingSourceComputed
+	FundingSource     string // FundingSourceVenue | FundingSourceComputed | FundingSourceBackfilled
 	FundingAnnualized decimal.NullDecimal
 	PremiumProxy      decimal.NullDecimal
 	SpreadBps         decimal.NullDecimal
@@ -121,7 +127,7 @@ func (r VenueStateRow) row() rowData {
 type BarRow struct {
 	TS         time.Time // bar close
 	ProductID  string
-	TF         string // '1m', '1h'
+	TF         string // '5m' from the WS candles channel, '1m' from REST
 	Open       decimal.Decimal
 	High       decimal.Decimal
 	Low        decimal.Decimal
