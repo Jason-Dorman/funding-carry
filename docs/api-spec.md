@@ -96,7 +96,21 @@ Constraints honored by `cbVenue`:
 
 ### 2.1 Read path (`internal/ingest` Base poller)
 
-JSON-RPC over Alchemy: `eth_getBalance` (wallet ETH), `eth_call` (USDC `balanceOf`), `eth_gasPrice`. Spot ETH/USDC reference price from a DEX quote (aggregator quote endpoint) or Coinbase spot **[decide wk 4, open item #2]**. Persisted to `base_state` every poll (default 30s).
+JSON-RPC over Alchemy, hand-rolled rather than through `go-ethereum` ([ADR-0017](decisions/0017-hand-rolled-base-rpc.md)). Four methods and five contract calls, and nothing else:
+
+| RPC method | Reads |
+|---|---|
+| `eth_blockNumber` | the height every other read in the poll is pinned to |
+| `eth_getBalance` | `wallet_eth` |
+| `eth_call` → `balanceOf(address)` on `BASE_USDC_CONTRACT` | `wallet_usdc`, scaled by that contract's own `decimals()` |
+| `eth_gasPrice` | `gas_gwei` — the one column that cannot be pinned to a block, since it is the node's estimate of what a transaction would pay now |
+| `eth_call` → `slot0()` on `BASE_SPOT_POOL` | `spot_px`, with `token0()`/`token1()`/`decimals()` read once to fix the pool's orientation and scales |
+
+**One row is one block.** The height is read first and every balance and price is answered at it, so a row is a snapshot of one moment on the chain rather than a smear across three. A failure to read the height is the only failure that skips the whole row; each of the four columns otherwise fails independently to NULL, and a poll that could read nothing at all writes nothing — a missing row is a visible gap, a row of NULLs is not.
+
+Spot ETH/USDC reference price comes from the pool itself, with the in-process Coinbase `ETH-USD` mid as the fallback ([ADR-0018](decisions/0018-base-spot-px-from-the-pool.md)). The pool is verified against the configured WETH and USDC on first read rather than trusted: a pool holding some other pair answers `slot0` happily and its number would look exactly like a price. The two sources are different markets, so **every row records which one it holds** in `spot_px_source`, `CHECK`-paired with `spot_px` so the column cannot drift into being set only sometimes; `ingest_base_spot_px_source_total` carries the same fact for alerting. **This does not close open item #2**, which decides where the automated leg *executes* in Part 17.
+
+Persisted to `base_state` every `POLL_BASE_SECS` (default 30s), timestamped on the sampling boundary because `(ts)` is the row's identity. **No backfill** — balances only exist from when polling starts ([architecture §7.1](architecture.md#71-historical-recovery--the-backfill-pattern)).
 
 ### 2.2 Write path (`baseVenue`, week 5)
 
@@ -368,6 +382,11 @@ cb_features (
 base_state (
   ts,
   spot_px numeric,                 -- ETH/USDC reference
+  spot_px_source text,             -- 'dex' | 'coinbase'; CHECK-paired with spot_px, so a price
+                                   -- always names its market and a source never floats free.
+                                   -- The pairing is NOT VALID: it binds every write from now on
+                                   -- without demanding that rows predating the column, which have
+                                   -- no market to name, invent one
   wallet_eth numeric, wallet_usdc numeric,
   gas_gwei numeric
 )
@@ -505,6 +524,8 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `ingest_rows_conflicted_total` | counter | table | rows the database already had: inserts that hit their natural key and did nothing |
 | `ingest_write_batch_seconds` | histogram | — | batch insert latency |
 | `ingest_write_queue_depth` | gauge | — | rows waiting on the writer's channel; a rising floor is backpressure |
+| `ingest_base_last_block` | gauge | — | block height the last successful Base poll read at. `base_state` has no WebSocket stream behind it, so `ingest_last_seen_timestamp_seconds` says nothing about it; a height that stops advancing is the equivalent statement, and it doubles as the anchor for auditing a row against a block explorer |
+| `ingest_base_spot_px_source_total` | counter | source | where each `base_state.spot_px` came from: `dex` (the configured Base pool), `coinbase` (the mid standing in for it), or `none` — no price at all, which the row records as NULL and the schema has no value for. All three label values are initialized, so a fallback that has never fired is a visible zero rather than an absent series. `none` rising is the alertable one: it means the column the spot leg is marked against is empty |
 | `carry_funding_rate` | gauge | product, source | current hourly funding; `source` = venue\|computed |
 | `carry_funding_rate_est` | gauge | product | locally computed estimate (always present) |
 | `carry_funding_reconciliation_error` | gauge | — | accrued estimate minus cash adjustments applied |
@@ -560,7 +581,8 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `PERP_PRODUCT_ID` | all | `ETP-20DEC30-CDE` |
 | `SPOT_PRODUCT_ID` | all | `ETH-USD` |
 | `CONTRACT_SIZE_ETH` | carry, migrate, research | `0.10` — `make migrate` seeds it into `cb_products` until Part 5 reads the real value from the products endpoint |
-| `BASE_RPC_URL`, `ALCHEMY_API_KEY` | ingest, carry | — |
+| `BASE_RPC_URL`, `ALCHEMY_API_KEY` | ingest, carry | — — the Alchemy key lives in `BASE_RPC_URL`'s path, so **the URL is the credential**: it is never logged, and the transport-failure path deliberately does not wrap `*url.Error`, which quotes the URL it failed on |
+| `BASE_USDC_CONTRACT`, `BASE_WETH_CONTRACT`, `BASE_SPOT_POOL` | ingest | Base mainnet native USDC / WETH / the Uniswap v3 WETH-USDC 0.05% pool. Configuration rather than constants because all three are chain-scoped — Base Sepolia, where the Base leg starts (spec §1), needs different ones. Parsed in `cmd/ingest`, so a malformed address fails the startup rather than reading an address nobody meant; the pool is additionally verified against the two token addresses on the first poll |
 | `BACKFILL_WINDOW` | ingest | `1080h` (45 days) — how far back history must reach; `0` disables it. **The backfill runs on every start and is gap-driven:** it reads what is already stored, downloads only the ranges missing from it, and costs one query when nothing is missing (0.24 s observed, against ~70 s for a full download). A container down for an hour recovers that hour by itself; one that restarts twice in a minute does no network work the second time. The z-score needs ~30 days; the venue serves candles back to the perp's launch, but re-pulling a year on every restart is pointless once the first run has stored it ([ADR-0015](decisions/0015-backfilled-funding-provenance.md)) |
 | `POLL_REST_SECS`, `POLL_BASE_SECS`, `BOOK_SNAP_SECS` | ingest | 5 / 30 / 10 — `POLL_REST_SECS` is also the `cb_venue_state` sampling boundary, shared by the WS sampler and the Part 5 poller because both must agree on where a boundary is ([ADR-0014](decisions/0014-one-sampler-owns-venue-state.md)) |
 | `Z_ENTER`, `Z_EXIT`, `F_FLIP` | carry | 1.5 / 0.5 / 0 *(placeholders — real values private)* |

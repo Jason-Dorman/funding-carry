@@ -41,6 +41,15 @@ const (
 	// (ADR-0015).
 	FundingSourceBackfilled = "backfilled"
 
+	// SpotSourceDEX and SpotSourceCoinbase are the two markets base_state.spot_px
+	// can come from: the configured Base pool's own mid, read on chain at the
+	// row's block, and the Coinbase spot mid standing in when the pool cannot be
+	// read (ADR-0018). They are different markets, so a row that could not say
+	// which one it held would be a price whose market is unknowable after the
+	// fact — and the spot leg is marked against this column.
+	SpotSourceDEX      = "dex"
+	SpotSourceCoinbase = "coinbase"
+
 	FundingKindAccrual    = "ACCRUAL"
 	FundingKindSettlement = "SETTLEMENT"
 
@@ -216,18 +225,22 @@ func (r TradesAggRow) row() rowData {
 // BaseStateRow is the Base side of the book: wallet inventory, reference price
 // and gas.
 type BaseStateRow struct {
-	TS         time.Time
-	SpotPx     decimal.NullDecimal
-	WalletETH  decimal.NullDecimal
-	WalletUSDC decimal.NullDecimal
-	GasGwei    decimal.NullDecimal
+	TS     time.Time
+	SpotPx decimal.NullDecimal
+	// SpotPxSource is SpotSourceDEX or SpotSourceCoinbase. The schema pairs it
+	// with SpotPx: a price with no source and a source with no price are both
+	// rejected, so the column cannot drift into being set only sometimes.
+	SpotPxSource string
+	WalletETH    decimal.NullDecimal
+	WalletUSDC   decimal.NullDecimal
+	GasGwei      decimal.NullDecimal
 }
 
 func (r BaseStateRow) row() rowData {
 	return rowData{
 		table:    "base_state",
-		columns:  []string{"ts", "spot_px", "wallet_eth", "wallet_usdc", "gas_gwei"},
-		values:   []any{r.TS, r.SpotPx, r.WalletETH, r.WalletUSDC, r.GasGwei},
+		columns:  []string{"ts", "spot_px", "spot_px_source", "wallet_eth", "wallet_usdc", "gas_gwei"},
+		values:   []any{r.TS, r.SpotPx, text(r.SpotPxSource), r.WalletETH, r.WalletUSDC, r.GasGwei},
 		conflict: "ON CONFLICT (ts) DO NOTHING",
 	}
 }

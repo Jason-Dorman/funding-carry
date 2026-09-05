@@ -234,3 +234,49 @@ func TestVenueStateRunStopsOnCancellation(t *testing.T) {
 		t.Fatal("the sampler kept running after cancellation")
 	}
 }
+
+// SpotMid is the Base poller's fallback price, and it had no test of any kind:
+// deleting its staleness check, or keying it on the perp instead of the spot
+// product, left the whole suite green. In production either mutation writes a
+// price into base_state.spot_px labelled spot_px_source='coinbase' — the column
+// the spot leg is marked against — that is either frozen or the wrong
+// instrument, which is exactly what maxQuoteAge exists to prevent everywhere
+// else in this file.
+func TestSpotMidIsTheSpotProductAndOnlyWhileFresh(t *testing.T) {
+	quotedAt := epoch
+	v := newSampler(t, &fakeSink{})
+
+	// A perp quote alone must not answer: this is the ETH-USD reference, and the
+	// perp trades at a premium to it — the whole basis the system measures.
+	v.Observe(testPerp, quote(t, "3000", "3002", "3001", quotedAt))
+	if px, ok := v.SpotMid(quotedAt); ok {
+		t.Fatalf("a perp quote answered the spot mid: %s", px)
+	}
+
+	v.Observe(testSpot, quote(t, "2499", "2501", "2500", quotedAt))
+	px, ok := v.SpotMid(quotedAt)
+	if !ok {
+		t.Fatal("a fresh spot quote did not answer")
+	}
+	if want := dec(t, "2500"); !px.Equal(want) {
+		t.Fatalf("mid = %s, want %s", px, want)
+	}
+
+	// Same freshness rule the sampler applies to its own rows: at the limit it
+	// still answers, past it there is no price rather than a stale one.
+	atLimit := quotedAt.Add(time.Duration(maxQuoteAge) * sampleEvery)
+	if _, ok := v.SpotMid(atLimit); !ok {
+		t.Error("a quote exactly at maxQuoteAge was refused")
+	}
+	tooOld := quotedAt.Add(time.Duration(maxQuoteAge)*sampleEvery + time.Nanosecond)
+	if px, ok := v.SpotMid(tooOld); ok {
+		t.Fatalf("a stale quote answered with %s: base_state would record a frozen price", px)
+	}
+
+	// A one-sided book has no midpoint, and a last-trade price is a print, not a
+	// mid — the substitution this file refuses everywhere else.
+	v.Observe(testSpot, quote(t, "", "2501", "2500", quotedAt))
+	if px, ok := v.SpotMid(quotedAt); ok {
+		t.Fatalf("a one-sided book answered with %s", px)
+	}
+}

@@ -77,6 +77,20 @@ type Options struct {
 	// account half is absent rather than broken.
 	Account AccountSource
 
+	// Chain enables the Base wallet poller (Part 6). Nil runs without it, which
+	// is what the stack does with no BASE_RPC_URL or no wallet address
+	// configured: base_state goes unwritten rather than half-written.
+	Chain ChainReader
+
+	// BaseAddresses are the wallet, the two tokens and the pool the Base poller
+	// reads. Ignored when Chain is nil.
+	BaseAddresses BaseAddresses
+
+	// BaseInterval is POLL_BASE_SECS. It is its own cadence rather than the
+	// sampler's because base_state is keyed on (ts) alone and has no boundary to
+	// share with anything.
+	BaseInterval time.Duration
+
 	// Backfill, when positive, is how far back to reconstruct history on
 	// startup. Zero skips it.
 	//
@@ -105,6 +119,7 @@ type Ingest struct {
 	funding  *FundingRunner
 	poller   *Poller
 	account  *AccountPoller
+	base     *BasePoller
 	backfill *Backfill
 	window   time.Duration
 	log      *slog.Logger
@@ -145,6 +160,13 @@ func New(opts Options, sink Sink, m *Metrics, log *slog.Logger) *Ingest {
 	}
 	if opts.Account != nil {
 		in.account = NewAccountPoller(opts.Account, opts.PerpProduct, sink, opts.SampleInterval, log, now)
+	}
+	// The venue-state sampler is the poller's spot fallback: the Coinbase mid it
+	// already holds costs no request, so a failing pool read degrades to a price
+	// from a different market rather than to no price at all.
+	if opts.Chain != nil {
+		in.base = NewBasePoller(opts.Chain, opts.BaseAddresses, state, sink,
+			opts.BaseInterval, m.Base(), log, now)
 	}
 
 	specs := []struct {
@@ -195,6 +217,7 @@ func (in *Ingest) Run(ctx context.Context) {
 		{"funding", runOf(in.funding)},
 		{"rest_poller", runOf(in.poller)},
 		{"account_poller", runOf(in.account)},
+		{"base_poller", runOf(in.base)},
 	} {
 		if r.run == nil {
 			continue

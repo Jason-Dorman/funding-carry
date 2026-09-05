@@ -4,6 +4,26 @@ Notable changes to the system and its contracts. Structural decisions get an ADR
 
 ## [Unreleased]
 
+### Base wallet poller — 2026-09-04 (Part 6, built; live acceptance pending)
+
+`cmd/ingest` gains a fifth producer: a Base L2 poller writing `base_state` every `POLL_BASE_SECS` — wallet ETH, wallet USDC, gas price, and an ETH/USDC reference price. Three things in it are contracts other parts will read against:
+
+- **One row is one block.** The block height is read first and every balance and price is answered at it, so a row is a single moment on the chain rather than a smear across three. A failure to read the height is the only failure that skips the whole row; each of the four columns otherwise degrades to NULL on its own, and a poll that can read *nothing* writes no row at all — a missing row is a visible gap, a row of NULLs is not.
+- **`spot_px` comes from the Base pool itself, not from a DEX aggregator quote** ([ADR-0018](docs/decisions/0018-base-spot-px-from-the-pool.md)): `slot0()` on the configured Uniswap v3 WETH/USDC pool, with the in-process Coinbase mid as the fallback. The pool is *verified* against the configured WETH and USDC on first read rather than trusted — a pool holding some other pair answers `slot0` happily, and in the mutation test that induced it the wrong pair produced `400000000.0000000000000001`. Each token's `decimals()` is read too, not assumed at 18 and 6, because bridged USDbC sits beside native USDC on the same chain. Every row records which source it holds in **`spot_px_source`** (`'dex'` | `'coinbase'`, migration `000006`), `CHECK`-paired with `spot_px` in both directions so a price always names its market and a source never floats free.
+- **The chain client is hand-rolled JSON-RPC, not `go-ethereum`** ([ADR-0017](docs/decisions/0017-hand-rolled-base-rpc.md), amending spec §3 to v3.3). Four RPC methods, five contract calls, no dynamic ABI types, nothing signed. Method ids are derived by keccak-256 from their signatures rather than pasted, which costs one dependency (`golang.org/x/crypto/sha3`) and turns the famous constants into a test. `BASE_RPC_URL` carries the Alchemy key in its path, so **the URL is the credential**: it is never logged, and the transport-failure path deliberately does not wrap `*url.Error`, which would quote it.
+
+New config: `BASE_USDC_CONTRACT`, `BASE_WETH_CONTRACT`, `BASE_SPOT_POOL` (Base mainnet defaults; chain-scoped, so Sepolia needs different ones). New metrics: `ingest_base_last_block` — this feed's staleness signal, since it has no WebSocket stream and therefore no `last_seen` — and `ingest_base_spot_px_source_total{source}`.
+
+**Accepted live against Base mainnet.** Every column of a row was re-read from a second, independent node at the same block and agrees to the last digit, the price to all sixteen decimal places; the recorded price matched exactly one block in a scanned window of forty, which is the block pinning demonstrated rather than described. Degradation was induced against a refusing endpoint: one warning across ~7 poll intervals, classified non-retryable, 0 restarts, 0 ERROR lines. Run against a public Base address — `WALLET_ADDRESS` remains the operator's to set, and without it (or without `BASE_RPC_URL`) the poller is simply absent and the rest of the stack runs unchanged.
+
+### Boundary sampling, in one place — 2026-09-04 (found by the Part 6 live run)
+
+A row keyed on a *truncated* timestamp must be sampled by **waiting for the boundary**, never by ticking on a period. A `time.Ticker` keeps its period but not its phase against the wall clock, so a late tick truncates onto a boundary already written, is dropped by `ON CONFLICT … DO NOTHING` — indistinguishable from a healthy retry — and takes its own boundary with it.
+
+Part 4 found this in the venue-state sampler after it silently dropped 914 rows over 19 hours and fixed it there. Parts 5 and 6 then both used `time.Ticker` anyway. Measuring a running stack: **`base_state` missing 2 of 20 boundaries, `cb_account_state` 11 of 120**, against 1 of 121 for the sampler that had been fixed. Both are now on the shared `runOnBoundary`, which is the actual remedy — the reasoning had been written down and was still not enough, so it now lives in one function all three callers share. After the fix, over 11 minutes: `base_state` **0 missing of 22**, `cb_account_state` 3 of 128 and `cb_venue_state` 1 of 128 — and one of those three is an instant both missed, so it is a process stall rather than a sampling bug. The account poller's remaining two are a three-call authenticated poll occasionally running past its 5-second interval, which is a boundary that genuinely could not be observed rather than a row computed and dropped.
+
+`cb_account_state` is Part 5's table and the fix is outside Part 6's scope. It was made anyway: the measurement was in hand, and a known defect that survives a phase boundary is one nobody re-finds.
+
 ### Coinbase WebSocket ingest — 2026-08-20 (Part 4, in progress)
 
 `cmd/ingest` now reads live market data. Five streams — `ticker`, `level2`, `market_trades`, `candles`, `status` — each on its own connection and goroutine, feeding `cb_venue_state`, `cb_bars`, `cb_book_snapshots` and `cb_trades_agg` through the one writer. Three findings from the live venue change contracts other parts were written against:

@@ -582,8 +582,8 @@ func TestInsertStatement(t *testing.T) {
 		{
 			name: "insert keyed on the sample instant",
 			row:  BaseStateRow{},
-			want: "INSERT INTO base_state (ts, spot_px, wallet_eth, wallet_usdc, gas_gwei) " +
-				"VALUES ($1, $2, $3, $4, $5) ON CONFLICT (ts) DO NOTHING",
+			want: "INSERT INTO base_state (ts, spot_px, spot_px_source, wallet_eth, wallet_usdc, gas_gwei) " +
+				"VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (ts) DO NOTHING",
 		},
 		{
 			name: "idempotent insert",

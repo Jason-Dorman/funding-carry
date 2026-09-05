@@ -55,22 +55,16 @@ func NewAccountPoller(source AccountSource, product string, sink Sink,
 	}
 }
 
-// Run polls on the interval until ctx is canceled.
+// Run polls on every sampling boundary until ctx is canceled.
+//
+// It waits for the boundary rather than ticking on a period (runOnBoundary), for
+// the reason recorded there: (ts) is this row's identity, so a tick that lands a
+// hair below its boundary truncates onto the previous one and is dropped as a
+// duplicate, taking its own boundary with it. Measured at 11 of 120 boundaries
+// missing before the change.
 func (a *AccountPoller) Run(ctx context.Context) {
-	ticker := time.NewTicker(a.interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := a.Poll(ctx); err != nil {
-				if ctx.Err() == nil {
-					a.log.Info("account poller stopping", "reason", err)
-				}
-				return
-			}
-		}
+	if err := runOnBoundary(ctx, a.interval, a.now, a.Poll); err != nil && ctx.Err() == nil {
+		a.log.Info("account poller stopping", "reason", err)
 	}
 }
 

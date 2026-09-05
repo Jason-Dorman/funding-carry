@@ -29,6 +29,8 @@ One short file per decision that shaped the system. ADRs make the build's judgme
 | [0014](0014-one-sampler-owns-venue-state.md) | One component samples `cb_venue_state`; every producer feeds it rather than writing rows | accepted |
 | [0015](0015-backfilled-funding-provenance.md) | Funding history is reconstructed from candles and marked `backfilled` | accepted |
 | [0016](0016-hand-rolled-coinbase-client.md) | Hand-rolled Advanced Trade client; the credential is isolated in `internal/coinbase` | accepted |
+| [0017](0017-hand-rolled-base-rpc.md) | The Base read path is hand-rolled JSON-RPC, not `go-ethereum` | accepted |
+| [0018](0018-base-spot-px-from-the-pool.md) | `base_state.spot_px` is read from the Base pool, with the Coinbase mid as fallback | accepted |
 
 **Decision memos** — analysis prepared for a PO decision, promoted to an ADR once decided:
 

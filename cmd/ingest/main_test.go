@@ -266,3 +266,84 @@ func (s *recordingSender) batches() int {
 	defer s.mu.Unlock()
 	return s.n
 }
+
+// The three Base contract addresses ship as committed defaults, and a default
+// that does not parse would take base_state down at startup on a machine that
+// never overrode it. This runs the real production path over the real committed
+// values rather than over a fixture.
+func TestChainReaderParsesTheCommittedDefaults(t *testing.T) {
+	// Emptied rather than assumed absent: config treats an empty value as unset
+	// and falls back to the default, so this pins the test to the committed
+	// constants whatever the developer's environment holds.
+	for _, key := range []string{"BASE_USDC_CONTRACT", "BASE_WETH_CONTRACT", "BASE_SPOT_POOL"} {
+		t.Setenv(key, "")
+	}
+	// The error is ignored: LoadIngest reports the required variables it has no
+	// defaults for, and still fills in every default — which is the half this
+	// test is about.
+	cfg, _ := config.LoadIngest()
+	cfg.Base.RPCURL = "https://base-mainnet.example/v2/key"
+	cfg.Secrets.WalletAddress = config.Secret("0x1111111111111111111111111111111111111111")
+
+	chain, addrs, err := chainReader(cfg, testLogger())
+	if err != nil {
+		t.Fatalf("the committed defaults do not parse: %v", err)
+	}
+	if chain == nil {
+		t.Fatal("chain reader is nil with an endpoint and a wallet configured")
+	}
+	for _, f := range []struct {
+		name string
+		got  ingest.Address
+		want string
+	}{
+		{"usdc", addrs.USDC, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
+		{"weth", addrs.WETH, "0x4200000000000000000000000000000000000006"},
+		{"pool", addrs.Pool, "0xd0b53d9277642d899df5c87a3966a349a798f224"},
+	} {
+		if f.got.String() != f.want {
+			t.Errorf("%s = %s, want %s", f.name, f.got, f.want)
+		}
+	}
+}
+
+// No endpoint or no wallet is a supported state, not a failure: the public stack
+// runs without either, the same way it runs without a CDP credential.
+func TestChainReaderIsAbsentWithoutAnEndpointOrAWallet(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		rpcURL string
+		wallet string
+	}{
+		{"neither", "", ""},
+		{"no endpoint", "", "0x1111111111111111111111111111111111111111"},
+		{"no wallet", "https://base-mainnet.example/v2/key", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.Base.RPCURL = tc.rpcURL
+			cfg.Secrets.WalletAddress = config.Secret(tc.wallet)
+
+			chain, _, err := chainReader(cfg, testLogger())
+			if err != nil {
+				t.Fatalf("an absent Base half is not an error: %v", err)
+			}
+			if chain != nil {
+				t.Fatal("a chain reader was built with nothing to point it at")
+			}
+		})
+	}
+}
+
+// A malformed address is the opposite of an absent one. Every read this system
+// makes answers a wrong address with a plausible zero rather than an error, so
+// the parse is the only place the mistake can be caught.
+func TestChainReaderFailsTheStartupOnAMalformedAddress(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Base.RPCURL = "https://base-mainnet.example/v2/key"
+	cfg.Secrets.WalletAddress = config.Secret("0xnot-an-address")
+
+	if _, _, err := chainReader(cfg, testLogger()); err == nil {
+		t.Fatal("a malformed WALLET_ADDRESS started the binary")
+	}
+}

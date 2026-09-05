@@ -9,6 +9,7 @@ Delta-neutral funding-carry system: long spot ETH on Base, short the ETH perpetu
 - Reality contradicts the docs (API drift, a design that doesn't survive contact with the venue).
 - Anything would touch **live trading, the named wallet, credentials, or real funds** — never act on these without explicit instruction in the current conversation.
 - A part's acceptance criteria can't be met as written.
+- **A gap** — something the plan or spec doesn't say and I'd otherwise fill by guessing: a threshold with no stated value, a criterion with no stated measurement, an unspecified behavior at a boundary. Name the gap and ask rather than quietly picking something defensible; a guess that ships looks identical to a decision until it is wrong. Two thresholds in Part 4 were set by guessing and later corrected by measuring.
 
 Jason reads every diff and must be able to explain every line (spec §1). Optimize for explainability over cleverness; when a diff needs explaining, explain it in the PR/summary, not in code comments.
 
@@ -39,7 +40,11 @@ Every change that alters behavior, a contract, a schema, a metric, config, or se
 - A completed part → update build-plan acceptance notes and the README **Status** line.
 - `[verify]` markers in api-spec: when you verify a payload against the live venue, replace the marker with what you found.
 
+- The **build spec** needs PO direction to change, but that governs its *requirements*, not its bookkeeping. Its status-bearing parts keep pace like any other doc: §12 open items are marked closed with the date and the evidence, and the amendment record gains an entry whenever building contradicts something the spec asserts. Recording that a requirement is satisfied, or that reality disagreed with it, is not editing the requirement.
+
 A doc that disagrees with the code is treated as a bug of the same severity as failing tests. If you find drift you didn't cause, fix it or flag it — don't build on top of it.
+
+This applies to *every* doc the change touches, including this one. "I'll update the docs at the end" is how drift starts: the end of a session is exactly when the reason for a change is least recoverable.
 
 ## Engineering rules
 

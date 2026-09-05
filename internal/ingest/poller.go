@@ -57,6 +57,63 @@ func NewPoller(perp string, client *RESTClient, state *VenueState, sink Sink,
 	}
 }
 
+// runOnBoundary calls poll on every wall-clock boundary of interval, until ctx
+// ends or poll reports a failure it cannot continue from.
+//
+// It waits for each boundary rather than ticking on a period, and the difference
+// is not cosmetic for any poller whose row is keyed on a truncated timestamp. A
+// time.Ticker keeps its period but not its phase relative to the wall clock, and
+// the boundary is derived by truncating the time the tick arrived — so a phase
+// sitting near a boundary edge lets a millisecond of jitter push a tick just
+// *below* the boundary it was meant for, where it truncates onto the previous
+// one, is rejected as a duplicate, and takes its own boundary with it. A timer
+// fires at or after its deadline and never before, so waiting for the boundary
+// itself removes the whole class.
+//
+// This was found once already, in Part 4's venue-state sampler, where it
+// silently dropped 914 rows over 19 hours. It was found again on 2026-09-04 by
+// measuring boundary coverage in a running stack: base_state was missing 2 of 20
+// boundaries and cb_account_state 11 of 120, against 1 of 121 for the sampler
+// that had been fixed. The scheme lives here, in one function all three callers
+// share, so there is no fourth component to rediscover it in.
+func runOnBoundary(ctx context.Context, interval time.Duration, now func() time.Time,
+	poll func(context.Context) error,
+) error {
+	return runWaiting(ctx, interval, now, realTimer, poll)
+}
+
+// waitFunc starts a wait of d and returns the channel it fires on plus a stop
+// for the wait that is abandoned.
+//
+// It is a seam, and it exists for one reason: the scheduling above is the part
+// that was wrong twice, and a test that raced real timers to find that out would
+// depend on whether a millisecond of lateness happened to occur. With the wait
+// injected, TestAPollerVisitsEveryBoundary drives this exact loop under a clock
+// it controls, and the failure is reproducible rather than lucky.
+type waitFunc func(d time.Duration) (<-chan time.Time, func() bool)
+
+func realTimer(d time.Duration) (<-chan time.Time, func() bool) {
+	t := time.NewTimer(d)
+	return t.C, t.Stop
+}
+
+func runWaiting(ctx context.Context, interval time.Duration, now func() time.Time,
+	wait waitFunc, poll func(context.Context) error,
+) error {
+	for {
+		fired, stop := wait(untilNextBoundary(now(), interval))
+		select {
+		case <-ctx.Done():
+			stop()
+			return ctx.Err()
+		case <-fired:
+		}
+		if err := poll(ctx); err != nil {
+			return err
+		}
+	}
+}
+
 // Run polls on the interval until ctx is canceled.
 func (p *Poller) Run(ctx context.Context) {
 	// One poll immediately, so a restart does not leave open interest and the

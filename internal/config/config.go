@@ -125,10 +125,20 @@ type CoinbaseEndpoints struct {
 	WSURL  string
 }
 
-// BaseEndpoints is the Base L2 read path (Alchemy JSON-RPC).
+// BaseEndpoints is the Base L2 read path (Alchemy JSON-RPC) and the contracts
+// it reads.
+//
+// The three addresses are configuration rather than constants because all three
+// are chain-scoped: pointed at Base Sepolia, where the Base leg starts (spec
+// section 1), the system needs a different USDC, a different WETH and a
+// different pool. They are validated where they are parsed, in cmd/ingest, so a
+// typo fails the startup rather than reading a wallet that holds nothing.
 type BaseEndpoints struct {
 	RPCURL     string
 	AlchemyKey Secret
+	USDC       string
+	WETH       string
+	SpotPool   string
 }
 
 // PollIntervals are the ingest tickers.
@@ -352,6 +362,16 @@ func loadMigrateCmd(lookup lookupFunc) (*MigrateCmd, error) {
 	return cfg, l.err()
 }
 
+// Base mainnet defaults. Native USDC (not the bridged USDbC beside it), the
+// canonical WETH, and the Uniswap v3 WETH/USDC 0.05% pool the spot price is read
+// from. The pool is verified against the two token addresses on the first poll
+// rather than trusted, so a wrong value here cannot become a price.
+const (
+	defaultBaseUSDC     = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+	defaultBaseWETH     = "0x4200000000000000000000000000000000000006"
+	defaultBaseSpotPool = "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+)
+
 const (
 	defaultMaintenanceBreak = "Fri 17:00-18:00 America/New_York"
 	defaultContractSizeETH  = "0.10"
@@ -381,6 +401,9 @@ func (l *loader) baseChain() BaseEndpoints {
 	return BaseEndpoints{
 		RPCURL:     l.String("BASE_RPC_URL", ""),
 		AlchemyKey: l.Secret("ALCHEMY_API_KEY"),
+		USDC:       l.String("BASE_USDC_CONTRACT", defaultBaseUSDC),
+		WETH:       l.String("BASE_WETH_CONTRACT", defaultBaseWETH),
+		SpotPool:   l.String("BASE_SPOT_POOL", defaultBaseSpotPool),
 	}
 }
 

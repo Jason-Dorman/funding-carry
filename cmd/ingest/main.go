@@ -5,7 +5,7 @@
 // Part 4 wires the WebSocket half: five streams, each with its own connection,
 // reconnect loop and gap detection, feeding cb_venue_state, cb_bars,
 // cb_book_snapshots and cb_trades_agg. The REST poller and funding estimator
-// (Part 5) and the Base poller (Part 6) hang off the same root context.
+// (Part 5) and the Base wallet poller (Part 6) hang off the same root context.
 package main
 
 import (
@@ -95,6 +95,53 @@ func accountSource(cfg *config.Ingest, log *slog.Logger) (ingest.AccountSource, 
 	return coinbase.NewClient(signer), nil
 }
 
+// chainReader builds the Base JSON-RPC client and resolves the addresses it
+// reads, or reports that the Base half is off.
+//
+// Nil is a supported state for the same reason it is for the CDP credential: the
+// stack must run without a Base endpoint, so an absent BASE_RPC_URL or an absent
+// WALLET_ADDRESS means base_state is not written. A configured endpoint with a
+// malformed address is the opposite — that is an operator mistake, and it fails
+// the startup rather than degrading into a poller that reads an address nobody
+// meant and records a wallet holding nothing.
+func chainReader(cfg *config.Ingest, log *slog.Logger) (ingest.ChainReader, ingest.BaseAddresses, error) {
+	var addrs ingest.BaseAddresses
+	if cfg.Base.RPCURL == "" || !cfg.Secrets.WalletAddress.IsSet() {
+		log.Info("no Base endpoint or wallet; base_state polling is off",
+			"add", "BASE_RPC_URL and WALLET_ADDRESS")
+		return nil, addrs, nil
+	}
+
+	for _, f := range []struct {
+		key   string
+		raw   string
+		field *ingest.Address
+	}{
+		// WALLET_ADDRESS is typed Secret because it lives in .env.private, not
+		// because it is a credential: it is a public chain address, and spec
+		// section 1's doctrine is that the wallet is named and its activity
+		// readable. Revealing it here is what lets the log say which wallet these
+		// rows describe, which is the difference between a series a reviewer can
+		// audit against a block explorer and a series they have to take on trust.
+		{"WALLET_ADDRESS", cfg.Secrets.WalletAddress.Reveal(), &addrs.Wallet},
+		{"BASE_USDC_CONTRACT", cfg.Base.USDC, &addrs.USDC},
+		{"BASE_WETH_CONTRACT", cfg.Base.WETH, &addrs.WETH},
+		{"BASE_SPOT_POOL", cfg.Base.SpotPool, &addrs.Pool},
+	} {
+		parsed, err := ingest.ParseAddress(f.raw)
+		if err != nil {
+			return nil, addrs, fmt.Errorf("%s: %w", f.key, err)
+		}
+		*f.field = parsed
+	}
+
+	log.Info("Base endpoint configured; base_state polling is on",
+		"wallet", addrs.Wallet, "usdc", addrs.USDC, "weth", addrs.WETH, "pool", addrs.Pool)
+	// The URL itself is the credential — an Alchemy key lives in its path — so it
+	// is handed to the client and never logged.
+	return ingest.NewEthClient(cfg.Base.RPCURL, nil), addrs, nil
+}
+
 // rowSender is the database as this binary's writer needs it: one batched send.
 // Named here rather than passing *pgxpool.Pool so that the wiring below — which
 // is where the shutdown ordering lives, and therefore where it can be got wrong
@@ -157,6 +204,12 @@ func pipeline(ctx context.Context, cfg *config.Ingest, sender rowSender, store i
 		return err
 	}
 
+	chain, baseAddrs, err := chainReader(cfg, log)
+	if err != nil {
+		stopStreams()
+		return err
+	}
+
 	streams := ingest.New(ingest.Options{
 		PerpProduct:      cfg.PerpProductID,
 		SpotProduct:      cfg.SpotProductID,
@@ -167,9 +220,12 @@ func pipeline(ctx context.Context, cfg *config.Ingest, sender rowSender, store i
 		RESTClient:       ingest.NewRESTClient(cfg.Coinbase.APIURL, nil),
 		// The backfill reads what is already stored so it can download only what
 		// is missing, which is what lets it run on every start.
-		BarStore: store,
-		Account:  account,
-		Backfill: cfg.Backfill,
+		BarStore:      store,
+		Account:       account,
+		Chain:         chain,
+		BaseAddresses: baseAddrs,
+		BaseInterval:  cfg.Poll.Base,
+		Backfill:      cfg.Backfill,
 	}, writer, ingest.NewMetrics(srv.Registry()), log)
 
 	// Run returns only once every stream goroutine has stopped, which is the

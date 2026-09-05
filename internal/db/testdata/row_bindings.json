@@ -2,6 +2,7 @@
   "base_state": {
     "gas_gwei": "GasGwei",
     "spot_px": "SpotPx",
+    "spot_px_source": "SpotPxSource",
     "ts": "TS",
     "wallet_eth": "WalletETH",
     "wallet_usdc": "WalletUSDC"

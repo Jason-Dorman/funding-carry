@@ -240,43 +240,31 @@ func untilNextBoundary(t time.Time, interval time.Duration) time.Duration {
 	return t.Truncate(interval).Add(interval).Sub(t)
 }
 
-// Run samples on the interval until ctx is canceled.
+// Run samples on every boundary until ctx is canceled.
 //
-// It waits for each boundary rather than ticking on a period, and the difference
-// is not cosmetic. A time.Ticker keeps its period but not its phase relative to
-// the wall clock, and the boundary here is derived by truncating the time the
-// tick arrived. With that phase sitting near a boundary edge, a millisecond of
-// jitter is enough for a tick to land just *below* the boundary it was meant
-// for, truncate onto the previous one, be rejected as a duplicate, and take its
-// own boundary with it. That is not hypothetical: over 19 hours of the Part 4
-// soak it silently dropped 914 rows, 6.4% of the series, always one at a time.
-// A timer fires at or after its deadline and never before, so waiting for the
-// boundary itself removes the whole class.
+// The boundary wait, and why it is not a time.Ticker, is runOnBoundary — which
+// this shares with the account and Base pollers. It used to be a private copy of
+// that loop, which is how Parts 5 and 6 came to be written with a Ticker despite
+// the reason being recorded here: an adversarial review pointed out that the
+// claim "one function all three callers share" was false while this was the
+// exception, and a comment three components are expected to read is not a
+// mechanism.
 //
-// The row timestamp is still the boundary, not the moment the sample ran: the
+// The row timestamp is the boundary, not the moment the sample ran: the
 // idempotency key is (product_id, ts), and a clock reading would make every row
 // unique and the constraint decorative (API spec section 5.3, which names Parts
 // 4 to 6 as the owners of this rule).
+//
+// Every error sample can produce is terminal — the writer has stopped, or the
+// context has ended — so runOnBoundary's "stop on error" contract is the right
+// one here. There is no transient case to retry: a full queue blocks inside
+// Submit rather than failing.
 func (v *VenueState) Run(ctx context.Context) {
-	for {
-		timer := time.NewTimer(untilNextBoundary(v.now(), v.interval))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-
-		// Both failures submit can produce are terminal — the writer has
-		// stopped, or the context has ended — so this returns rather than
-		// carrying on. There is no transient case to retry: a full queue blocks
-		// inside Submit rather than failing.
-		if err := v.sample(ctx, v.now()); err != nil {
-			if ctx.Err() == nil {
-				v.log.Info("venue state sampler stopping", "reason", err)
-			}
-			return
-		}
+	err := runOnBoundary(ctx, v.interval, v.now, func(c context.Context) error {
+		return v.sample(c, v.now())
+	})
+	if err != nil && ctx.Err() == nil {
+		v.log.Info("venue state sampler stopping", "reason", err)
 	}
 }
 
@@ -430,4 +418,27 @@ func spreadBps(q Quote, mid decimal.NullDecimal) decimal.NullDecimal {
 	}
 	spread := q.Ask.Decimal.Sub(q.Bid.Decimal)
 	return decimal.NullDecimal{Decimal: spread.Div(mid.Decimal).Mul(tenThousand), Valid: true}
+}
+
+// SpotMid is the most recent Coinbase spot mid, when it is fresh enough to
+// stand in for a price. It is the Base poller's fallback for spot_px.
+//
+// Freshness is the same rule the sampler applies to its own rows, and for the
+// same reason: a mid carried forward past its useful life is indistinguishable
+// from a fresh one. The fallback existing at all does not make a stale number
+// acceptable — if this reports false, spot_px is NULL, which is the honest
+// answer.
+func (v *VenueState) SpotMid(at time.Time) (decimal.Decimal, bool) {
+	v.mu.Lock()
+	q, ok := v.quotes[v.spotProduct]
+	v.mu.Unlock()
+
+	if !ok || at.Sub(q.At) > time.Duration(maxQuoteAge)*v.interval {
+		return decimal.Zero, false
+	}
+	mid := midpoint(q)
+	if !mid.Valid {
+		return decimal.Zero, false
+	}
+	return mid.Decimal, true
 }

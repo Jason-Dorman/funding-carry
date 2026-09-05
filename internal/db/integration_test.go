@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -625,6 +626,49 @@ func TestClosedVocabulariesAreEnforced(t *testing.T) {
 	if _, badRate := pool.Exec(ctx, insertStatement(bad), bad.values...); badRate == nil {
 		t.Error("a settlement with an hourly rate was accepted")
 	}
+
+	badSpot := BaseStateRow{TS: ts, SpotPx: Num(decimal.RequireFromString("2500")), SpotPxSource: "aggregator"}.row()
+	if _, err := pool.Exec(ctx, insertStatement(badSpot), badSpot.values...); err == nil {
+		t.Error("an unknown spot_px_source was accepted")
+	}
+}
+
+// spot_px and spot_px_source are paired by a CHECK, in both directions.
+//
+// The column exists so that a price can always name its market — the Base pool
+// and the Coinbase mid are different markets (ADR-0018) — and a column that is
+// merely *usually* set is one nothing downstream can rely on. The pairing is
+// what turns the convention into a guarantee, so both halves of it are asserted
+// rather than the obvious one.
+func TestASpotPriceAlwaysNamesItsMarket(t *testing.T) {
+	pool := testPool(t)
+	ctx := t.Context()
+	ts := time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC)
+
+	priceWithoutSource := BaseStateRow{TS: ts, SpotPx: Num(decimal.RequireFromString("2500"))}.row()
+	if _, err := pool.Exec(ctx, insertStatement(priceWithoutSource), priceWithoutSource.values...); err == nil {
+		t.Error("a price with no source was accepted")
+	}
+
+	sourceWithoutPrice := BaseStateRow{TS: ts.Add(time.Second), SpotPxSource: SpotSourceDEX}.row()
+	if _, err := pool.Exec(ctx, insertStatement(sourceWithoutPrice), sourceWithoutPrice.values...); err == nil {
+		t.Error("a source with no price was accepted")
+	}
+
+	// A row with neither is the poll that could read everything but the price,
+	// which is a real and expected observation.
+	neither := BaseStateRow{TS: ts.Add(2 * time.Second), GasGwei: Num(decimal.RequireFromString("0.006"))}.row()
+	if _, err := pool.Exec(ctx, insertStatement(neither), neither.values...); err != nil {
+		t.Errorf("a row with no price at all was rejected: %v", err)
+	}
+
+	both := BaseStateRow{
+		TS: ts.Add(3 * time.Second), SpotPx: Num(decimal.RequireFromString("2500")),
+		SpotPxSource: SpotSourceCoinbase,
+	}.row()
+	if _, err := pool.Exec(ctx, insertStatement(both), both.values...); err != nil {
+		t.Errorf("a well-formed row was rejected: %v", err)
+	}
 }
 
 // A flush is one implicit transaction: pgx sends the whole batch as a single
@@ -703,38 +747,7 @@ func TestEveryInsertIsIdempotent(t *testing.T) {
 	pool := testPool(t)
 	ctx := t.Context()
 
-	const (
-		product  = "IDEMPOTENCY-TEST"
-		position = "01JZZZPOSITIONULID00000000"
-	)
-	ts := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	num := Num(decimal.RequireFromString("1.25"))
-
-	// positions first: fills and funding events point at it.
-	rows := []Row{
-		PositionRow{ID: position, OpenedAt: ts, Venue: VenuePaper,
-			SpotQty: decimal.RequireFromString("0.7"), PerpContracts: -7, Status: "OPEN"},
-		VenueStateRow{TS: ts, ProductID: product, FuturesMark: num},
-		sampleBar(product, ts),
-		BookSnapshotRow{TS: ts, ProductID: product, BestBid: num},
-		TradesAggRow{TS: ts, ProductID: product, BucketSecs: 180,
-			BuyVol: decimal.Zero, SellVol: decimal.Zero, TradeCount: 0},
-		FeatureRow{TS: ts, ProductID: product, FundingZScore: num},
-		BaseStateRow{TS: ts, SpotPx: num},
-		AccountStateRow{TS: ts, MarginRatio: num},
-		ProductRow{ProductID: product, ContractSize: num, UpdatedAt: ts},
-		DecisionRow{TS: ts, State: "HOLD", ReasonCodes: []string{"HOLD_OK"},
-			InputSnapshot: Snapshot(`{"funding_rate":"0.0001"}`)},
-		FillRow{TS: ts, PositionID: Opt(position), ClOrdID: "01JCLORDID", Venue: VenuePaper,
-			Leg: "perp", Side: "sell", Qty: decimal.RequireFromString("7"),
-			Px: num.Decimal, ExecState: "FILLED", VenueExecID: "exec-1"},
-		FundingEventRow{TS: ts, ProductID: product, Kind: FundingKindAccrual,
-			RateHourly: num, FundingSource: FundingSourceComputed,
-			Amount: decimal.RequireFromString("0.42")},
-		RiskEventRow{TS: ts, Kind: "HARD_STOP_MARGIN_RATIO"},
-		FIXSessionRow{SessionID: "FIX.4.4:CARRY->SIMV", StartedAt: ts},
-	}
-
+	rows := seedRowPerTable()
 	if len(rows) != len(everyRowType()) {
 		t.Fatalf("this test covers %d row types but there are %d", len(rows), len(everyRowType()))
 	}
@@ -806,4 +819,134 @@ func whereNaturalKey(t *testing.T, d rowData) (string, []any) {
 		clauses = append(clauses, fmt.Sprintf("%s IS NOT DISTINCT FROM $%d", column, len(args)))
 	}
 	return strings.Join(clauses, " AND "), args
+}
+
+// Every migration must survive being rolled back and re-applied against a
+// database that already holds data.
+//
+// This is not a hypothetical property. Migration 000006 adds a provenance column
+// to base_state plus a CHECK pairing it with the price. Written validating, it
+// applied cleanly to an empty table and then could never be re-applied: the down
+// drops the column, which is where the provenance lived, so the re-applied up
+// rejects every row whose price survived it and leaves the schema marked dirty.
+// It was found by an adversarial review roughly ten minutes after base_state
+// stopped being empty, against a database that by then held 174 priced rows.
+// The fix is NOT VALID — enforce on every write from now on, do not demand that
+// history it predates satisfies it.
+//
+// The check runs inside a transaction that is always rolled back, so it can seed
+// data, exercise the real SQL against it, and change nothing. Postgres makes DDL
+// transactional, which is what makes that possible.
+//
+// **The seeding is the entire test.** The first version of this test did not
+// seed, and the integration suite runs against a throwaway database that is
+// dropped and recreated on every run — so it round-tripped the migrations against
+// empty tables and passed against the exact defect it was written to catch. That
+// was caught by re-running it with the constraint put back the way the review
+// found it, which is the only thing that turns a regression test from a guess
+// into evidence. It is the fourth test in this repository to have needed that.
+func TestEveryMigrationCanBeRolledBackAndReapplied(t *testing.T) {
+	pool := testPool(t)
+	ctx := t.Context()
+
+	// A row in every table, so a migration is re-applied against data rather than
+	// against emptiness. The bug this test exists for is invisible on an empty
+	// table by construction: a CHECK added to a column with no rows in it always
+	// succeeds.
+	seed := seedRowPerTable()
+
+	entries, err := migrationFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read embedded migrations: %v", err)
+	}
+
+	var versions []string
+	for _, e := range entries {
+		if name := e.Name(); strings.HasSuffix(name, ".up.sql") {
+			versions = append(versions, strings.TrimSuffix(name, ".up.sql"))
+		}
+	}
+	if len(versions) == 0 {
+		t.Fatal("no migrations found: this test would pass by doing nothing")
+	}
+	sort.Strings(versions)
+
+	// Only the newest one. `migrate down 1` followed by `migrate up` is the
+	// operation this is about, and it touches exactly the latest migration —
+	// rolling back an older one in isolation, while everything built on top of it
+	// still exists, is not a state the tool can produce. (000001 proves the
+	// point: its down drops the timescaledb extension, which fails while any
+	// hypertable stands.) Each migration gets this check as it becomes the newest.
+	latest := versions[len(versions)-1]
+
+	for _, v := range []string{latest} {
+		t.Run(v, func(t *testing.T) {
+			down, err := migrationFS.ReadFile("migrations/" + v + ".down.sql")
+			if err != nil {
+				t.Fatalf("read down: %v", err)
+			}
+			up, err := migrationFS.ReadFile("migrations/" + v + ".up.sql")
+			if err != nil {
+				t.Fatalf("read up: %v", err)
+			}
+
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin: %v", err)
+			}
+			// Rolled back on every path, including a failure below, so the
+			// database this ran against is untouched either way.
+			defer func() { _ = tx.Rollback(ctx) }()
+
+			for _, r := range seed {
+				d := r.row()
+				if _, err := tx.Exec(ctx, insertStatement(d), d.values...); err != nil {
+					t.Fatalf("seed %s: %v", d.table, err)
+				}
+			}
+
+			if _, err := tx.Exec(ctx, string(down)); err != nil {
+				t.Fatalf("%s down: %v", v, err)
+			}
+			if _, err := tx.Exec(ctx, string(up)); err != nil {
+				t.Fatalf("%s could not be re-applied after its own down migration, "+
+					"against a database holding data: %v", v, err)
+			}
+		})
+	}
+}
+
+// seedRowPerTable is one well-formed row for each of the fourteen tables, in an
+// order that satisfies the foreign keys (positions first: fills and funding
+// events point at it). Shared by the idempotency test and the migration
+// round-trip test, so a new table or column is added in exactly one place.
+func seedRowPerTable() []Row {
+	const product = "IDEMPOTENCY-TEST"
+	const position = "01JIDEMPOTENCY000000000000"
+	ts := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	num := Num(decimal.RequireFromString("1.5"))
+
+	return []Row{
+		PositionRow{ID: position, OpenedAt: ts, Venue: VenuePaper,
+			SpotQty: decimal.RequireFromString("0.7"), PerpContracts: -7, Status: "OPEN"},
+		VenueStateRow{TS: ts, ProductID: product, FuturesMark: num},
+		sampleBar(product, ts),
+		BookSnapshotRow{TS: ts, ProductID: product, BestBid: num},
+		TradesAggRow{TS: ts, ProductID: product, BucketSecs: 180,
+			BuyVol: decimal.Zero, SellVol: decimal.Zero, TradeCount: 0},
+		FeatureRow{TS: ts, ProductID: product, FundingZScore: num},
+		BaseStateRow{TS: ts, SpotPx: num, SpotPxSource: SpotSourceDEX},
+		AccountStateRow{TS: ts, MarginRatio: num},
+		ProductRow{ProductID: product, ContractSize: num, UpdatedAt: ts},
+		DecisionRow{TS: ts, State: "HOLD", ReasonCodes: []string{"HOLD_OK"},
+			InputSnapshot: Snapshot(`{"funding_rate":"0.0001"}`)},
+		FillRow{TS: ts, PositionID: Opt(position), ClOrdID: "01JCLORDID", Venue: VenuePaper,
+			Leg: "perp", Side: "sell", Qty: decimal.RequireFromString("7"),
+			Px: num.Decimal, ExecState: "FILLED", VenueExecID: "exec-1"},
+		FundingEventRow{TS: ts, ProductID: product, Kind: FundingKindAccrual,
+			RateHourly: num, FundingSource: FundingSourceComputed,
+			Amount: decimal.RequireFromString("0.42")},
+		RiskEventRow{TS: ts, Kind: "HARD_STOP_MARGIN_RATIO"},
+		FIXSessionRow{SessionID: "FIX.4.4:CARRY->SIMV", StartedAt: ts},
+	}
 }

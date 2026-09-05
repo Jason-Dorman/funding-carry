@@ -17,10 +17,17 @@ func TestExportedSeriesMatchTheCatalogue(t *testing.T) {
 	// The names in API spec section 6, spelled out here so a rename has to be a
 	// deliberate edit in two places rather than a silent break of every alert
 	// and dashboard that reads them.
+	// The base series has one label with three initialized values, so it is
+	// counted separately from the single-series names below.
+	if n := testutil.CollectAndCount(reg, "ingest_base_spot_px_source_total"); n != 3 {
+		t.Errorf("ingest_base_spot_px_source_total: %d series, want 3 (dex, coinbase, none)", n)
+	}
+
 	for _, name := range []string{
 		"ingest_ws_reconnects_total",
 		"ingest_ws_gaps_total",
 		"ingest_last_seen_timestamp_seconds",
+		"ingest_base_last_block",
 	} {
 		if n := testutil.CollectAndCount(reg, name); n != 1 {
 			t.Errorf("%s: %d series, want 1", name, n)

@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -412,17 +413,23 @@ func TestUntilNextBoundaryNeverWakesEarly(t *testing.T) {
 // a nil Account, so `New` constructed none of the marks sampler, the funding
 // runner, the REST poller or the account poller — and the four Run loops Part 5
 // added were never started by any test, let alone asserted to stop.
-func TestPartFiveGoroutinesStopOnCancellation(t *testing.T) {
+func TestEveryPollerGoroutineStopsOnCancellation(t *testing.T) {
 	opts := testOptions(t, &scriptedDialer{})
 	opts.RESTClient = NewRESTClient("http://127.0.0.1:1/", nil) // refuses instantly
 	opts.Account = stubAccount{}
 	opts.Backfill = 0 // the backfill has its own tests; this one is about the loops
+	// Part 6's poller joins the same list. The Part 5 half of this test exists
+	// because four Run loops had been added that no test ever started; a fifth
+	// added without wiring it in here would repeat that exactly.
+	opts.Chain = newFakeChain()
+	opts.BaseAddresses = testAddresses()
+	opts.BaseInterval = pollBaseEvery
 
 	in := New(opts, &fakeSink{}, NewMetrics(prometheus.NewRegistry()), testLogger())
 
-	if in.marks == nil || in.funding == nil || in.poller == nil || in.account == nil {
-		t.Fatalf("Part 5 components not constructed: marks=%v funding=%v poller=%v account=%v",
-			in.marks != nil, in.funding != nil, in.poller != nil, in.account != nil)
+	if in.marks == nil || in.funding == nil || in.poller == nil || in.account == nil || in.base == nil {
+		t.Fatalf("components not constructed: marks=%v funding=%v poller=%v account=%v base=%v",
+			in.marks != nil, in.funding != nil, in.poller != nil, in.account != nil, in.base != nil)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -433,7 +440,7 @@ func TestPartFiveGoroutinesStopOnCancellation(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("Run did not return after cancellation: a Part 5 goroutine ignores the root context, " +
+		t.Fatal("Run did not return after cancellation: a poller goroutine ignores the root context, " +
 			"so the writer could never drain safely")
 	}
 }
@@ -584,5 +591,121 @@ func TestFundingRunnerEmitsAtTheHourBoundary(t *testing.T) {
 	}
 	if rows[0].FundingSource != db.FundingSourceComputed {
 		t.Errorf("funding_source = %q, want computed", rows[0].FundingSource)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Part 6 regression (2026-09-04)
+// ---------------------------------------------------------------------------
+
+// Every poller whose row is keyed on a truncated timestamp must wait for the
+// boundary, not tick on a period.
+//
+// Part 4 found this in the venue-state sampler and fixed it there. Part 5's
+// account poller and Part 6's Base poller were both written with time.Ticker
+// anyway, and a running stack measured the cost on 2026-09-04: base_state
+// missing 2 of 20 boundaries and cb_account_state 11 of 120, against 1 of 121
+// for the sampler that had been fixed.
+//
+// The scheme now lives in one function all of them call, and this test drives
+// that function under a clock it controls rather than racing real timers. That
+// matters: the first version of this test used real timers with a hostile
+// starting phase, and it passed against the time.Ticker loop it was written to
+// catch — the skip needs a tick to run late, and on an idle machine none did.
+// Here the lateness is scripted, so the failure is reproducible instead of
+// lucky. Swap untilNextBoundary for a fixed `interval` wait and the jitter
+// accumulates until a boundary is skipped, which is exactly what the two
+// pollers were doing in production.
+func TestAPollerVisitsEveryBoundary(t *testing.T) {
+	const (
+		interval = 5 * time.Second
+		wanted   = 200
+	)
+
+	// A phase that sits a hair under the boundary, with lateness either side of
+	// it — the worst case for a fixed period, and harmless for a boundary wait.
+	lateness := []time.Duration{0, 1200 * time.Microsecond, 0, 800 * time.Microsecond, 0}
+	clock := newClock(epoch.Add(interval - time.Millisecond))
+
+	var waits int
+	wait := func(d time.Duration) (<-chan time.Time, func() bool) {
+		clock.advance(d + lateness[waits%len(lateness)])
+		waits++
+		fired := make(chan time.Time, 1)
+		fired <- clock.now()
+		return fired, func() bool { return true }
+	}
+
+	// The loop is stopped by the poll reporting a terminal error rather than by
+	// cancellation: a canceled context and an already-fired wait are both ready
+	// at once, and select would pick between them at random, so the run length
+	// would vary and the assertion below would be reporting on a different thing
+	// each time.
+	errEnough := errors.New("enough boundaries")
+
+	seen := make([]time.Time, 0, wanted)
+	err := runWaiting(context.Background(), interval, clock.now, wait, func(context.Context) error {
+		seen = append(seen, clock.now().Truncate(interval))
+		if len(seen) == wanted {
+			return errEnough
+		}
+		return nil
+	})
+	if !errors.Is(err, errEnough) {
+		t.Fatalf("runWaiting: %v", err)
+	}
+	if len(seen) != wanted {
+		t.Fatalf("visited %d boundaries, want %d", len(seen), wanted)
+	}
+
+	for i := 1; i < len(seen); i++ {
+		if gap := seen[i].Sub(seen[i-1]); gap != interval {
+			t.Fatalf("boundary %s followed %s: gap of %s, want exactly %s "+
+				"(a repeat is a row dropped as a duplicate, and it takes its own boundary with it)",
+				seen[i].Format(time.RFC3339Nano), seen[i-1].Format(time.RFC3339Nano), gap, interval)
+		}
+	}
+}
+
+// Run must actually start the Base poller.
+//
+// The test above asserts that every loop observes cancellation, and the nil
+// check in it asserts that the component was constructed — neither notices a
+// component that was built and then left out of Run's goroutine list, which is
+// a poller that silently never runs. Nothing else would notice either: an
+// unstarted goroutine leaks nothing, so goleak is quiet, and the only symptom is
+// an empty table.
+func TestRunStartsTheBasePoller(t *testing.T) {
+	opts := testOptions(t, &scriptedDialer{})
+	opts.Backfill = 0
+	opts.Chain = newFakeChain()
+	opts.BaseAddresses = testAddresses()
+	opts.BaseInterval = pollBaseEvery
+
+	sink := &fakeSink{}
+	in := New(opts, sink, NewMetrics(prometheus.NewRegistry()), testLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); in.Run(ctx) }()
+
+	// The poller's first poll is immediate, so a row is the signal that it ran.
+	deadline := time.After(5 * time.Second)
+	for len(baseRows(t, sink)) == 0 {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatal("no base_state row: the Base poller was built but never started by Run")
+		default:
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancellation")
 	}
 }

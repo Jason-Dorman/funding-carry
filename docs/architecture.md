@@ -127,6 +127,7 @@ graph LR
     G4 --> CH
     G6 --> CH
     G7 --> CH
+    VS -. "spot mid, when the pool cannot be read" .-> G7
     CH --> W[writer goroutine<br/>batch INSERT via pgx]
     W --> DB[(TimescaleDB)]
     G1 --> M[Prometheus:<br/>last_seen per stream<br/>reconnect + gap counters]
@@ -154,6 +155,10 @@ Rules, enforced in review:
 
    **Every connection also subscribes to `heartbeats`.** One frame a second on every socket, whatever the market is doing, is what makes a single read deadline a dependable liveness check across streams with completely different natural rates — and it gives each stream's own goroutine a regular pulse, so the periodic work (book snapshot, trade-bucket close, silence check) needs no timer beside the read loop and no lock around state the read loop owns. Heartbeats never advance `last_seen`: a staleness gauge that they did advance would report every dead feed as healthy.
 4. **Errors on a feed are wrapped and surfaced, not swallowed** — but a feed error degrades to `stale`, it never crashes the binary. Only invariant violations (e.g. writer cannot reach DB after retries) are fatal.
+
+   **A row keyed on a truncated timestamp is sampled by waiting for the boundary, never by ticking on a period.** Three components write one: the venue-state sampler, the account poller and the Base poller. A `time.Ticker` keeps its period but not its phase against the wall clock, so a tick arriving a hair late crosses into the next window, truncates onto a boundary already written, is dropped by `ON CONFLICT … DO NOTHING` — indistinguishable from a healthy retry — and takes its own boundary with it. A timer fires at or after its deadline and never before, so waiting for the boundary itself removes the class. This was found in the sampler after it silently dropped 914 rows over 19 hours, and found again on 2026-09-04 by measuring boundary coverage in a running stack: `base_state` was missing 2 of 20 boundaries and `cb_account_state` 11 of 120, against 1 of 121 for the sampler that had been fixed. The scheme therefore lives in one function all three callers share (`runOnBoundary`), not in a comment three components were expected to read.
+
+   **Degrading has a granularity, and it is per column where the sources are independent.** The Base poller is the clearest case: four columns from four reads, so a gas price the node will not quote leaves `gas_gwei` NULL and does not throw away a wallet balance that was read perfectly well. Two things bound that. The block height is read first and every other read is pinned to it, so a row is one moment on the chain rather than a smear across three — and a failure to read the height is therefore the one failure that skips the whole row, since falling back to `latest` would silently produce the mixed snapshot the pin exists to prevent. And a poll that could read *nothing* writes no row at all: a missing row is a visible gap, where a row of NULLs claims an observation that did not happen and would be counted as present by any coverage query.
 
 The `carry` binary is simpler: a ticker-driven loop (decision tick) plus the FIX session goroutines that quickfixgo manages, plus one DB writer for decisions/fills/events.
 
@@ -372,6 +377,7 @@ erDiagram
     base_state {
         timestamptz ts
         numeric spot_px
+        text spot_px_source
         numeric wallet_eth
         numeric wallet_usdc
         numeric gas_gwei
