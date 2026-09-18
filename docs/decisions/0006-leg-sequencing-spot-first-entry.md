@@ -1,6 +1,6 @@
 # ADR-0006: Spot-first entry, perp-first exit, timeout unwind on leg failure
 
-**Date:** 2026-08-16 · **Status:** accepted · **Source:** [architecture §6.4](../architecture.md#64-live-carry-entry-v15); exercised manually per the [carry playbook](../manual-carry-playbook.md)
+**Date:** 2026-08-16 · **Status:** accepted · **Source:** [architecture §6.4](../architecture.md#64-live-carry-entry-week-5); exercised manually per the [carry playbook](../manual-carry-playbook.md)
 
 ## Context
 

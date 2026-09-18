@@ -769,9 +769,11 @@ func TestEveryInsertIsIdempotent(t *testing.T) {
 			if err != nil {
 				t.Fatalf("second insert (this is what a retry does): %v", err)
 			}
-			// cb_products upserts rather than doing nothing — rewriting the same
-			// values is still idempotent — so it reports one row either way.
-			if d.table != "cb_products" && second.RowsAffected() != 0 {
+			// cb_products and fix_sessions upsert rather than doing nothing —
+			// rewriting the same values is still idempotent — so they report one
+			// row either way.
+			upserts := d.table == "cb_products" || d.table == "fix_sessions"
+			if !upserts && second.RowsAffected() != 0 {
 				t.Fatalf("second insert affected %d rows, want 0: a retry would duplicate",
 					second.RowsAffected())
 			}
@@ -948,5 +950,103 @@ func seedRowPerTable() []Row {
 			Amount: decimal.RequireFromString("0.42")},
 		RiskEventRow{TS: ts, Kind: "HARD_STOP_MARGIN_RATIO"},
 		FIXSessionRow{SessionID: "FIX.4.4:CARRY->SIMV", StartedAt: ts},
+	}
+}
+
+// The simulator prices against the newest snapshot that has both sides of the
+// touch. Every column in the schema is nullable, so a snapshot written while one
+// side of the market was empty is a real row — and it is not a book anyone can
+// fill against.
+func TestLatestBookReadsTheNewestTwoSidedSnapshot(t *testing.T) {
+	pool := testPool(t)
+	ctx := t.Context()
+	const product = "LATEST-BOOK-TEST"
+
+	base := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	for _, row := range []BookSnapshotRow{
+		{TS: base, ProductID: product,
+			BestBid: Num(decimal.RequireFromString("2300.10")),
+			BestAsk: Num(decimal.RequireFromString("2300.60"))},
+		{TS: base.Add(time.Minute), ProductID: product,
+			BestBid: Num(decimal.RequireFromString("2344.50")),
+			BestAsk: Num(decimal.RequireFromString("2345.00"))},
+		// Newest of the three, and one-sided: it must not be what the reader
+		// returns.
+		{TS: base.Add(2 * time.Minute), ProductID: product,
+			BestBid: Num(decimal.RequireFromString("2350.00"))},
+	} {
+		d := row.row()
+		if _, err := pool.Exec(ctx, insertStatement(d), d.values...); err != nil {
+			t.Fatalf("insert snapshot: %v", err)
+		}
+	}
+
+	got, ok, err := NewReader(pool).LatestBook(ctx, product)
+	if err != nil {
+		t.Fatalf("latest book: %v", err)
+	}
+	if !ok {
+		t.Fatal("no book returned, with three snapshots stored")
+	}
+	if !got.TS.Equal(base.Add(time.Minute)) {
+		t.Errorf("book is from %s, want the newest two-sided snapshot at %s",
+			got.TS, base.Add(time.Minute))
+	}
+	if !got.BestBid.Equal(decimal.RequireFromString("2344.50")) ||
+		!got.BestAsk.Equal(decimal.RequireFromString("2345.00")) {
+		t.Errorf("book is %s/%s, want 2344.50/2345.00", got.BestBid, got.BestAsk)
+	}
+
+	// A product nothing has been recorded for is "no market", not an error: it
+	// is what an empty database looks like, and the simulator answers it by
+	// refusing orders rather than by failing.
+	if _, ok, err := NewReader(pool).LatestBook(ctx, "NOTHING-RECORDED"); err != nil || ok {
+		t.Errorf("unknown product returned ok=%v err=%v, want false and no error", ok, err)
+	}
+}
+
+// fix_sessions is the second table that upserts rather than doing nothing on
+// conflict. A session is written when it logs on, with no end and no sequence
+// numbers, and rewritten when it ends with the numbers the store finished on.
+// DO NOTHING would have discarded every one of those later facts.
+func TestAFixSessionRowIsCompletedByItsLogout(t *testing.T) {
+	pool := testPool(t)
+	ctx := t.Context()
+	const session = "FIX.4.4:SIMV->CARRY-UPSERT-TEST"
+
+	started := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	ended := started.Add(90 * time.Minute)
+
+	open := FIXSessionRow{SessionID: session, StartedAt: started}.row()
+	if _, err := pool.Exec(ctx, insertStatement(open), open.values...); err != nil {
+		t.Fatalf("insert the open session: %v", err)
+	}
+
+	closed := FIXSessionRow{
+		SessionID: session, StartedAt: started, EndedAt: ended,
+		LastInSeq: Opt(int32(41)), LastOutSeq: Opt(int32(57)), Disconnects: 1,
+	}.row()
+	if _, err := pool.Exec(ctx, insertStatement(closed), closed.values...); err != nil {
+		t.Fatalf("complete the session: %v", err)
+	}
+
+	var rows int
+	var gotEnded time.Time
+	var gotIn, gotOut, gotDisconnects int32
+	err := pool.QueryRow(ctx,
+		`SELECT count(*) OVER (), ended_at, last_in_seq, last_out_seq, disconnects
+		   FROM fix_sessions WHERE session_id = $1`, session).
+		Scan(&rows, &gotEnded, &gotIn, &gotOut, &gotDisconnects)
+	if err != nil {
+		t.Fatalf("read the session back: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("%d rows for one session, want 1: the logout added a row rather than completing one", rows)
+	}
+	if !gotEnded.UTC().Equal(ended) {
+		t.Errorf("ended_at %s, want %s", gotEnded.UTC(), ended)
+	}
+	if gotIn != 41 || gotOut != 57 || gotDisconnects != 1 {
+		t.Errorf("in %d out %d disconnects %d, want 41/57/1", gotIn, gotOut, gotDisconnects)
 	}
 }

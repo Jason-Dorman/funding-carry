@@ -51,12 +51,32 @@ graph TD
     P21 --> P22
 
     classDef done fill:#2e7d32,stroke:#1b5e20,color:#ffffff
-    class P1,P2,P3 done
+    class P1,P2,P3,P4,P5,P6,P7 done
 ```
 
 **Status key:** green in the diagram above = complete. A completed part carries a **Status** line under its heading and an **Evidence** paragraph under its acceptance criteria recording what was actually observed, plus a dated entry in the [changelog](#changelog--decision-record).
 
 Mapping to spec §10 weeks: P1–P3 ≈ wk 0, P4–P6 ≈ wk 1, P7–P8 ≈ wk 2, P9–P12 ≈ wk 3, P13–P15 ≈ wk 4, P16–P18 ≈ wk 5, P19–P20 ≈ wk 6, P21–P22 ≈ wk 7–8.
+
+---
+
+## ⛔ Funding and live-capital gates
+
+**Nothing before Part 16 can move money.** Parts 1–15 read venues and write a local database; the packages that place orders are empty `doc.go` stubs, no Ethereum signing code exists anywhere in the repository, and the only credential in use is a **view-only** Coinbase key. Adding `WALLET_ADDRESS` enables balance *reads* and nothing else.
+
+Three parts change that, and each needs something from the PO **before** it can start. None of it can be provisioned by the agent — every item is an account action, a funding move, or an on-chain operation the PO performs.
+
+| Part | Prerequisite the PO must complete first | What goes live |
+|---|---|---|
+| **16 — `cbVenue`** | **A second Coinbase API key**, trade-scoped and IP-allowlisted — *not* the view-only key Part 5 uses ([ADR-0016](decisions/0016-hand-rolled-coinbase-client.md) requires it be created only once the kill switch exists). CFM futures account funded with margin for one contract. | **Real perp orders.** First act is a far-from-market limit order that cannot fill, to prove place/cancel; then one tiny real round trip. |
+| **17 — `baseVenue`** | **Base Sepolia funded** for the rehearsal, then the named wallet funded on **Base mainnet** with ETH for gas and USDC. **A session key provisioned by hand from the owner wallet** — router-scoped, allowance-capped, explicit expiry — which is itself an on-chain transaction the PO signs. | **Real on-chain swaps** from the named wallet. Sepolia first, then one tiny mainnet swap. |
+| **18 — Treasury** | Both legs funded and a position open. A deliberate test transfer between Coinbase spot and futures. | Reconciliation across real balances; **first fully automated carry entry and exit**. |
+
+Parts 16–18 are additionally **gated on Parts 13 and 15 being accepted** (spec §1) — the kill switch and the full loop must exist and be demonstrated before any of this is reachable.
+
+> **Agent rule, not just documentation.** When the PO asks to build Part 16, 17 or 18, the agent **stops before writing code**, says in the conversation that this part spends real money and what must be funded first, and waits for explicit confirmation in that conversation. A gate recorded only in a file is a gate nobody is standing at. This is mirrored in [CLAUDE.md](../CLAUDE.md)'s safety rails so it is loaded every session.
+
+---
 
 **Parallel wallet track (manual, not code — never blocked by parts; procedure and log template in the [manual carry playbook](manual-carry-playbook.md)):** wk 0a wallet bootstrap → wk 0b manual carry #1 (the reference sequence) → manual carry #2 opened wk 1, closed wk 2 → manual carry #3 timed by Part-12 advisory signals wk 3 → first automated cycle after P16–P17 → continuous small-size after P19. If a part slips, the week's manual carry still happens.
 
@@ -128,7 +148,7 @@ Mapping to spec §10 weeks: P1–P3 ≈ wk 0, P4–P6 ≈ wk 1, P7–P8 ≈ wk 2
 
 ### Part 4 — Coinbase WS ingest
 
-> **Status: 🟢 every executable acceptance item demonstrated 2026-08-21; awaiting the PO's diff review.** The soak, the SIGTERM flush and the network pull all ran against the live venue and a real TimescaleDB. The one criterion still open is the first one, which is Jason's to close by reading the diff.
+> **Status: ✅ complete** — accepted 2026-08-21, diff reviewed and merged in PR #6. The soak, the SIGTERM flush and the network pull all ran against the live venue and a real TimescaleDB. The one criterion still open is the first one, which is Jason's to close by reading the diff.
 
 **Objective:** live ETH market data flowing into TimescaleDB with reliability plumbing.
 
@@ -171,7 +191,7 @@ Mapping to spec §10 weeks: P1–P3 ≈ wk 0, P4–P6 ≈ wk 1, P7–P8 ≈ wk 2
 
 ### Part 5 — REST poller, funding estimator, backfill
 
-> **Status: 🟢 delivered 2026-08-24; one criterion carved out with reasons (see **Carve-out** below) and one awaiting a 24h live window.** The funding series exists, 45 days of it reconstructed and verified against an independent reimplementation (1,000 of 1,002 hours to 1e-9), and the account half is live against a real futures account. The backfill is **self-healing**: it runs on every start, downloads only what is missing, and costs ~1s when nothing is. Any future backfill follows the same six steps — [architecture §7](architecture.md#71-historical-recovery--the-backfill-pattern).
+> **Status: ✅ complete** — accepted 2026-08-25, diff reviewed and merged in PR #7; the PO's `cb_account_state` spot-check closed the last open item 2026-09-04. One criterion is carved out to [Part 18](#part-18--treasury-reconciliation) with reasons and PO sign-off (see **Carve-out** below) — deferred with a recorded home, not removed. The funding series exists, 45 days of it reconstructed and verified against an independent reimplementation (1,000 of 1,002 hours to 1e-9), and the account half is live against a real futures account. The backfill is **self-healing**: it runs on every start, downloads only what is missing, and costs ~1s when nothing is. Any future backfill follows the same six steps — [architecture §7](architecture.md#71-historical-recovery--the-backfill-pattern).
 
 **Objective:** the funding / futures-mark / spot-mark series — the system's primary asset — recorded, computed where the venue does not publish it, and backfilled.
 
@@ -219,12 +239,12 @@ Same mechanism as the Part 3 hand-written-first waiver and the Part 4 JWT deferr
 
 ### Part 6 — Base poller
 
-> **Status: 🟢 every acceptance item demonstrated 2026-09-04, against Base mainnet through the PO's Alchemy endpoint; awaiting the PO's diff review.** Balances and price cross-checked against an independent node at the same block, degradation induced against a refusing endpoint, and a boundary-skipping defect found by the live run and fixed in two components. `WALLET_ADDRESS` points at a public Base address: nothing in this part reads or references the named wallet, and setting it stays the PO's.
+> **Status: ✅ complete** — accepted 2026-09-04, diff reviewed and committed as `34d9751` on `main`. Every acceptance item was demonstrated against Base mainnet through the PO's Alchemy endpoint, and an [adversarial review](reviews/part6-adversarial-findings.md) ran over the diff before it landed. Balances and price cross-checked against an independent node at the same block, degradation induced against a refusing endpoint, and a boundary-skipping defect found by the live run and fixed in two components. `WALLET_ADDRESS` points at a public Base address: nothing in this part reads or references the named wallet, and setting it stays the PO's.
 
 **Objective:** the spot side of the book: wallet balances, reference price, gas.
 
 **Deliverables**
-- `internal/ingest/ethrpc.go`: a hand-rolled JSON-RPC client — `eth_blockNumber`, `eth_getBalance`, `eth_gasPrice`, `eth_call` — with a parsed `Address` type, keccak-derived method ids, address-argument encoding and fixed-word decoding ([ADR-0017](decisions/0017-hand-rolled-base-rpc.md), amending [spec §3](basis-carry-build-spec.md#3-stack-and-libraries), which named `go-ethereum`).
+- `internal/ingest/ethrpc.go`: a hand-rolled JSON-RPC client — `eth_blockNumber`, `eth_getBalance`, `eth_gasPrice`, `eth_call` — with a parsed `Address` type, keccak-derived method ids, address-argument encoding and fixed-word decoding ([ADR-0017](decisions/0017-hand-rolled-base-rpc.md), amending [spec §3](basis-carry-build-spec.md#2-language-and-tooling), which named `go-ethereum`).
 - `internal/ingest/base.go`: poll (`POLL_BASE_SECS`) wallet ETH via `eth_getBalance`, USDC via `balanceOf`, `eth_gasPrice`, ETH/USDC reference px → `base_state`. **As built (deviation from this line):** the reference price is read from the configured Base pool's own `slot0()` rather than from a DEX *aggregator quote*, with the in-process Coinbase mid as the configured fallback ([ADR-0018](decisions/0018-base-spot-px-from-the-pool.md)). Every mainstream aggregator now needs a provisioned API key, and `base_state.spot_px` is documented as a reference rather than an executable quote — Part 14 already models slippage separately. **This does not close [spec §12](basis-carry-build-spec.md#12-open-items) item 2**, which decides where the automated leg *executes* in Part 17.
 - Wallet address from config; works against any address.
 - Three new config variables, in [api-spec §7](api-spec.md#7-configuration-surface) and `.env.example`: `BASE_USDC_CONTRACT`, `BASE_WETH_CONTRACT`, `BASE_SPOT_POOL`, defaulting to Base mainnet. Two new metrics in [api-spec §6](api-spec.md#6-prometheus-metrics): `ingest_base_last_block` and `ingest_base_spot_px_source_total`.
@@ -289,17 +309,45 @@ A ticker keeps its period but not its phase against the wall clock, and these ro
 
 ### Part 7 — sim-venue (FIX acceptor)
 
+> **Status: 🟢 every acceptance item demonstrated 2026-09-16, against the live Compose stack and a scripted FIX client; an [adversarial review](reviews/part7-adversarial-findings.md) ran over the diff on 2026-09-17 and 20 of its 30 findings were acted on; awaiting the PO's diff review.** Orders ran over a real socket against real recorded market data — `ETP-20DEC30-CDE` at 2399.50/2400.50 from ingest's own `cb_book_snapshots` rows — and the sequence numbers survived a container restart on the new `fix-store` volume. **Two of the acceptance criteria were being guarded by tests that could not fail**, which the review found and which are now red-then-green against the defects they name.
+
 **Objective:** the exchange simulator: quickfixgo acceptor with a realistic fill model.
 
 **Deliverables**
-- `cmd/sim-venue` + `internal/fix/acceptor`: FIX 4.4 acceptor per [API spec §4](api-spec.md#4-fix-44-specification) (session settings, FileStore, FileLog).
+- `cmd/sim-venue` + the acceptor half of `internal/fix`: FIX 4.4 acceptor per [API spec §4](api-spec.md#4-fix-44-specification) (session settings built in code, FileStore, FileLog). *Read as the acceptor half of package `fix` rather than an `internal/fix/acceptor` subpackage, matching the package's own doc comment and Part 8's `internal/fix/initiator.go`.*
 - Message handling: NOS (D) → ExecutionReport(NEW) then fill reports; OrderCancelRequest (F) → ER(CANCELED) or OrderCancelReject (9); malformed → Reject (3).
-- Fill model: fills against last top-of-book read from TimescaleDB; configurable latency (jittered), slippage bps, partial fills above `SIM_PARTIAL_THRESHOLD` (N slices); deterministic under seed.
+- Fill model: fills against last top-of-book read from TimescaleDB; configurable latency (jittered), slippage bps, partial fills above `SIM_PARTIAL_THRESHOLD` (`SIM_PARTIAL_SLICES` slices); deterministic under seed.
 - Fills persisted to `fills` (venue='sim'); session state to `fix_sessions`; `fix_*` metrics.
+
+**Four open points settled by the PO, 2026-09-15** — each one a gap the plan did not fill, named rather than guessed. The two that shape what a fill *means* are recorded as [ADR-0019](decisions/0019-sim-fills-against-recorded-book.md), because Parts 14 and 20 answer the same question again:
+
+| Question | Decision |
+|---|---|
+| Does a non-crossing limit order ever fill later? | **It rests**, re-evaluated on each book read (new `SIM_BOOK_POLL_SECS`, 1s). An order that cannot fill is deferred to the next read, which is also what keeps the engine's loop from spinning |
+| The plan's "N slices" had no value | **`SIM_PARTIAL_SLICES`, default 3.** Whole contracts, remainder on the last slice, summing to the order exactly |
+| No book, or a stale one | **Reject at entry** with `no market data` (new `SIM_BOOK_MAX_AGE_SECS`, 60s); a resting order simply stops filling. Never a fabricated fill |
+| `fix_sessions` is `ON CONFLICT DO NOTHING`, so a row written at logon can never gain its `ended_at` | **Upsert**, as `cb_products` already does. Same key, no migration — only the conflict clause changed |
 
 **Acceptance**
 - Bring-up with a scripted FIX client: D→8(NEW)→8(FILLED) round trip; oversized order produces partials summing to full qty; cancel works both pre-fill and mid-partial.
 - Restart sim-venue: sequence numbers persist, session resumes without reset.
+
+**Evidence (2026-09-16).** A scripted quickfixgo client on the host, against the Compose `sim-venue` with `ingest` writing live book snapshots beside it:
+
+- **Round trip.** `D` → `8` ExecType=0/OrdStatus=0 LeavesQty=3 → `8` ExecType=F/OrdStatus=2, LastQty=3 at **2400.48** — the 2400.50 ask is not what filled: the touch was 2400.00 and two basis points of adverse slippage is 2400.48, arithmetic anyone can redo from the `cb_book_snapshots` row.
+- **Partials.** A 35-contract sell printed **11, 11, 13 = 35**, OrdStatus 1, 1, 2, CumQty 11 → 22 → 35 and LeavesQty 24 → 13 → 0, at 2399.02010 against a 2399.50 bid. Three `fills` rows, `sum(qty) = 35`.
+- **Cancels.** Pre-fill: a buy at 1000 rested, then `F` → `8` ExecType=4 with CumQty 0, LeavesQty 0, Text `canceled on request`. Mid-partial is covered by a test at a 500 ms venue latency, where the window is wide enough to be a fact rather than a race.
+- **Business rejection.** An OrderQty of 1.5 came back `8` ExecType=8 Text `OrderQty must be a positive whole number of contracts` — the quantization rule enforced at the venue boundary.
+- **Restart.** The venue's last outbound sequence before `docker compose restart sim-venue` was **22**; after it the session logged on at **23** and continued 24, 25, 26. No reset, no resend needed.
+- **Resend recovery, unplanned.** A client reconnecting with a *fresh* store asked for everything from sequence 1 and the venue replayed its store — SequenceReset-GapFill for the admin messages, the nine ExecutionReports verbatim, then live traffic at 20. The behaviour §4.1 calls "standard resend handling", observed rather than assumed.
+- **Rows and metrics.** `fills` under `venue='sim'`, `leg='perp'`, `exec_state` PARTIAL/FILLED, `venue_exec_id` = the FIX ExecID. `fix_sessions`: **one row** across three connect/disconnect cycles, `disconnects=3`, `last_in_seq=23`, `last_out_seq=38`. `simv_orders_total`, `simv_book_age_seconds`, `simv_resting_orders`, `fix_session_up`, `fix_msgs_total{dir,msg_type}` and `simv_rows_written_total{table}` all served from `:9103/metrics`.
+- **Suites.** `make test` green (`-race`, includes the socket-level acceptance tests, which need no database); `make test-integration` green, including the new `LatestBook` and `fix_sessions` upsert cases; `make lint` 0 issues.
+
+**One defect found by the live run and fixed in the same session.** The first demonstration produced *three* `fix_sessions` rows carrying disconnect counts of 1, 2, 1 — a row per logon, with a per-process counter split across them and reset by the restart. A row per connection makes `disconnects` a column that can only hold 0 or 1, and a running total split across rows is unreadable in either direction. One row now covers one process's session: opened at the first logon, rewritten at each logout, reopened (`ended_at` back to NULL) on reconnect.
+
+**A known upstream leak, recorded rather than hidden.** quickfixgo v0.9.11 arms two `time.AfterFunc` timers — logon timeout and logout timeout — that fire into the session's event channel with a bare send. After the session stops, nothing reads that channel, so each leaks one goroutine for the life of the process. The library guards two neighbouring sends against exactly this and comments on it; these two it does not. `goleak` ignores both by name in `internal/fix`, with the mechanism written out. It is visible in production through `go_goroutines`, which every binary already exports: a sim-venue whose client flapped would show it as a slow climb.
+
+*Corrected after the adversarial review: only the **logout** timer is sim-venue's. The logon timer is armed solely by initiators — `session_state.go` returns early on `!session.InitiateLogon` — so an acceptor never arms it. It shows up in this package's test runs because the scripted client is an initiator, and it is what `carry` will leak once Part 8 gives it a session. The original wording told an operator to watch sim-venue for a climb it cannot produce on its own.*
 
 ### Part 8 — FIX initiator + `Venue` interface
 
@@ -431,6 +479,17 @@ A ticker keeps its period but not its phase against the wall clock, and these ro
 
 ### Part 16 — `cbVenue` (Coinbase live adapter)
 
+> ### ⛔ STOP — this part spends real money
+> **Before any code is written, the agent must say so in the conversation and wait for the PO's explicit go-ahead.**
+>
+> **What the PO must have done first:**
+> - **A second Coinbase API key: trade-scoped and IP-allowlisted.** The Part 5 key is view-only and cannot place orders. [ADR-0016](decisions/0016-hand-rolled-coinbase-client.md) requires the order-capable key be created *only once the kill switch exists* — so this key should not exist before Part 13 is accepted.
+> - **CFM futures account funded** with enough margin for one contract at ≤ 3×.
+> - **Parts 13 and 15 accepted** — the kill switch and the full loop, demonstrated.
+>
+> **What happens when it runs:** real orders reach a real venue. The first is deliberately a limit order priced far from market so it *cannot* fill — it proves place and cancel. Only then, one tiny real round trip.
+
+
 **Deliverables**
 - `internal/exec/cb.go`: `Venue` impl over Advanced Trade — CDP JWT auth (per the Part-5 client decision), order place/cancel with tick rounding and **integer contract sizes**, client order id = ClOrdID, fills via WS `user` channel → ExecReports; leverage ≤ 3× overnight enforced and intraday opt-in asserted off; maintenance-window guard; kill-switch check before every submit.
 - Reconciliation: positions and margin from `cfm/positions` + `cfm/balance_summary` vs internal state; divergence → risk event. Funding actually applied vs accrued → `carry_funding_reconciliation_error`.
@@ -438,6 +497,18 @@ A ticker keeps its period but not its phase against the wall clock, and these ro
 **Acceptance:** full order lifecycle exercised at minimum size (place, partial where reachable, cancel, reject) — a far-from-market limit order proves place/cancel without taking risk; then one tiny real round trip in the perp product; positions, margin ratio, and funding accrual all reconcile against the venue. Fractional-contract submission is rejected by our own guard before it reaches the API.
 
 ### Part 17 — `baseVenue` (Base spot live adapter)
+
+> ### ⛔ STOP — this part spends real money and signs on-chain transactions
+> **Before any code is written, the agent must say so in the conversation and wait for the PO's explicit go-ahead.**
+>
+> **What the PO must have done first:**
+> - **Base Sepolia funded** — the rehearsal happens there first (spec §1).
+> - **The named wallet funded on Base mainnet**: ETH for gas, USDC as working capital. This is the wk-0a checklist item that is still open.
+> - **A session key provisioned by hand from the owner wallet** — router-scoped, allowance-capped, explicit expiry. *This is itself an on-chain transaction the PO signs*, and it is its own reviewed step before any adapter code.
+> - Note the **two-address question** ([spec §12](basis-carry-build-spec.md#12-open-items) item 9): the swap executes from the ERC-4337 **smart account**, which is a different address from the owner EOA that `WALLET_ADDRESS` names today.
+>
+> **What happens when it runs:** real swaps from the named wallet. Sepolia first, then one tiny mainnet swap.
+
 
 **Deliverables**
 - **Session-key provisioning first, as its own reviewed step:** create the key from the owner wallet on-chain — scoped to the DEX router, capped allowance, explicit expiry — recording address, scope, allowance, and expiry in `.env.private`. This is a wallet operation the PO performs, and it is itself a legible on-chain event under the ENS name.
@@ -447,6 +518,14 @@ A ticker keeps its period but not its phase against the wall clock, and these ro
 **Acceptance:** Base Sepolia swap round trip; then one tiny mainnet swap from the named wallet; effective price within slippage bound; receipt persisted. **Expiry drill:** with the expiry set in the past, `baseVenue` refuses to start with a clear error and the perp leg is never opened one-sided; with expiry inside 7 days, `SessionKeyExpiring` fires.
 
 ### Part 18 — Treasury reconciliation
+
+> ### ⛔ STOP — this part moves real balances between accounts
+> **Before any code is written, the agent must say so in the conversation and wait for the PO's explicit go-ahead.**
+>
+> **What the PO must have done first:** both legs funded, an open position to reconcile against, and willingness to run a **deliberate test transfer** between Coinbase spot and futures.
+>
+> **What happens when it runs:** the acceptance criterion is the **first fully automated carry entry and exit** — spot leg on-chain from the named wallet, perp leg at Coinbase. This is the part where the system trades by itself.
+
 
 **Deliverables**
 - `internal/treasury/`: balance reconciliation across the Coinbase spot (CBI) account, futures (CFM) margin account, and the Base wallet, reading `cb_account_state`. Four tracked transitions, each with its own timeout from config per [spec §6.8](basis-carry-build-spec.md#68-treasury-internaltreasury--week-5): CBI→CFM auto-transfer (`TREASURY_TRANSFER_TIMEOUT`), CFM→CBI sweep (`TREASURY_SWEEP_TIMEOUT`), funding cash adjustment vs expected settlement time (`TREASURY_SETTLEMENT_TIMEOUT`), Base tx submitted→confirmed (`TREASURY_BASE_TX_TIMEOUT`). Breach or mismatch → risk event + alert; a missed settlement also feeds `carry_funding_reconciliation_error`. Snapshot table + metrics.
@@ -476,6 +555,19 @@ A ticker keeps its period but not its phase against the wall clock, and these ro
 - `research/backtest/`: Python (polars/duckdb) chronological replay per FR-8; same decision rules imported as config-parity (thresholds read from the same env); funding at hourly boundaries; report per FR-8.2; results → `bt_runs`/`bt_results` for Grafana.
 - `make replay`: 30 days end-to-end + dashboard refresh.
 - Parity check: replay over a period the paper engine also traded → decisions match.
+
+**Fixtures: capture and restore on demand, not seed on start** *(raised 2026-09-16, PO-directed).* This part needs a reproducible dataset, and the temptation is to seed one on container start. Three cases want different answers:
+
+- **Development needs nothing built.** `make down` keeps the data volumes (only `make clean` drops them), and the gap-driven backfill rebuilds `cb_bars` and the funding series on every start. A dev database already survives restarts and repairs its own candle gaps.
+- **Tests must stay hermetic.** The integration suite drops and recreates its own throwaway database every run, which is what keeps it honest. Seeding a shared database would make tests depend on ambient state — the failure this repository has now hit four times, where a test passes for a reason other than the one it is named for.
+- **The backtest wants a captured window**, version-pinned and not re-downloaded, so a result is reproducible. The capture half already exists: [`research/quarantine/export.py`](../research/quarantine/export.py) dumps exactly the five non-backfillable tables to Parquet with numerics as **strings**, which is what keeps `numeric` out of a float at the export boundary. What is missing is the restore.
+
+So `make snapshot` / `make restore`, invoked deliberately — **not** seeding on boot. Two reasons, and the second is the one that matters:
+
+1. Seeding every start would race the backfill, which writes the same `cb_bars` and `funding_events` rows, and make "what is in this database" depend on boot order.
+2. **Provenance.** This system goes to real lengths to keep measurement classes separable — `funding_source` splits venue/computed/backfilled, `spot_px_source` splits dex/coinbase, and [ADR-0015](decisions/0015-backfilled-funding-provenance.md) exists solely because two kinds of measurement mixed into one column cannot be told apart afterwards. Fixture rows landing silently beside observed ones is that exact failure. **If restored data can ever reach the live tables it needs a marker of its own**, on the same footing as `backfilled`; if it cannot, restore must target a separate database and say so.
+
+That second point is the acceptance criterion this note contributes: **a restored dataset must be distinguishable from a recorded one by a query**, without knowing which command was run.
 
 **Acceptance** *(spec wk-6 done-when)*: `make replay` runs 30 days clean; **PnL decomposition matches on-chain reality for the live book** within tolerance (fees/gas exact, slippage modeled); acceptance rule wired: report prints ACCEPTED/REJECTED per the profitable-after-costs rule.
 
@@ -650,7 +742,7 @@ Record here as parts complete (date, part, decisions made, deviations from plan)
 
 - *2026-09-04 — **Part 6 built; two live criteria held open for a Base RPC endpoint.** Four PO decisions taken before any code was written, each because the plan left a gap that would otherwise have been filled by guessing:*
   - ***`spot_px` is read from the Base pool on chain, not from a DEX aggregator quote*** ([ADR-0018](decisions/0018-base-spot-px-from-the-pool.md)). The deliverable named no aggregator and every mainstream one now requires a provisioned key. `slot0()` on the configured Uniswap v3 WETH/USDC pool costs no extra dependency and rides the same RPC connection as the balances; the fallback is the Coinbase mid the binary already holds from the ticker stream, so it costs no request and cannot fail over the network. **The pool is verified, not trusted** — a mismatched pair produced `400000000.0000000000000001` in the mutation test, which is exactly what would have reached `spot_px`. **This does not close [spec §12](basis-carry-build-spec.md#12-open-items) item 2**, which is Part 17's execution venue and still the [memo's](decisions/memo-base-spot-venue.md) question.*
-  - ***The Base client is hand-rolled JSON-RPC, not `go-ethereum`*** ([ADR-0017](decisions/0017-hand-rolled-base-rpc.md), amending [spec §3](basis-carry-build-spec.md#3-stack-and-libraries)). Four RPC methods, five contract calls, no dynamic ABI types, nothing signed — against a full consensus client's dependency tree. Same reasoning as [ADR-0016](decisions/0016-hand-rolled-coinbase-client.md). One new dependency, `golang.org/x/crypto/sha3`, so the five method ids are **derived from their signatures rather than pasted** and the famous constants become a test; the standard library's `crypto/sha3` deliberately omits legacy keccak.*
+  - ***The Base client is hand-rolled JSON-RPC, not `go-ethereum`*** ([ADR-0017](decisions/0017-hand-rolled-base-rpc.md), amending [spec §3](basis-carry-build-spec.md#2-language-and-tooling)). Four RPC methods, five contract calls, no dynamic ABI types, nothing signed — against a full consensus client's dependency tree. Same reasoning as [ADR-0016](decisions/0016-hand-rolled-coinbase-client.md). One new dependency, `golang.org/x/crypto/sha3`, so the five method ids are **derived from their signatures rather than pasted** and the famous constants become a test; the standard library's `crypto/sha3` deliberately omits legacy keccak.*
   - ***The acceptance demonstration will use a public Base address***, not the named wallet, on the PO's decision — the deliverable already says the poller "works against any address", so nothing in this part reads or references the named wallet. `WALLET_ADDRESS` stays the PO's to set.*
   - ***An Alchemy endpoint over the public `mainnet.base.org`***, also the PO's decision. The code is identical either way; the choice is what the acceptance run points at. Until the key lands, `base_state` polling is **off** rather than broken: an absent `BASE_RPC_URL` or `WALLET_ADDRESS` leaves the poller unbuilt, exactly as an absent CDP credential leaves the account poller unbuilt.*
   - ***New config, new metrics, one row-level gap left open.*** `BASE_USDC_CONTRACT` / `BASE_WETH_CONTRACT` / `BASE_SPOT_POOL` are configuration rather than constants because all three are chain-scoped and Base Sepolia needs different ones; a malformed one fails the startup rather than reading an address nobody meant. `ingest_base_last_block` is this feed's staleness signal, since it has no WebSocket stream and so no `last_seen`. **Raised for the PO and not decided here: `base_state` has no `spot_px_source` column**, so a fallback row cannot say where its price came from — the symmetric fix is a schema change, which is a deviation needing sign-off.*
@@ -670,4 +762,36 @@ Record here as parts complete (date, part, decisions made, deviations from plan)
   - ***Losing both price sources was silent.*** Reached from inside an already-warned pool failure, so the warn-once map swallowed it: `spot_px` goes NULL on every row with no new log line, a frozen counter, and `ingest_base_last_block` still climbing. There is now a `none` value on `ingest_base_spot_px_source_total` and a warning on the transition.*
   - ***Smaller, all with tests:*** a poll is now bounded by its own interval (five sequential 15 s round trips could overrun a 30 s cadence and skip the boundaries it ran through — the residual actually measured on the account poller); `decodeQuantity` refused a signed hex quantity only after review, since `big.Int.SetString` accepts a leading sign and `0x-1` had been decoding to a wallet balance of minus one wei; the one permanent failure (a mismatched pool) was being logged `retryable=true`; graceful shutdown emitted four spurious "the column is going NULL" warnings; and the two new metrics were outside the catalogue test that exists to make a rename deliberate.*
   - ***One finding refuted:*** that the missing `lastBoundary` guard in the two new pollers could re-emit a timestamp already written. A verifier proved the emitted timestamps are strictly increasing by construction — an overrun *skips* boundaries, it cannot repeat one — and demonstrated it with a simulation at a 45 s poll against a 30 s interval: zero duplicates. Its factual observation (that the sampler was not actually sharing the loop) was correct and is fixed above; its failure mechanism was not.*
-  - ***17 lower-severity findings were left unverified*** by the review's own top-8 cap. The ones acted on above were pulled from that list after checking them by hand; the rest are recorded in the run transcript.*
+  - ***17 lower-severity findings were left unverified*** by the review's own top-8 cap. The ones acted on above were pulled from that list after checking them by hand; all 25 are recorded, with their state, in [`docs/reviews/part6-adversarial-findings.md`](reviews/part6-adversarial-findings.md).*
+
+- *2026-09-16 — **the deployment question, raised by the PO and recorded rather than answered.** Eleven days after Part 6 the stack was found down, and the first read of that was wrong: I reported an unrecoverable hole in the 30-day threshold-fitting window. The PO's correction — this runs under Docker Desktop on a laptop and cannot be up continuously — is what surfaced the real shape.*
+  - ***The z-score does not depend on uptime.*** It is computed on funding, funding is derivable from candles back to the contract's launch, and the gap-driven backfill rebuilds it on every start. [Spec §12](basis-carry-build-spec.md#12-open-items) item 4's date stands. What downtime actually costs is **Tier 2 microstructure alone** — `cb_book_snapshots` above all, which exists nowhere else — and whether Tier 2 is even used as a rolling window rather than as current state at decision time is Part 11's to settle. Recorded as **open item 8**.*
+  - ***Two documentation defects, both found by taking the correction seriously.*** [Architecture §7.1](architecture.md#71-historical-recovery--the-backfill-pattern) asserted "the stack is meant to stay up" — a production claim in a doc describing a laptop — and its recoverability table marked `cb_trades_agg` **Yes**, a documented recovery that **does not exist**: the backfill writes `cb_bars` and `funding_events` and nothing else. The second is the more serious, because Tier 2's trade imbalance and sweep intensity read that table and would have been silently short of history that the doc promised.*
+  - ***Live capital needs a home, and it is not the recorder.*** What must be continuously available for an open position is the risk engine, hard stops and kill switch — a recorder that is down costs history, a risk engine that is down costs money. The exposure is specific: margin at Coinbase, the offsetting gain in a wallet on Base, unattended. Recorded as **open item 7**, with the observation that **Part 16's `[verify]` on venue order types is now a decision input** — a stop resting at the venue fires without this system being alive, and is the only mitigation that does not depend on uptime. **Nothing here blocks Parts 7–15**; it must be settled before 16.*
+  - ***Part 20 gains a fixtures note:*** capture and restore on demand rather than seed on start, because seeding races the backfill and, more importantly, would put fixture rows in the same tables as observed ones with nothing to tell them apart — the failure ADR-0015 exists to prevent.*
+  - ***Funding and live-capital gates made a mechanism rather than a note*** (PO-directed). Parts 16, 17 and 18 are the only parts that can move money, and the PO asked to be told **in the conversation** before any of them starts — "not that it's just in the docs." So it is written in three places on purpose: a gate table at the head of this plan listing what must be funded or provisioned before each, a ⛔ STOP block on each of the three parts, and a rule in [CLAUDE.md](../CLAUDE.md)'s safety rails, which is loaded every session where this file is not. The agent stops before writing code, names the prerequisites, and waits for explicit confirmation; a general "do Part 16" is not that confirmation. **The trigger for this was a good question:** whether configuring `WALLET_ADDRESS` could itself spend from the live wallet. It cannot — the order-emitting packages are empty `doc.go` stubs, no Ethereum signing exists in the repository, the Coinbase credential is view-only, and every session-key variable is unset — but "no, and here is the grep that shows it" is a better answer than reassurance, and the gates now make the next such question unnecessary.*
+  - ***Spec §12 item 9 added: which wallet `WALLET_ADDRESS` names once there are two.*** Part 17 swaps from an ERC-4337 smart account whose address differs from the owner EOA the variable names today. Irrelevant to Part 6, decisive for Part 18's treasury reconciliation. Decide with Part 17.*
+  - ***Parts 4, 5 and 6 status lines closed.*** All three still read "awaiting the PO's diff review" or similar, months after the reviews happened — the 2026-09-04 entry retired that claim in the README and left the build plan's own lines behind. P4 and P5 are evidenced by PRs #6 and #7, P6 by `34d9751` on `main`; all three are now ✅ and green in the part index. The status key at the top of this document says green means complete, so the diagram had been under-reporting three finished parts.*
+  - ***The Part 6 review's raw findings moved into the repository*** ([`docs/reviews/part6-adversarial-findings.md`](reviews/part6-adversarial-findings.md)). The changelog entry below pointed at a run transcript in `~/.claude/`; eleven days later the `/tmp` half of it was already gone. All 25 are now recorded with their state — 20 closed, **5 still open** — rather than a pointer a reader cannot follow.*
+
+- *2026-09-16 — **Part 7: sim-venue, the FIX 4.4 acceptor.** A venue simulator that prices against the system's own recorded market data, so a simulated fill is reproducible from the database rather than from a private model.*
+  - ***Four gaps named and decided by the PO before any code was written*** (table in the [part](#part-7--sim-venue-fix-acceptor)): resting orders re-evaluated on each book read; `SIM_PARTIAL_SLICES` = 3; an absent or stale book is a rejection at entry rather than a fabricated fill; and `fix_sessions` becomes an upsert. The first and third add config (`SIM_BOOK_POLL_SECS`, `SIM_BOOK_MAX_AGE_SECS`), the fourth changes only a conflict clause — same key, no migration.*
+  - ***The acceptor is one goroutine owning the book***, fed over **unbuffered** channels from quickfixgo's connection goroutines. The buffer is the part worth explaining: with one, a message is accepted by a channel rather than by the engine, and once the engine has stopped `select` picks at random between queueing an order and reporting the shutdown — so half the time an order would be acknowledged into a buffer with no reader. A test written for the shutdown path is what found it.*
+  - ***ExecIDs carry the process start in base 36.*** `fills` is keyed on `(venue, venue_exec_id)` with `ON CONFLICT DO NOTHING`, so a counter restarting from one on every boot would make the second run's fills collide with the first run's and vanish — no error anywhere, just missing rows.*
+  - ***Two decisions about what not to invent.*** `fills.fee` stays NULL: the simulator observes no fee tier, and a fabricated fee would flow into the P&L decomposition as though it had been charged. And a fill is capped at the order's own limit price, because a limit order printing through its limit is an execution the real venue could not produce.*
+  - ***`FIX_STORE_PATH` and a Compose volume.*** `ResetOnLogon` is off, so the sequence store has to outlive the container. Without the volume a restarted session would silently renumber itself, log on, trade, and look healthy right up until a resend recovered the wrong messages.*
+  - ***A defect the live run found:*** `fix_sessions` was writing a row per logon, which made `disconnects` a counter split across rows and reset by every restart — 1, 2, 1 down the table. One row now covers one process's session. Fixed in the session that found it rather than carried to a phase boundary.*
+  - ***A quickfixgo leak recorded rather than papered over:*** two unguarded `time.AfterFunc` sends into a session's event channel leak a goroutine per logon and per logout in v0.9.11. `goleak` ignores both by name, with the mechanism written out beside the ignore, and `go_goroutines` is where it would show in production.*
+
+- *2026-09-17 — **adversarial review of Part 7**, six lenses plus a refutation stage: 30 raw findings, 16 verified (10 survived, 6 refuted), 14 left unverified by the run's own cap. All 30 recorded with their state in [`docs/reviews/part7-adversarial-findings.md`](reviews/part7-adversarial-findings.md); 20 acted on, 4 left open with reasons, 6 refuted.*
+  - ***Two acceptance criteria were being guarded by tests that could not fail, and this is the fourth time this project has produced one.*** `TestSequenceNumbersSurviveARestart` asserted only that a sequence number went up — which a venue that lost its store entirely also satisfies, because the client's resend recovery pulls the numbers forward. Demonstrated by discarding the store on restart: the test passed. It now asserts **contiguity across the restart** (every message, session-level and application-level, carrying exactly the next number, no SequenceReset in the span) and fails with `carries seq 1, want 5 ... the store did not survive`. `TestFillsAreDeterministicUnderASeed` compared wire output that carried nothing derived from the seed, because its 50 ms tick step exceeded the whole [10 ms, 30 ms) jitter range — every slice was due on the first tick whatever the generator returned. Replacing the seeded generator with a wall-clock one passed the entire suite. It now ticks below the jitter spread and asserts that a **different** seed produces different output. Both were mutation-checked red before green.*
+  - ***A fill could be dropped at SIGTERM and reported as a fatal error.*** `publish` submitted the fills row on the engine's own cancellable context: with the queue ready and the context cancelled, `db.Writer.Submit` has two ready select cases and Go picks at random, so a fill that had already moved the order's state and gone on the wire was lost about half the time during shutdown. It now submits on `context.WithoutCancel` with its own timeout — architecture §8's rule that shutdown I/O runs on a context cancellation cannot reach, which this part had followed for the session record and not for fills.*
+  - ***The `fix_sessions` upsert erased the sequence numbers on reconnect.*** A defect introduced by the same-day fix that made a row span a process's whole session: `logon` writes no sequence numbers, and `DO UPDATE SET last_in_seq = EXCLUDED.last_in_seq` wrote NULL over what the logout had recorded. Proven against the live database by replaying the three writes. The live demonstration had missed it because it ended on a logout. Two changes: the conflict clause now `COALESCE`s the sequence columns — `ended_at` is still overwritten unconditionally, because a session that has reconnected is genuinely no longer down, while a sequence number is a high-water mark that a NULL must never erase — and `logon` now records the numbers the store **resumed** from, which makes the row the audit trail for the restart criterion rather than a hole in it.*
+  - ***`simv_book_age_seconds` read zero — the healthiest possible value — in the one state where the venue rejects every order.*** Found independently by three of the six lenses. A simulator that has never read a snapshot is infinitely stale, not perfectly fresh, and `simv_book_age_seconds > SIM_BOOK_MAX_AGE_SECS` would never have fired on the worst case it exists for. It now reports `+Inf`.*
+  - ***`fix_msgs_total{msg_type}` took its label from raw tag 35.*** No data dictionary is configured, so one buggy or hostile client on the FIX port could mint a Prometheus series per message. Now an allowlist of the twelve MsgTypes this venue speaks, with everything else counted as `other` — the signal without the cardinality.*
+  - ***Smaller, all with tests:*** the book read now has a timeout (it runs on the engine goroutine, the only reader of the order channel, so an unbounded query would stop the venue answering FIX while the process looked healthy); `SimVenue.validate` rejects a book-max-age shorter than the poll interval; a logout with no preceding logon no longer adopts the failed handshake's instant as the session's start; `fixSender.sendCancelReject` and the three `simv_*` series had **no test at all** and no-op versions passed the suite, so both are now covered — the cancel reject end-to-end over a real socket.*
+  - ***Three documentation claims were wrong, including one about a leak.*** The goleak ignore and this plan attributed quickfixgo's logon-timeout leak to sim-venue; it is armed only by initiators (`session_state.go` returns early on `!session.InitiateLogon`), so it is the scripted **client's** in tests and will be `carry`'s at Part 8 — the original wording told an operator to watch sim-venue for a climb it cannot produce. api-spec §4.3 said the jittered latency applies "before each report" when acknowledgements and rejections are immediate. And "the row is written before the report is sent" claimed durability the writer does not provide: `Submit` enqueues, the flush is later, so a process killed in between keeps the client's fill and loses the row — an ordering guarantee, now described as one.*
+  - ***Six findings refuted, and two of them improved the docs anyway.*** The refutations that held: `SendToTarget` queues rather than touching the socket, so a stalled peer cannot freeze the engine; `carry` has no FIX code yet, so its missing volume is a Part 8 obligation rather than a live defect (recorded in api-spec §7); IOC filling one slice and ClOrdID reuse after a rejection are both the documented contract, the latter harmless because `fills.cl_ord_id` can only ever carry an accepted order's id. The tick-grid finding was refuted as a defect — the code matches ADR-0019 and api-spec §4.3 — but it is true that **every sim fill prints at a price the venue could not have produced**, which was undocumented; ADR-0019 now records it beside the depth limitation.*
+  - ***A flaky test, found by a refuted finding.*** The claim that the socket tests race real timers was refuted on its mechanism — the jitter is seeded, so the schedule does not depend on load — but verifying it exposed a different, real race in the same file, which then reproduced during the post-review suite run: `freePort` released a port before the acceptor bound it, so anything on the machine could take it, and the failure surfaced as "timed out waiting for the client to log on" rather than as the `bind: address already in use` it was. The harness now waits until the acceptor is actually accepting, reports a bind failure as itself, and retries on a fresh port. Refutations are worth reading, not just filing.*
+  - ***The fixes were demonstrated, not asserted.*** Both rewritten tests were mutation-checked red before green — the restart test now fails with `carries seq 1, want 5 ... the store did not survive`, and the determinism test fails when the generator is seeded from the clock. The `fix_sessions` fix was re-demonstrated against the live stack: after a reconnect the row reads `ended_at` NULL with `last_in_seq=27, last_out_seq=66` where it previously read NULL, NULL.*
+  - ***The run's own cap is a known limit.*** 14 of 30 findings were never adversarially verified because verification stopped at the top 16 by severity. Several of those turned out to be real and were fixed after checking by hand; the four left open are recorded with reasons. This is the same cap the [Part 6 review](reviews/part6-adversarial-findings.md) was criticised for, raised from 8 to 16 and still binding.*

@@ -150,11 +150,21 @@ type PollIntervals struct {
 
 // FIXSession is the FIX 4.4 session identity shared by the initiator (carry) and
 // the acceptor (sim-venue).
+//
+// StorePath is the directory quickfixgo keeps its sequence-number store and its
+// message log under (one subdirectory each). It is configuration rather than a
+// constant because it must outlive the process: ResetOnLogon is off, so a
+// session that cannot find yesterday's sequence numbers is a session that
+// silently starts again from one — which is the failure the file store exists to
+// prevent, and it looks like a working system right up until the resend never
+// comes. In Compose it points at a volume; on a developer machine it is a local
+// directory; in tests it is a t.TempDir.
 type FIXSession struct {
-	Sender string
-	Target string
-	Host   string
-	Port   int
+	Sender    string
+	Target    string
+	Host      string
+	Port      int
+	StorePath string
 }
 
 // Signals are the decision-engine thresholds. Committed values are synthetic
@@ -191,11 +201,26 @@ type TreasuryTimeouts struct {
 	BaseTx     time.Duration // Base tx submitted -> confirmed
 }
 
-// FillModel is sim-venue's fill behavior.
+// FillModel is sim-venue's fill behavior (API spec section 4.3).
+//
+// Latency is the delay between an order becoming fillable and the fill printing,
+// jittered; SlippageBps is how far through the touch a fill prints, always
+// adverse to the order; an order larger than PartialThreshold prints in
+// PartialSlices reports rather than one.
+//
+// BookPoll and BookMaxAge are the two that describe the market rather than the
+// order. The simulator prices against the last top-of-book ingest recorded, so
+// it re-reads that row every BookPoll, and refuses to accept an order when the
+// newest one it can see is older than BookMaxAge. Without the second, a venue
+// whose data feed had stopped would keep filling at yesterday's price and look
+// entirely healthy doing it.
 type FillModel struct {
 	Latency          time.Duration
 	SlippageBps      decimal.Decimal
 	PartialThreshold decimal.Decimal
+	PartialSlices    int
+	BookPoll         time.Duration
+	BookMaxAge       time.Duration
 }
 
 // Secrets are the values that exist only in .env.private. They are loaded but
@@ -346,9 +371,15 @@ func loadSimVenue(lookup lookupFunc) (*SimVenue, error) {
 			Latency:          time.Duration(l.PositiveInt("SIM_LATENCY_MS", 20)) * time.Millisecond,
 			SlippageBps:      l.Decimal("SIM_SLIPPAGE_BPS", "2"),
 			PartialThreshold: l.Decimal("SIM_PARTIAL_THRESHOLD", "10"),
+			PartialSlices:    l.PositiveInt("SIM_PARTIAL_SLICES", 3),
+			BookPoll:         l.Seconds("SIM_BOOK_POLL_SECS", time.Second),
+			BookMaxAge:       l.Seconds("SIM_BOOK_MAX_AGE_SECS", 60*time.Second),
 		},
 	}
-	return cfg, l.err()
+	if err := l.err(); err != nil {
+		return cfg, err
+	}
+	return cfg, cfg.validate()
 }
 
 func loadMigrateCmd(lookup lookupFunc) (*MigrateCmd, error) {
@@ -373,6 +404,12 @@ const (
 )
 
 const (
+	// defaultFIXStorePath is an absolute path because the containers run with no
+	// working directory of their own: a relative default would resolve to / and
+	// fail to create on an image whose user is not root. Compose mounts a volume
+	// here, which is what carries the sequence numbers across a restart.
+	defaultFIXStorePath = "/var/lib/carry/fix"
+
 	defaultMaintenanceBreak = "Fri 17:00-18:00 America/New_York"
 	defaultContractSizeETH  = "0.10"
 	defaultBackfillWindow   = 45 * 24 * time.Hour
@@ -409,10 +446,11 @@ func (l *loader) baseChain() BaseEndpoints {
 
 func (l *loader) fix() FIXSession {
 	return FIXSession{
-		Sender: l.String("FIX_SENDER", "CARRY"),
-		Target: l.String("FIX_TARGET", "SIMV"),
-		Host:   l.String("FIX_HOST", "sim-venue"),
-		Port:   l.PositiveInt("FIX_PORT", 5001),
+		Sender:    l.String("FIX_SENDER", "CARRY"),
+		Target:    l.String("FIX_TARGET", "SIMV"),
+		Host:      l.String("FIX_HOST", "sim-venue"),
+		Port:      l.PositiveInt("FIX_PORT", 5001),
+		StorePath: l.String("FIX_STORE_PATH", defaultFIXStorePath),
 	}
 }
 
@@ -463,6 +501,45 @@ func (c *Carry) validate() error {
 	} else if halfContract := c.ContractSizeETH.Div(two); c.Risk.DeltaToleranceETH.GreaterThan(halfContract) {
 		errs = append(errs, fmt.Errorf("DELTA_TOLERANCE_ETH=%s: exceeds half a contract (%s)",
 			c.Risk.DeltaToleranceETH, halfContract))
+	}
+
+	return errors.Join(errs...)
+}
+
+// validate enforces the two fill-model invariants a zero or a negative would
+// turn into silently wrong behavior rather than an error.
+func (c *SimVenue) validate() error {
+	var errs []error
+
+	// Slippage is applied away from the order, so a negative value would print
+	// fills *better* than the touch: a simulator that flatters every execution
+	// is worse than no simulator, because the number it produces looks like
+	// evidence. Zero is legitimate — it is the frictionless baseline a test
+	// wants.
+	if c.Fill.SlippageBps.IsNegative() {
+		errs = append(errs, fmt.Errorf("SIM_SLIPPAGE_BPS=%s: must not be negative", c.Fill.SlippageBps))
+	}
+
+	// The threshold is the size above which an order prints in slices. At zero
+	// or below, every order is oversized and the partial path becomes the only
+	// path, which is not what any caller reading "orders larger than X" expects.
+	if c.Fill.PartialThreshold.LessThanOrEqual(decimal.Zero) {
+		errs = append(errs, fmt.Errorf("SIM_PARTIAL_THRESHOLD=%s: must be greater than 0",
+			c.Fill.PartialThreshold))
+	}
+
+	// A book may not be declared stale sooner than it can be refreshed. The
+	// simulator re-reads the recorded top-of-book every BookPoll and refuses
+	// orders once the newest snapshot is older than BookMaxAge, so a maximum age
+	// below the poll interval is a venue that spends part of every cycle
+	// rejecting everything, for no reason an operator could see from either
+	// value alone. Equal is allowed: that is a venue with no slack, which is a
+	// choice rather than a mistake.
+	if c.Fill.BookMaxAge < c.Fill.BookPoll {
+		errs = append(errs, fmt.Errorf(
+			"SIM_BOOK_MAX_AGE_SECS=%s: must not be shorter than SIM_BOOK_POLL_SECS=%s, "+
+				"or the book is stale before it can be refreshed",
+			c.Fill.BookMaxAge, c.Fill.BookPoll))
 	}
 
 	return errors.Join(errs...)

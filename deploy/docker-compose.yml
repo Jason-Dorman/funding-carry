@@ -98,8 +98,15 @@ services:
         SERVICE: sim-venue
     ports:
       - "127.0.0.1:9103:9103"
-      # FIX 4.4 acceptor, listening from Part 7.
+      # FIX 4.4 acceptor.
       - "127.0.0.1:5001:5001"
+    volumes:
+      # The sequence-number store and the message log. On a volume rather than in
+      # the container's own filesystem because ResetOnLogon is off and the
+      # numbers have to survive a restart — a session that came back renumbered
+      # would log on, trade, and look healthy right up until a resend recovered
+      # the wrong messages. The path matches FIX_STORE_PATH in .env.example.
+      - fix-store:/var/lib/carry/fix
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9103/healthz || exit 1"]
       <<: *health-defaults
@@ -178,6 +185,7 @@ services:
 
 volumes:
   timescale-data:
+  fix-store:
   prometheus-data:
   alertmanager-data:
   grafana-data:

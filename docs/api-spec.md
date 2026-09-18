@@ -259,11 +259,12 @@ Initiator: `carry` (`internal/fix`). Acceptor: `sim-venue` (later optionally a C
 |---|---|
 | BeginString | FIX.4.4 |
 | HeartBtInt | 30 |
-| SenderCompID / TargetCompID | `CARRY` / `SIMV` (config) |
-| Sequence store | file-backed (quickfixgo FileStore), survives restart |
+| SenderCompID / TargetCompID | `CARRY` / `SIMV` (config) — **from the initiator's point of view.** The acceptor's own `SenderCompID` is therefore `FIX_TARGET` and its `TargetCompID` is `FIX_SENDER`. Reversing them produces a session that never logs on, reported only as a comp-id mismatch |
+| Sequence store | file-backed (quickfixgo FileStore) under `FIX_STORE_PATH/store`, survives restart — a Compose volume, because a store inside the container's filesystem would not |
 | Resend | standard ResendRequest / SequenceReset-GapFill handling |
-| ResetOnLogon | **N** — sequence continuity is the point |
-| Logs | quickfixgo FileLog, retained for demo/replay |
+| ResetOnLogon / ResetOnLogout / ResetOnDisconnect | **N**, all three set explicitly — sequence continuity is the point, and each defaults to N already: a default is not a decision, and a session that quietly renumbered itself would look healthy until a resend recovered the wrong messages |
+| StartTime / EndTime | **unset.** A session with no time range never rolls and never resets its sequence numbers. The venue trades around the clock apart from the weekly break, and that break is a trading rule the decision engine applies, not a reason to renumber |
+| Logs | quickfixgo FileLog under `FIX_STORE_PATH/log`, retained for demo/replay |
 
 ### 4.2 Messages
 
@@ -277,7 +278,7 @@ Initiator: `carry` (`internal/fix`). Acceptor: `sim-venue` (later optionally a C
 | 38 | OrderQty | qty |
 | 40 | OrdType | 2=Limit |
 | 44 | Price | limit px |
-| 59 | TimeInForce | 1=GTC, 3=IOC, 6/post-only per venue convention (sim: custom tag if needed) |
+| 59 | TimeInForce | 1=GTC, 3=IOC. Conditionally required in FIX, so an absent tag is Day — which the simulator does not honour and refuses by name rather than treating as one of the two it does |
 | 60 | TransactTime | UTC |
 
 **ExecutionReport (35=8)** — sim-venue → carry
@@ -298,9 +299,26 @@ Initiator: `carry` (`internal/fix`). Acceptor: `sim-venue` (later optionally a C
 
 **Reject (35=3):** 45 RefSeqNum, 371 RefTagID, 372 RefMsgType, 373 SessionRejectReason — surfaced as a metric and log, never silently dropped.
 
+**Which refusal is which.** A message that cannot be *read* is a session-level Reject (35=3) naming the tag: a missing ClOrdID, a Side outside the enumeration, a price that is not a number. A well-formed order this venue will not *take* is an ExecutionReport with ExecType/OrdStatus = 8 and the reason in Text (58), so the client sees it against its own order id. The split matters because the two are different problems — the first is a client that cannot speak FIX, the second is a client asking for something real. sim-venue's business rejections are: an unknown symbol, a non-limit OrdType, an unsupported TimeInForce, a quantity that is not a positive whole number of contracts, a non-positive price, a reused ClOrdID, and no fresh market data (below). A message type the venue does not handle at all is a BusinessMessageReject (35=j), never silence.
+
 ### 4.3 sim-venue fill model
 
-Fills against last recorded top-of-book from TimescaleDB with configurable: latency (ms, jittered), slippage (bps), partial-fill threshold (orders larger than X fill in N slices). Config via env. Fill decisions are deterministic under a fixed seed for tests.
+Fills against the last recorded top-of-book from TimescaleDB — the same `cb_book_snapshots` rows the feature engine and the replay read, so a simulated run is reproducible from the database rather than from a private model. The simulator re-reads that row every `SIM_BOOK_POLL_SECS` and prices against the newest snapshot carrying **both** sides of the touch.
+
+| Behaviour | Rule |
+|---|---|
+| Marketable | Crosses or joins: a buy at exactly the ask fills. There is no order queue — modelling one would make fills unpredictable from the row they were priced against |
+| Fill price | The touch, moved adversely by `SIM_SLIPPAGE_BPS` (up for a buy, down for a sell), **capped at the order's own limit**. A limit order printing through its limit is an execution the real venue could not produce |
+| Latency | `SIM_LATENCY_MS`, jittered over [half, one and a half] of it, before each **fill** — the acknowledgement, the rejection and the cancel answer are immediate, because they are the venue replying rather than the market trading. Centred on the configured value rather than below it, so a configured 20 ms is a 20 ms venue |
+| Partials | An order larger than `SIM_PARTIAL_THRESHOLD` prints in `SIM_PARTIAL_SLICES` reports. The slices are whole contracts and sum to the order exactly, remainder on the last — integer arithmetic, which is available because the perp leg is quantized and a fractional quantity is refused at entry |
+| Resting orders | A non-crossing order **rests** and fills when the market comes to it, re-evaluated on each book read ([ADR-0019](decisions/0019-sim-fills-against-recorded-book.md)). An order that could not fill is deferred to the next read rather than re-asked immediately, which is also what keeps the engine's loop from spinning |
+| IOC | Evaluated once: it takes the slice it can and the remainder is canceled. It never rests |
+| No market | An order arriving when the newest snapshot is absent or older than `SIM_BOOK_MAX_AGE_SECS` is **rejected** with `no market data` ([ADR-0019](decisions/0019-sim-fills-against-recorded-book.md)); a resting order simply stops filling while the book is stale. A simulator that kept filling against a frozen book would look entirely healthy doing it |
+| Determinism | The jitter is the only randomness, and it is seeded — by a constant, not the clock, so an ordinary run is as reproducible as a test. `TestFillsAreDeterministicUnderASeed` asserts byte-identical FIX messages across two runs of the same script, and orders that become fillable on the same tick report in ClOrdID order rather than in map order |
+
+**What is recorded and what is not.** Every report that moved quantity becomes a `fills` row under `venue='sim'`, `leg='perp'`, keyed on its ExecID — which is prefixed with the process start, because `(venue, venue_exec_id)` is `ON CONFLICT DO NOTHING` and a counter restarting from one would make a second run's fills vanish into the first run's rows. The row is handed to the writer *before* the report is sent: a report sent but not recorded is a fill the system cannot account for, while one recorded but not sent is recovered by the resend. That is an ordering guarantee, not a durability one — `Submit` enqueues onto the single writer goroutine, which flushes on its own batch size and interval, so a process killed between the two loses the row while the client keeps the fill. What the ordering buys is that the row is never skipped; the writer's drain on shutdown is what gets it out. `fee` stays NULL — the simulator observes no fee tier, and a fabricated one would flow straight into the P&L decomposition as though it had been charged.
+
+**Resting orders live in memory only.** The FIX session survives a restart of sim-venue; its book of resting orders does not. Fills already printed are in the database and in the message log, so nothing recorded is lost — but an order still working when the simulator restarts is gone, and the client learns that by asking. This is a property of a simulator, not of the venue it stands in for.
 
 ---
 
@@ -489,13 +507,17 @@ The schema carries the rules that must hold regardless of which process wrote th
 | `fills` | `(venue, venue_exec_id)` | FIX resend after reconnect (Part 8) |
 | `funding_events` | `(product_id, kind, ts, position_id)`, `NULLS NOT DISTINCT` | funding-history backfill (Part 5) |
 | `risk_events` | `(ts, kind)` | event re-emission |
-| `fix_sessions` | `(session_id, started_at)` | session re-record |
+| `fix_sessions` | `(session_id, started_at)` | session re-record — and an **upsert**, see below |
 
 Three obligations come with that table, and none of them is enforceable by the schema alone:
 
 - **`ts` is the sampling boundary, not `time.Now()`.** For the series tables and `cb_features`, producers align the timestamp to the poll or tick boundary. A nanosecond-resolution clock reading makes every row unique, and the constraint becomes decorative. Parts 4–6 own this.
 - **`funding_events.ts` is the start of the funding hour** for an `ACCRUAL` — the rate is a property of the hour (venue doc §3), not of the moment it was computed. `position_id` is in the key because one hour legitimately produces both an observed-series row (`position_id NULL`) and a position-linked accrual; `NULLS NOT DISTINCT` is what makes the observed row collide with its own repeat.
 - **`fills.venue_exec_id` is `NOT NULL`.** Every `Venue` implementation supplies one: FIX `ExecID` (tag 17) live and on sim, a minted id on paper.
+
+**Two tables upsert rather than doing nothing.** `cb_products` is metadata that is rewritten whenever the products endpoint is read. `fix_sessions` is a record of something still happening: **one row covers one process's whole session**, written at the first logon with `ended_at` NULL, rewritten at each logout with the sequence numbers the store reached and a `disconnects` count that rises, and reopened — `ended_at` back to NULL — when the client comes back. A restarted binary is a new row, because it is a new run.
+
+`DO NOTHING` would have discarded every one of those later facts and left the table holding a row per session saying only that a session existed, which is the one thing `fix_session_up` already says. A row per *connection* is the other wrong answer, and the Part 7 live run produced it before this was settled: three rows carrying disconnect counts of 1, 2, 1 — a running total split across rows and reset by the restart, unreadable in either direction. A row that stays open is then a true statement rather than a missing update: either the session is up, or the process died without logging out.
 
 `positions` is the one table with no natural key — a carry has no property that identifies it — so its identity is assigned rather than discovered: `id` is a client-minted ULID, the same convention as `ClOrdID`. That also removes the need to read a generated id back before `fills` and `funding_events` can reference it, which would have made a producer into a second writer.
 
@@ -511,7 +533,9 @@ Three obligations come with that table, and none of them is enforceable by the s
 
 All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-cardinality (`product`, `stream`, `venue`, `leg`, `component`).
 
-The four writer metrics (`rows_written_total`, `rows_conflicted_total`, `write_batch_seconds`, `write_queue_depth`) come from shared code in `internal/db` and take the prefix of whichever binary owns that writer, so `carry_rows_written_total` exists alongside the `ingest_` ones listed below. "Is this binary keeping up with its writes?" is a per-binary question. `rows_written_total` and `rows_conflicted_total` are deliberately separate: with `ON CONFLICT` on every insert, a re-sent batch is silent in every other signal, and a single counter adding the two together would report a retry storm as healthy throughput.
+The four writer metrics (`rows_written_total`, `rows_conflicted_total`, `write_batch_seconds`, `write_queue_depth`) come from shared code in `internal/db` and take the prefix of whichever binary owns that writer, so `carry_rows_written_total` and `simv_rows_written_total` exist alongside the `ingest_` ones listed below. "Is this binary keeping up with its writes?" is a per-binary question. `rows_written_total` and `rows_conflicted_total` are deliberately separate: with `ON CONFLICT` on every insert, a re-sent batch is silent in every other signal, and a single counter adding the two together would report a retry storm as healthy throughput.
+
+The three `fix_*` series carry **no binary prefix**, and that is deliberate: the acceptor in sim-venue and the initiator in carry export the same three names, and the `session` label is what separates them. A dashboard asking "is the FIX link up" should not have to ask it twice with two spellings.
 
 One prefix is deliberately outside this catalogue: the Part 3 learning exercise in `research/onramp/` exports `onramp_*` series and nothing scrapes it. It is not a service, it is not in the Compose stack, and its metrics are not alertable — the exception is recorded here so it does not read as drift.
 
@@ -548,9 +572,12 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `carry_hard_stops_total` | counter | kind | hard-stop firings |
 | `carry_kill_switch_engaged` | gauge | — | 0/1 |
 | `carry_session_key_expiry_timestamp_seconds` | gauge | — | unix ts of session-key expiry |
-| `fix_session_up` | gauge | session | 0/1 |
-| `fix_msgs_total` | counter | session, msg_type, dir | message counts |
-| `fix_resend_events_total` | counter | session | sequence recoveries |
+| `fix_session_up` | gauge | session | 0/1. Created at zero before anything connects: `FixSessionDown` is `fix_session_up == 0`, and PromQL over a series that does not exist yields nothing rather than firing |
+| `fix_msgs_total` | counter | session, msg_type, dir | message counts. `dir` is `in`/`out`; a message whose own MsgType could not be read is counted as `unknown` rather than skipped |
+| `fix_resend_events_total` | counter | session | sequence recoveries: ResendRequests seen on the session, either direction |
+| `simv_orders_total` | counter | result | orders by outcome — `accepted`, `rejected` (refused at entry), `filled`, `canceled`. All four initialized, so a rejection path that has never fired is a visible zero |
+| `simv_book_age_seconds` | gauge | — | age of the top-of-book the fill model last priced against. Past `SIM_BOOK_MAX_AGE_SECS` the simulator refuses orders, so this is the series that explains a venue rejecting everything |
+| `simv_resting_orders` | gauge | — | orders live on the simulator's book: accepted, not yet filled or canceled |
 
 ### Alert rules (Alertmanager)
 
@@ -602,8 +629,11 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `DAILY_LOSS_LIMIT_USD` | carry | — |
 | `SPREAD_MAX_BPS`, `STALE_FEED_SECS` | carry | 5 / 60 |
 | `PRESSURE_WEIGHTS` | carry | `0.5,0.3,0.2` *(placeholder)* |
-| `FIX_SENDER`, `FIX_TARGET`, `FIX_HOST`, `FIX_PORT` | carry, sim-venue | — |
-| `SIM_LATENCY_MS`, `SIM_SLIPPAGE_BPS`, `SIM_PARTIAL_THRESHOLD` | sim-venue | 20 / 2 / — |
+| `FIX_SENDER`, `FIX_TARGET`, `FIX_HOST`, `FIX_PORT` | carry, sim-venue | `CARRY` / `SIMV` / `sim-venue` / 5001 — named from the initiator's point of view; §4.1 on which is which for the acceptor |
+| `FIX_STORE_PATH` | sim-venue *(carry from Part 8)* | `/var/lib/carry/fix` — quickfixgo's sequence store and message log (one subdirectory each). A Compose volume on the `sim-venue` service; **carry has no FIX code and no volume yet**, and Part 8 must add one when it gains the initiator, or its sequence numbers will be as ephemeral as its container. `ResetOnLogon` is off, so a store that did not survive a restart would give a session that silently renumbered itself |
+| `SIM_LATENCY_MS`, `SIM_SLIPPAGE_BPS` | sim-venue | 20 / 2 — latency jittered over [half, one and a half]; slippage always adverse and never through the limit |
+| `SIM_PARTIAL_THRESHOLD`, `SIM_PARTIAL_SLICES` | sim-venue | 10 / 3 — an order above the threshold prints in this many reports, whole contracts, summing to the order |
+| `SIM_BOOK_POLL_SECS`, `SIM_BOOK_MAX_AGE_SECS` | sim-venue | 1 / 60 — how often the recorded top-of-book is re-read, and how old it may be before orders are refused rather than filled at a price the market has left behind |
 | `CB_API_KEY_NAME`, `CB_API_PRIVATE_KEY` | **private** | CDP key for JWT auth |
 | `CB_PORTFOLIO_ID` | **private** | futures portfolio |
 | `WALLET_ADDRESS`, `SESSION_KEY`, `GAS_POLICY_ID` | **private** | Base leg |
@@ -615,11 +645,13 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 
 `DATABASE_URL`, `PERP_PRODUCT_ID` and `SPOT_PRODUCT_ID` are required; everything else has a documented default. `cmd/migrate` is the exception to the shared `Common` block: it reads only `DATABASE_URL`, `PERP_PRODUCT_ID`, `CONTRACT_SIZE_ETH` and the log settings, so a schema migration cannot fail on configuration it never uses. A load reports *every* problem it found at once rather than failing on the first, so a misconfigured deployment learns all of it in one restart.
 
-Three values fail the load rather than being checked at trade time, because a configuration that violates them must never reach a venue:
+Three values fail `carry`'s load rather than being checked at trade time, because a configuration that violates them must never reach a venue:
 
 - `INTRADAY_MARGIN_OPT_IN` true — intraday margin is never opted into in v1 (spec §9, architecture §12).
 - `MAX_LEVERAGE` above 3 or non-positive — the overnight cap.
 - `DELTA_TOLERANCE_ETH` above half of `CONTRACT_SIZE_ETH` — the spot leg can always close residual delta smaller than half a contract, so a wider tolerance would accept delta the system could have removed.
+
+`sim-venue` fails its own load on two, for the same reason — neither would fail loudly at run time. A negative `SIM_SLIPPAGE_BPS` would print fills *better* than the touch, and a simulator that flatters every execution is worse than none because its numbers look like evidence; zero is legitimate and is the frictionless baseline. A `SIM_PARTIAL_THRESHOLD` at or below zero would make every order an oversized one.
 
 Credentials are typed as a redacting `Secret` in `internal/config`, reachable only through an explicit `Reveal()` at the point of use. Redaction covers `String()`, `GoString()` (`%#v`), `LogValue()` (slog attributes), `MarshalJSON` and `MarshalText` — the last two because slog resolves `LogValuer` only on the attribute value itself, so a `Secret` nested inside a struct handed to the JSON handler falls through to `encoding/json`, and JSON is the format containers log in. A `Secret` that redacted only under `fmt` and a top-level slog attribute would be redacted on every path except the one production uses; `TestSecretsAreRedacted` asserts all of them.
 

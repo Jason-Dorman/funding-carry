@@ -139,3 +139,46 @@ func (r *Reader) LatestFundingRate(ctx context.Context, product string, before t
 	}
 	return rate, ts.UTC(), true, rows.Err()
 }
+
+// StoredBook is the top of the book as cb_book_snapshots recorded it.
+//
+// TS is the snapshot's own timestamp — the sampling boundary ingest wrote it on,
+// not the moment it was read back — so a consumer measuring staleness is
+// measuring the age of the market data rather than the age of its own query.
+type StoredBook struct {
+	TS      time.Time
+	BestBid decimal.Decimal
+	BestAsk decimal.Decimal
+}
+
+// LatestBook returns the most recent snapshot for a product that carries both
+// sides of the touch, and whether there was one.
+//
+// Both sides are required because a caller that prices against the book needs a
+// bid and an ask, and every column in the schema is nullable: a snapshot written
+// while one side of the market was empty is a real row, and it is not a book
+// anyone can fill against. Skipping it here rather than returning it and letting
+// the caller discover the NULL keeps "there is no usable market" one answer
+// instead of two.
+func (r *Reader) LatestBook(ctx context.Context, product string) (StoredBook, bool, error) {
+	rows, err := r.q.Query(ctx,
+		`SELECT ts, best_bid, best_ask
+		   FROM cb_book_snapshots
+		  WHERE product_id = $1 AND best_bid IS NOT NULL AND best_ask IS NOT NULL
+		  ORDER BY ts DESC LIMIT 1`,
+		product)
+	if err != nil {
+		return StoredBook{}, false, fmt.Errorf("read latest book for %s: %w", product, err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return StoredBook{}, false, rows.Err()
+	}
+	var b StoredBook
+	if err := rows.Scan(&b.TS, &b.BestBid, &b.BestAsk); err != nil {
+		return StoredBook{}, false, fmt.Errorf("scan latest book for %s: %w", product, err)
+	}
+	b.TS = b.TS.UTC()
+	return b, true, rows.Err()
+}

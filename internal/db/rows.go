@@ -56,6 +56,15 @@ const (
 	VenuePaper = "paper"
 	VenueSim   = "sim"
 	VenueLive  = "live"
+
+	// LegSpot and LegPerp are the two halves of a carry, and which one a fill
+	// belongs to is the difference between a continuous position and a quantized
+	// one (spec section 11).
+	LegSpot = "spot"
+	LegPerp = "perp"
+
+	SideBuy  = "buy"
+	SideSell = "sell"
 )
 
 // Opt marks an optional non-numeric column as present. A nil pointer writes SQL
@@ -594,6 +603,21 @@ func (r RiskEventRow) row() rowData {
 // FIXSessionRow is the operational record of a FIX session. quickfixgo's file
 // store holds the authoritative sequence numbers; these rows are what the
 // dashboard and the resend demo read.
+//
+// It is the second row type that upserts rather than doing nothing on conflict,
+// and for the same reason cb_products does: this is a record of something still
+// happening, not an observation of a moment. One row covers one process's whole
+// session — written at the first logon with ended_at NULL, rewritten at every
+// logout with the sequence numbers the store reached and a disconnect count that
+// rises, and reopened (ended_at back to NULL) when the client comes back.
+//
+// DO NOTHING would have thrown away every one of those later facts and left the
+// table holding empty shells: a row saying a session existed, which is the one
+// thing fix_session_up already says. And a row per *connection* would make
+// disconnects a column that could only ever hold 0 or 1.
+//
+// A row that stays open is a session that is still up or a process that died
+// without logging out, and both are true things to be able to read.
 type FIXSessionRow struct {
 	SessionID   string
 	StartedAt   time.Time
@@ -614,6 +638,23 @@ func (r FIXSessionRow) row() rowData {
 			r.SessionID, r.StartedAt, stamp(r.EndedAt), r.LastInSeq,
 			r.LastOutSeq, r.Disconnects,
 		},
-		conflict: "ON CONFLICT (session_id, started_at) DO NOTHING",
+		// The two halves of this SET are deliberately asymmetric, and the
+		// asymmetry is the point.
+		//
+		// ended_at is overwritten unconditionally, including with NULL: a session
+		// that has reconnected is no longer down, so the time it was last down
+		// has stopped being true. A sequence number is the opposite — it is a
+		// high-water mark, and NULL on an incoming row means "I have no newer
+		// value", never "forget the one you have". COALESCE is what encodes that
+		// difference, and without it the reconnect write erased the numbers the
+		// logout had just recorded, so a process that reconnected and then died
+		// left NULLs in the one column that says where its session got to. Found
+		// by the Part 7 adversarial review; the live demonstration had missed it
+		// because it ended on a logout.
+		conflict: "ON CONFLICT (session_id, started_at) DO UPDATE SET " +
+			"ended_at = EXCLUDED.ended_at, " +
+			"last_in_seq = COALESCE(EXCLUDED.last_in_seq, fix_sessions.last_in_seq), " +
+			"last_out_seq = COALESCE(EXCLUDED.last_out_seq, fix_sessions.last_out_seq), " +
+			"disconnects = EXCLUDED.disconnects",
 	}
 }

@@ -17,6 +17,9 @@ coverage.html
 # FIX sequence stores and message logs (Parts 7 and 8) — session state and
 # potentially live order detail.
 /deploy/fix/
+# The host-mode FIX store: .env.example suggests ./.fix for running a binary
+# outside Compose, and it holds the sequence store and a verbatim message log.
+/.fix/
 *.session
 
 # Local data directories

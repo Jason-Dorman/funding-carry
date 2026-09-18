@@ -177,6 +177,61 @@ func TestLoadSimVenueDefaults(t *testing.T) {
 	if got, want := cfg.FIX.Port, 5001; got != want {
 		t.Errorf("FIX.Port = %d, want %d", got, want)
 	}
+	if got, want := cfg.FIX.StorePath, defaultFIXStorePath; got != want {
+		t.Errorf("FIX.StorePath = %q, want %q", got, want)
+	}
+	if got, want := cfg.Fill.PartialSlices, 3; got != want {
+		t.Errorf("Fill.PartialSlices = %d, want %d", got, want)
+	}
+	if got, want := cfg.Fill.BookPoll, time.Second; got != want {
+		t.Errorf("Fill.BookPoll = %v, want %v", got, want)
+	}
+	if got, want := cfg.Fill.BookMaxAge, time.Minute; got != want {
+		t.Errorf("Fill.BookMaxAge = %v, want %v", got, want)
+	}
+	if got, want := cfg.Fill.PartialThreshold.String(), "10"; got != want {
+		t.Errorf("Fill.PartialThreshold = %s, want %s", got, want)
+	}
+}
+
+// The simulator's own two invariants. Neither would fail loudly at run time: a
+// negative slippage would print fills better than the touch, which is a
+// simulator that flatters every execution, and a threshold of zero would make
+// every order an oversized one.
+func TestSimVenueValidationRejectsAFillModelThatWouldLie(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		env      map[string]string
+		wantText string
+	}{
+		{"slippage that improves the price", map[string]string{"SIM_SLIPPAGE_BPS": "-2"}, "SIM_SLIPPAGE_BPS"},
+		{"a partial threshold of zero", map[string]string{"SIM_PARTIAL_THRESHOLD": "0"}, "SIM_PARTIAL_THRESHOLD"},
+		{"a negative partial threshold", map[string]string{"SIM_PARTIAL_THRESHOLD": "-1"}, "SIM_PARTIAL_THRESHOLD"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := loadSimVenue(withEnv(tt.env))
+			if err == nil {
+				t.Fatal("want the load to fail, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantText) {
+				t.Errorf("error does not mention %s:\n%v", tt.wantText, err)
+			}
+		})
+	}
+}
+
+// Zero slippage is legitimate: it is the frictionless baseline a test wants, and
+// refusing it would make the model impossible to isolate.
+func TestSimVenueAcceptsZeroSlippage(t *testing.T) {
+	t.Parallel()
+
+	if _, err := loadSimVenue(withEnv(map[string]string{"SIM_SLIPPAGE_BPS": "0"})); err != nil {
+		t.Fatalf("zero slippage should be acceptable: %v", err)
+	}
 }
 
 func TestLoadReportsEveryMissingRequiredVariable(t *testing.T) {
@@ -219,6 +274,8 @@ func TestLoadRejectsMalformedValues(t *testing.T) {
 		{"zero seconds", loadIngestErr, map[string]string{"POLL_REST_SECS": "0"}, errNotPositive},
 		{"negative seconds", loadIngestErr, map[string]string{"POLL_BASE_SECS": "-1"}, errNotPositive},
 		{"non-integer milliseconds", loadSimVenueErr, map[string]string{"SIM_LATENCY_MS": "20ms"}, errNotPositive},
+		{"a slice count of zero", loadSimVenueErr, map[string]string{"SIM_PARTIAL_SLICES": "0"}, errNotPositive},
+		{"a book poll of zero", loadSimVenueErr, map[string]string{"SIM_BOOK_POLL_SECS": "0"}, errNotPositive},
 		{"non-integer port", loadSimVenueErr, map[string]string{"FIX_PORT": "five thousand"}, errNotPositive},
 		{"non-integer horizon", loadCarryErr, map[string]string{"CARRY_HORIZON_HOURS": "1 week"}, errNotPositive},
 		{"non-decimal threshold", loadCarryErr, map[string]string{"CONTRACT_SIZE_ETH": "ten"}, errNotDecimal},

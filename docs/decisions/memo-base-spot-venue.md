@@ -45,7 +45,7 @@ Route B does not merely score lower on this axis; it removes the thing the order
 
 ## Honest case for Route B
 
-It is materially simpler, and the simplification is not trivial: **Part 17's entire session-key apparatus disappears** — ERC-4337 UserOperations, a bundler, gas sponsorship, a router-scoped allowance, an expiry preflight that must fail loudly ([api-spec §2.2](../api-spec.md#22-write-path-baseVenue-week-5)). That is the highest-risk code in the build and the only place a key can move funds autonomously. Route B replaces it with an authenticated REST order on a venue we already talk to.
+It is materially simpler, and the simplification is not trivial: **Part 17's entire session-key apparatus disappears** — ERC-4337 UserOperations, a bundler, gas sponsorship, a router-scoped allowance, an expiry preflight that must fail loudly ([api-spec §2.2](../api-spec.md#22-write-path-basevenue-week-5)). That is the highest-risk code in the build and the only place a key can move funds autonomously. Route B replaces it with an authenticated REST order on a venue we already talk to.
 
 If the goal were purely to ship a working carry with the least chance of losing money to a bug, Route B wins.
 

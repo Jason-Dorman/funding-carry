@@ -279,6 +279,8 @@ stateDiagram-v2
 
 FIX 4.4, 30s heartbeat, file-backed sequence numbers so sessions survive restart, standard resend/gap-fill handling (details and tag dictionary in the [API spec](api-spec.md#4-fix-44-specification)).
 
+The acceptor is one goroutine owning a book of live orders, fed over channels from quickfixgo's connection goroutines — the same shape as `ingest`, and for the same reason: every decision about an order is made in one place, so "what would this order have done" is answered by reading one function rather than by reasoning about locks. The channels are unbuffered on purpose, so a message is accepted by the engine rather than by a buffer, and an order arriving after the engine has stopped is refused rather than stranded. It prices against the last `cb_book_snapshots` row ingest recorded, which is what makes a simulated fill reproducible from the database; the [fill model](api-spec.md#43-sim-venue-fill-model) has the rules. Its book of resting orders is in memory: the session survives a sim-venue restart, the resting orders do not.
+
 ```mermaid
 sequenceDiagram
     participant C as carry (initiator)
@@ -416,12 +418,20 @@ Every backfill in this system follows the same shape, and it is written here rat
 
 | | Recoverable | Why |
 |---|---|---|
-| `cb_bars`, `cb_trades_agg` | Yes | The venue re-serves them. Candles reach back to the contract's launch |
+| `cb_bars` | Yes | Rebuilt from the candles endpoint on every start, back to the contract's launch |
+| `cb_trades_agg` | **Possible, not built** | The venue re-serves trades, but nothing reconstructs this table — the backfill writes `cb_bars` and `funding_events` and nothing else. Marked "Yes" here until 2026-09-16, which was a documented recovery that did not exist. It feeds Tier 2 trade imbalance and sweep intensity |
 | `funding_events` | Derivable | The venue publishes only the *current* rate, but the estimator's inputs are candles ([ADR-0015](decisions/0015-backfilled-funding-provenance.md)) |
 | `cb_venue_state`, `cb_book_snapshots`, `cb_features` | **No** | Self-recorded. The book at a past instant exists nowhere else |
 | `cb_account_state`, `base_state` | **No** | Point-in-time account and wallet state, only from when polling started |
 
-A part that wants a backfill must first place its series in that table. "No" is a legitimate answer and means downtime is permanent loss — which is why the stack is meant to stay up.
+A part that wants a backfill must first place its series in that table. "No" is a legitimate answer and means downtime is permanent loss.
+
+**And downtime is the normal case, not the exception** *(corrected 2026-09-16 — the sentence here previously read "which is why the stack is meant to stay up", which described production infrastructure this system does not have).* v1 runs under Docker Desktop on a development laptop; it records while that laptop is on and Docker is running, and not otherwise. Two consequences follow, and they are the reason this table matters more here than it would in a hosted system:
+
+- **The recoverable half self-heals and needs no attention.** `cb_bars` and the funding series are rebuilt by the gap-driven backfill on every start, for as far back as `BACKFILL_WINDOW` reaches (45 days). A stack that has been off for a week repairs that week by itself. Past the window it cannot, so the window is the real deadline on any outage.
+- **The unrecoverable half accumulates only while the stack runs**, so any criterion phrased in *calendar* days — spec §12 item 4 is the live example — is measuring something this deployment cannot deliver. Coverage, not elapsed time, is the quantity to state and to check.
+
+Live capital changes this, and that is a separate question from recording: what has to be continuously up for an open position is the **risk engine, hard stops and kill switch**, not the recorder. That is an open item, not a decision — see [spec §12](basis-carry-build-spec.md#12-open-items).
 
 **2. Run on every start, and be gap-driven.** Not "on first run": read what is stored, download only the ranges missing from it, and do nothing when nothing is missing. A start with complete history costs one query (~1s observed, against ~70s for an unconditional download of the same window), which is what makes it safe to leave enabled rather than something an operator has to remember. A container down for an hour then recovers that hour by itself.
 
