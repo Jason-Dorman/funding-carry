@@ -7,5 +7,6 @@
 // The decision engine emits intent (TargetPosition) and nothing else: only the
 // risk engine may emit orders.
 //
-// Built in Parts 8 and 12.
+// Part 8 defines the Venue contract (venue.go) and the order id (id.go); Part 12
+// adds the decision engine.
 package carry

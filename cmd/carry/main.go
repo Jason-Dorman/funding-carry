@@ -2,12 +2,16 @@
 // features, judges funding pressure, emits decisions, and — only through the risk
 // engine — emits orders to the configured venues.
 //
-// Part 1 wires the skeleton only: configuration, logging, signal handling and the
-// metrics endpoint. The decision tick is assembled in Parts 9 to 15.
+// Part 1 wired the skeleton: configuration, logging, signal handling and the
+// metrics endpoint. Part 8 adds the order-entry stack — the FIX initiator as
+// the first Venue, and the order-state machine every report flows through —
+// with a temporary command-line trigger to send one order, which Part 15's
+// router replaces. The decision tick is assembled in Parts 9 to 15.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -15,13 +19,12 @@ import (
 	"syscall"
 
 	"github.com/Jason-Dorman/funding-carry/internal/config"
-	"github.com/Jason-Dorman/funding-carry/internal/metrics"
 )
 
 const service = "carry"
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		// Configuration failures happen before there is a logger, so the
 		// last-resort path is stderr.
 		fmt.Fprintf(os.Stderr, "%s: %v\n", service, err)
@@ -29,7 +32,22 @@ func main() {
 	}
 }
 
-func run() error {
+func run(args []string) error {
+	flags := flag.NewFlagSet(service, flag.ContinueOnError)
+	probeSpec := flags.String("probe-order", "", "TEMPORARY (Part 8): send one order to the FIX venue and "+
+		"exit once it is terminal, e.g. side=sell,qty=1,px=2400.00,tif=GTC. Removed by Part 15's router.")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	var probe *probeOrder
+	if *probeSpec != "" {
+		p, err := parseProbe(*probeSpec)
+		if err != nil {
+			return fmt.Errorf("-probe-order: %w", err)
+		}
+		probe = &p
+	}
+
 	cfg, err := config.LoadCarry()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -55,12 +73,14 @@ func run() error {
 		"intraday_margin_opt_in", cfg.Risk.IntradayMarginOptIn,
 		"maintenance_break", cfg.Maintenance.String(),
 		"fix_session", fmt.Sprintf("%s->%s@%s:%d", cfg.FIX.Sender, cfg.FIX.Target, cfg.FIX.Host, cfg.FIX.Port),
+		"fix_store", cfg.FIX.StorePath,
+		"order_timeout", cfg.Execution.OrderTimeout.String(),
+		"probe", probe != nil,
 	)
 
-	if err := metrics.NewServer(cfg.MetricsAddr, log).Serve(ctx); err != nil {
+	if err := trade(ctx, cfg, probe, log); err != nil {
 		return err
 	}
-
 	log.Info("stopped")
 	return nil
 }

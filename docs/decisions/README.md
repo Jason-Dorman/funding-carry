@@ -32,6 +32,7 @@ One short file per decision that shaped the system. ADRs make the build's judgme
 | [0017](0017-hand-rolled-base-rpc.md) | The Base read path is hand-rolled JSON-RPC, not `go-ethereum` | accepted |
 | [0018](0018-base-spot-px-from-the-pool.md) | `base_state.spot_px` is read from the Base pool, with the Coinbase mid as fallback | accepted |
 | [0019](0019-sim-fills-against-recorded-book.md) | sim-venue fills against the recorded book; orders rest, and no market means no fill | accepted |
+| [0020](0020-initiator-delivery-guarantees.md) | The FIX initiator refuses orders while down, never resends one, acknowledges a report only once it is on the channel, keeps cancel rejects out of the report stream; the tracker adopts unknown orders | accepted (amended after the Part 8 review) |
 
 **Decision memos** — analysis prepared for a PO decision, promoted to an ADR once decided:
 

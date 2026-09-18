@@ -7,7 +7,13 @@ require (
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/jackc/pgx-shopspring-decimal v0.0.0-20220624020537-1d36b5a1853e
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/oklog/ulid/v2 v2.1.1
 	github.com/prometheus/client_golang v1.24.1
+	github.com/quickfixgo/enum v0.1.0
+	github.com/quickfixgo/field v0.1.0
+	github.com/quickfixgo/fix44 v0.1.0
+	github.com/quickfixgo/quickfix v0.9.11
+	github.com/quickfixgo/tag v0.1.0
 	github.com/shopspring/decimal v1.4.0
 	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.56.0
@@ -29,11 +35,6 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/quagmt/udecimal v1.8.0 // indirect
-	github.com/quickfixgo/enum v0.1.0 // indirect
-	github.com/quickfixgo/field v0.1.0 // indirect
-	github.com/quickfixgo/fix44 v0.1.0 // indirect
-	github.com/quickfixgo/quickfix v0.9.11 // indirect
-	github.com/quickfixgo/tag v0.1.0 // indirect
 	golang.org/x/mod v0.39.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect

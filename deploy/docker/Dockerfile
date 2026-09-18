@@ -29,8 +29,9 @@ RUN apk add --no-cache ca-certificates
 # Nothing in these binaries needs root.
 RUN adduser -D -u 10001 carry
 
-# sim-venue's FIX sequence store and message log live here, on a volume declared
-# in the Compose file. The directory is created with its ownership set now
+# Each end of the FIX session — sim-venue's acceptor and carry's initiator —
+# keeps its sequence store and message log here, on a volume of its own
+# declared in the Compose file. The directory is created with its ownership set now
 # because a volume mounted onto a path that does not exist is created owned by
 # root, and the unprivileged user below could then not write the sequence numbers
 # the session depends on.

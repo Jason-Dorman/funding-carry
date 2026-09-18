@@ -201,6 +201,17 @@ type TreasuryTimeouts struct {
 	BaseTx     time.Duration // Base tx submitted -> confirmed
 }
 
+// Execution is carry's order-entry configuration.
+//
+// OrderTimeout is the per-order deadline the state machine measures from
+// Submit. An open order past it is overdue: not dead — a resting limit order
+// legitimately outlives any timeout — but something the router has to look at
+// rather than wait on, and on the second leg of an entry the trigger for
+// unwinding the first (architecture section 6.4).
+type Execution struct {
+	OrderTimeout time.Duration
+}
+
 // FillModel is sim-venue's fill behavior (API spec section 4.3).
 //
 // Latency is the delay between an order becoming fillable and the fill printing,
@@ -263,6 +274,7 @@ type Carry struct {
 	Signals         Signals
 	Risk            RiskLimits
 	Treasury        TreasuryTimeouts
+	Execution       Execution
 	FIX             FIXSession
 	Maintenance     MaintenanceWindow
 	Secrets         Secrets
@@ -350,6 +362,9 @@ func loadCarry(lookup lookupFunc) (*Carry, error) {
 			Settlement: l.Duration("TREASURY_SETTLEMENT_TIMEOUT", 2*time.Hour),
 			BaseTx:     l.Duration("TREASURY_BASE_TX_TIMEOUT", 10*time.Minute),
 		},
+		Execution: Execution{
+			OrderTimeout: l.Duration("ORDER_TIMEOUT", defaultOrderTimeout),
+		},
 		FIX:         l.fix(),
 		Maintenance: l.Window("MAINTENANCE_BREAK", defaultMaintenanceBreak),
 		Secrets:     l.secrets(),
@@ -409,6 +424,13 @@ const (
 	// fail to create on an image whose user is not root. Compose mounts a volume
 	// here, which is what carries the sequence numbers across a restart.
 	defaultFIXStorePath = "/var/lib/carry/fix"
+
+	// defaultOrderTimeout is a placeholder, not a measured value: the plan names
+	// a per-order timeout and gives it no number, and this one is a bound on
+	// how long an acknowledged order may go unanswered before the router is
+	// told — long enough for the simulator's jittered latency, short enough to
+	// notice a venue that has stopped answering. Flagged to the PO at Part 8.
+	defaultOrderTimeout = 30 * time.Second
 
 	defaultMaintenanceBreak = "Fri 17:00-18:00 America/New_York"
 	defaultContractSizeETH  = "0.10"

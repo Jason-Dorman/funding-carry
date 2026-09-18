@@ -241,7 +241,7 @@ func TestMessagesAreCounted(t *testing.T) {
 	if got := testutil.CollectAndCount(h.reg, "fix_resend_events_total"); got != 1 {
 		t.Fatalf("fix_resend_events_total has %d series, want 1", got)
 	}
-	if got := testutil.ToFloat64(h.acceptor.sm.resends); got != 1 {
+	if got := testutil.ToFloat64(h.acceptor.counter.sm.resends); got != 1 {
 		t.Errorf("resend events counted %v, want 1", got)
 	}
 }
@@ -250,7 +250,7 @@ func TestMessagesAreCounted(t *testing.T) {
 // catalogue names.
 func (h *acceptorHarness) acceptorMetric(t *testing.T, _, session, msgType, dir string) prometheus.Counter {
 	t.Helper()
-	return h.acceptor.sm.msgs.WithLabelValues(session, msgType, dir)
+	return h.acceptor.counter.sm.msgs.WithLabelValues(session, msgType, dir)
 }
 
 // The store directory is where sequence numbers live, so a path that cannot be

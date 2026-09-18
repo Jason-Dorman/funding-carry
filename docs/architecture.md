@@ -251,12 +251,12 @@ type Venue interface {
 
 | Implementation | Package | Transport | Fills |
 |---|---|---|---|
-| `fixVenue` | `internal/fix` | FIX 4.4 to `sim-venue` | sim fill model (slippage, latency, partials) |
+| `fixVenue` (`fix.Initiator`, Part 8) | `internal/fix` | FIX 4.4 to `sim-venue` | sim fill model (slippage, latency, partials) |
 | `paperVenue` | `internal/exec` | in-process | book-depth fill model, both legs, funding accrual |
 | `cbVenue` (week 5) | `internal/exec` | JWT-signed Advanced Trade REST + WS user channel | real |
 | `baseVenue` (week 5) | `internal/exec` | ERC-4337 UserOps via Alchemy | real (DEX aggregator swap) |
 
-Every implementation feeds the same `ExecReport` channel and the same order state machine, so the router, risk engine, and P&L accounting are identical across paper, sim, and live.
+Every implementation feeds the same `ExecReport` channel and the same order state machine (`exec.Tracker`, one per venue), so the router, risk engine, and P&L accounting are identical across paper, sim, and live. The state machine sequences reports by `CumQty`, recognises the duplicates a resend replays by `ExecID`, and **adopts** a report for an order it was never told about — after a restart every resting order is one of these, because the tracker is memory and the venue's book is not ([API spec §3.2](api-spec.md#32-core-types)).
 
 ### 6.2 Order lifecycle
 
@@ -278,6 +278,8 @@ stateDiagram-v2
 ### 6.3 FIX session (initiator in `carry`, acceptor in `sim-venue`)
 
 FIX 4.4, 30s heartbeat, file-backed sequence numbers so sessions survive restart, standard resend/gap-fill handling (details and tag dictionary in the [API spec](api-spec.md#4-fix-44-specification)).
+
+The initiator (`fix.Initiator`) is carry's `Venue`. `Submit` and `Cancel` run on the caller's goroutine and put a message on the session; reports come back on quickfixgo's goroutine and are handed to the consumer over a buffered channel. Four rules shape it ([ADR-0020](decisions/0020-initiator-delivery-guarantees.md)): it **refuses to submit while the session is down** rather than letting quickfix queue the order into its store, because a queued order executes at a price chosen now whenever the link returns; it **acknowledges a report to the venue only once the report is on the channel** — quickfix increments the inbound sequence number only after the application callback returns, so a report a dying process had not yet handed over is one the venue resends, and the handoff is abandoned only on a timeout, never in a race against a shutdown signal; it **never resends an order**, returning `ErrDoNotSend` for any replay so quickfix gap-fills it, because a venue that has asked for a resend has lost its side of the session and would take a replayed order as a new one; and an OrderCancelReject is **logged and counted, not put on the report channel**, because a cancel that arrived too late is not a state the order can be in. It writes nothing to the database: the venue's own `fills` and `fix_sessions` rows are the record, and carry's writer arrives with the decisions that need one (Part 12).
 
 The acceptor is one goroutine owning a book of live orders, fed over channels from quickfixgo's connection goroutines — the same shape as `ingest`, and for the same reason: every decision about an order is made in one place, so "what would this order have done" is answered by reading one function rather than by reasoning about locks. The channels are unbuffered on purpose, so a message is accepted by the engine rather than by a buffer, and an order arriving after the engine has stopped is refused rather than stranded. It prices against the last `cb_book_snapshots` row ingest recorded, which is what makes a simulated fill reproducible from the database; the [fill model](api-spec.md#43-sim-venue-fill-model) has the rules. Its book of resting orders is in memory: the session survives a sim-venue restart, the resting orders do not.
 

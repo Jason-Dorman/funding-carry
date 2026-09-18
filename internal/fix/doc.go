@@ -13,5 +13,12 @@
 // restart with resend recovery intact is the point of having a real FIX session
 // rather than a REST client.
 //
-// The initiator half is Part 8.
+// The initiator (Part 8) is carry's Venue: Order to NewOrderSingle,
+// ExecutionReport to ExecReport, over the same session settings from the
+// other side. It refuses to submit while the session is down, acknowledges a
+// report to the venue only once the consumer has taken it, and keeps a cancel
+// reject out of the report stream (ADR-0020). Both ends count messages and
+// sequence numbers the same way, through one counter, and both tee quickfix's
+// event log into the binary's structured log so the reason a session is not
+// up is where an operator looks.
 package fix

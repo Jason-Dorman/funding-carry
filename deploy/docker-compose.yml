@@ -85,6 +85,13 @@ services:
         SERVICE: carry
     ports:
       - "127.0.0.1:9102:9102"
+    volumes:
+      # carry's end of the FIX session: its sequence-number store and message
+      # log, on a volume of its own for the same reason sim-venue's is. The two
+      # ends must not share one — each side keeps its own numbers — so this is
+      # a second volume at the same in-container path, not the same volume
+      # mounted twice.
+      - carry-fix-store:/var/lib/carry/fix
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9102/healthz || exit 1"]
       <<: *health-defaults
@@ -186,6 +193,7 @@ services:
 volumes:
   timescale-data:
   fix-store:
+  carry-fix-store:
   prometheus-data:
   alertmanager-data:
   grafana-data:

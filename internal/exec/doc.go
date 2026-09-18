@@ -5,5 +5,8 @@
 // Every venue feeds the same ExecReport stream and the same state machine, so
 // paper, sim and live accounting are identical by construction.
 //
-// Built in Parts 8, 14, 15, 16 and 17.
+// Part 8 builds the state machine (statemachine.go): one Tracker per venue,
+// fed every ExecReport that venue emits, sequencing them by CumQty and
+// recognising the duplicates a FIX resend produces. Parts 14 to 17 add the
+// router and the other venues.
 package exec

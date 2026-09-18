@@ -63,7 +63,7 @@ type Acceptor struct {
 	storeRoot string
 	engine    *engine
 	sessions  *sessionRecorder
-	sm        *SessionMetrics
+	counter   *msgCounter
 	log       *slog.Logger
 	now       func() time.Time
 }
@@ -85,6 +85,7 @@ func NewAcceptor(opts Options, books BookSource, sink Sink, m *Metrics, log *slo
 	}
 
 	log = log.With("component", "sim_venue")
+	counter := newMsgCounter(m.session(sessionID.String()), log)
 	return &Acceptor{
 		sessionID: sessionID,
 		settings:  settings,
@@ -96,8 +97,8 @@ func NewAcceptor(opts Options, books BookSource, sink Sink, m *Metrics, log *slo
 			Now:     now,
 			Wait:    opts.Wait,
 		}, books, sink, fixSender{}, m, log),
-		sessions: newSessionRecorder(sink, log, now),
-		sm:       m.session(sessionID.String()),
+		sessions: newSessionRecorder(sink, log, now, counter.sequenceNumbers),
+		counter:  counter,
 		log:      log,
 		now:      now,
 	}, nil
@@ -114,10 +115,11 @@ func (a *Acceptor) Run(ctx context.Context) error {
 		}
 	}
 
-	logFactory, err := filelog.NewLogFactory(a.settings)
+	fileLog, err := filelog.NewLogFactory(a.settings)
 	if err != nil {
 		return fmt.Errorf("fix log factory: %w", err)
 	}
+	logFactory := newTeeLogFactory(fileLog, a.log)
 
 	acceptor, err := quickfix.NewAcceptor(a, filestore.NewStoreFactory(a.settings), a.settings, logFactory)
 	if err != nil {
@@ -213,35 +215,35 @@ func (a *Acceptor) OnCreate(sessionID quickfix.SessionID) {
 
 // OnLogon opens the session's record and lights fix_session_up.
 func (a *Acceptor) OnLogon(sessionID quickfix.SessionID) {
-	a.sm.loggedOn()
+	a.counter.sm.loggedOn()
 	a.sessions.logon(sessionID)
 }
 
-// OnLogout closes the record with the sequence numbers the store reached. It
+// OnLogout closes the record with the sequence numbers the session reached. It
 // fires during shutdown too, which is why the record is written on a context the
 // cancellation cannot reach.
 func (a *Acceptor) OnLogout(sessionID quickfix.SessionID) {
-	a.sm.loggedOff()
+	a.counter.sm.loggedOff()
 	a.sessions.logout(sessionID)
 }
 
 // ToAdmin counts an outbound session message. The simulator never edits one:
 // logons, heartbeats and resends are quickfix's business.
 func (a *Acceptor) ToAdmin(msg *quickfix.Message, _ quickfix.SessionID) {
-	a.count(msg, dirOut)
+	a.counter.count(msg, dirOut)
 }
 
 // ToApp counts an outbound application message — every ExecutionReport and
 // OrderCancelReject the engine sends passes through here.
 func (a *Acceptor) ToApp(msg *quickfix.Message, _ quickfix.SessionID) error {
-	a.count(msg, dirOut)
+	a.counter.count(msg, dirOut)
 	return nil
 }
 
 // FromAdmin counts an inbound session message and notices ResendRequests, which
 // are sequence recoveries in progress.
 func (a *Acceptor) FromAdmin(msg *quickfix.Message, _ quickfix.SessionID) quickfix.MessageRejectError {
-	a.count(msg, dirIn)
+	a.counter.count(msg, dirIn)
 	return nil
 }
 
@@ -249,7 +251,7 @@ func (a *Acceptor) FromAdmin(msg *quickfix.Message, _ quickfix.SessionID) quickf
 // else is a business reject rather than silence: API spec section 4.2 is
 // explicit that a message this venue cannot process is surfaced, never dropped.
 func (a *Acceptor) FromApp(msg *quickfix.Message, sessionID quickfix.SessionID) quickfix.MessageRejectError {
-	a.count(msg, dirIn)
+	a.counter.count(msg, dirIn)
 
 	at := a.now()
 	switch {
@@ -266,6 +268,18 @@ func (a *Acceptor) FromApp(msg *quickfix.Message, sessionID quickfix.SessionID) 
 			return err
 		}
 		return a.deliver(a.engine.requestCancel(c))
+
+	case msg.IsMsgTypeOf(msgTypeBusinessReject):
+		// Never answered with a reject of our own, for the same reason the
+		// initiator does not: a BusinessMessageReject is itself an application
+		// message, and both ends refuse unrouted application messages this way.
+		// Rejecting it would have the two engines rejecting each other's
+		// rejects until the connection died, burning a sequence number per
+		// round trip. Found by the Part 8 adversarial review, which reached it
+		// through this venue's own refusal of an order that arrives after the
+		// engine has stopped.
+		a.log.Warn("business message rejected by the client", businessRejectDetail(msg)...)
+		return nil
 
 	default:
 		return quickfix.UnsupportedMessageType()
@@ -285,60 +299,3 @@ func (a *Acceptor) deliver(err error) quickfix.MessageRejectError {
 
 // applicationNotAvailable is BusinessRejectReason 4.
 const applicationNotAvailable = 4
-
-// FIX MsgTypes this package names.
-const (
-	msgTypeNewOrderSingle     = "D"
-	msgTypeOrderCancelRequest = "F"
-	msgTypeResendRequest      = "2"
-	msgTypeSequenceReset      = "4"
-	msgTypeOrderCancelReject  = "9"
-	msgTypeLogon              = "A"
-	msgTypeUnknown            = "unknown"
-	msgTypeOther              = "other"
-)
-
-// countedMsgTypes is the label vocabulary of fix_msgs_total.
-//
-// The MsgType comes off the wire, and API spec section 6 requires these labels
-// stay low-cardinality. No data dictionary is configured, so tag 35 reaches this
-// code as whatever the client put there: an unfiltered label would let one
-// buggy — or hostile — client on the FIX port mint a new Prometheus time series
-// per message and take the metrics endpoint down with it. Anything outside the
-// set this venue actually speaks is counted as "other", which preserves the
-// signal an operator needs (something is arriving that we do not handle) without
-// the cardinality. Found by the Part 7 adversarial review.
-var countedMsgTypes = map[string]bool{
-	"0": true, // Heartbeat
-	"1": true, // TestRequest
-	"2": true, // ResendRequest
-	"3": true, // Reject
-	"4": true, // SequenceReset
-	"5": true, // Logout
-	"A": true, // Logon
-	"8": true, // ExecutionReport
-	"9": true, // OrderCancelReject
-	"D": true, // NewOrderSingle
-	"F": true, // OrderCancelRequest
-	"j": true, // BusinessMessageReject
-}
-
-// count records one message in one direction, and notices the one admin message
-// that means something operationally: a ResendRequest is a sequence recovery in
-// progress, which is the event the file-backed store exists to make possible.
-func (a *Acceptor) count(msg *quickfix.Message, dir string) {
-	msgType, err := msg.MsgType()
-	switch {
-	case err != nil:
-		// A message whose own type could not be read still happened, and a
-		// counter that skipped it would make the gap invisible.
-		msgType = msgTypeUnknown
-	case !countedMsgTypes[msgType]:
-		msgType = msgTypeOther
-	}
-	a.sm.message(msgType, dir)
-	if msgType == msgTypeResendRequest {
-		a.sm.resend()
-		a.log.Info("sequence recovery", "dir", dir, "session", a.sessionID.String())
-	}
-}
