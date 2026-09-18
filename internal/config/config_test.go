@@ -155,6 +155,9 @@ func TestLoadCarryDefaults(t *testing.T) {
 	if got, want := cfg.Treasury.Sweep, 24*time.Hour; got != want {
 		t.Errorf("Treasury.Sweep = %v, want %v", got, want)
 	}
+	if got, want := cfg.Execution.OrderTimeout, 30*time.Second; got != want {
+		t.Errorf("Execution.OrderTimeout = %v, want %v", got, want)
+	}
 	if got, want := cfg.Risk.StaleFeed, 60*time.Second; got != want {
 		t.Errorf("Risk.StaleFeed = %v, want %v", got, want)
 	}

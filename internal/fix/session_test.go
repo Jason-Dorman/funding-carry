@@ -5,7 +5,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/quickfixgo/field"
+	"github.com/quickfixgo/fix44/heartbeat"
 	"github.com/quickfixgo/quickfix"
+	"github.com/quickfixgo/tag"
 )
 
 // errWriterGone stands in for the writer having stopped.
@@ -25,7 +29,7 @@ func TestALiveSessionIsRecordedWithNoEnd(t *testing.T) {
 
 	sink := &fakeSink{}
 	clock := newClock(epoch)
-	r := newSessionRecorder(sink, testLogger(), clock.now)
+	r := newSessionRecorder(sink, testLogger(), clock.now, noSeqs)
 
 	r.logon(testSessionID())
 
@@ -56,7 +60,7 @@ func TestLogoutRewritesTheSameRow(t *testing.T) {
 
 	sink := &fakeSink{}
 	clock := newClock(epoch)
-	r := newSessionRecorder(sink, testLogger(), clock.now)
+	r := newSessionRecorder(sink, testLogger(), clock.now, noSeqs)
 
 	r.logon(testSessionID())
 	clock.advance(90 * time.Minute)
@@ -79,17 +83,41 @@ func TestLogoutRewritesTheSameRow(t *testing.T) {
 	}
 }
 
-// Sequence numbers come from quickfix's own store. For a session that was never
-// registered — or one that never exchanged a message — there is no last-used
-// number, and the columns stay NULL rather than claiming a message that never
-// existed.
-func TestSequenceNumbersAreNullWhenThereAreNone(t *testing.T) {
+// noSeqs is a session that has exchanged nothing.
+func noSeqs() (in, out *int32) { return nil, nil }
+
+// Sequence numbers are read off the messages that pass through the counter,
+// never from quickfix's store (which is unsynchronised against a concurrent
+// send). A direction nothing has travelled in is NULL rather than a claim
+// about a message that never existed; a resend replaying earlier numbers
+// does not move the number backwards.
+func TestSequenceNumbersFollowTheMessages(t *testing.T) {
 	t.Parallel()
 
-	in, out := sequenceNumbers(testSessionID())
-	if in != nil || out != nil {
-		t.Errorf("last_in_seq %v last_out_seq %v, want NULL on both", in, out)
+	c := newMsgCounter(NewSessionCatalogue(prometheus.NewRegistry()).session("s"), testLogger())
+	if in, out := c.sequenceNumbers(); in != nil || out != nil {
+		t.Errorf("last_in_seq %v last_out_seq %v before any message, want NULL on both", in, out)
 	}
+
+	c.count(numbered(7), dirIn)
+	c.count(numbered(3), dirOut)
+	c.count(numbered(4), dirOut)
+	in, out := c.sequenceNumbers()
+	if in == nil || *in != 7 || out == nil || *out != 4 {
+		t.Fatalf("last_in_seq %v last_out_seq %v, want 7 and 4", seqValue(in), seqValue(out))
+	}
+
+	// A replay of an earlier outbound message, as a resend produces.
+	c.count(numbered(2), dirOut)
+	if _, out := c.sequenceNumbers(); out == nil || *out != 4 {
+		t.Errorf("last_out_seq %v after a replayed 2, want still 4", seqValue(out))
+	}
+}
+
+func numbered(seq int) *quickfix.Message {
+	msg := heartbeat.New().ToMessage()
+	msg.Header.SetField(tag.MsgSeqNum, field.NewMsgSeqNum(seq))
+	return msg
 }
 
 // A logout with no logon before it happens when a connection is refused at the
@@ -100,7 +128,7 @@ func TestALogoutWithoutALogonIsItsOwnRow(t *testing.T) {
 
 	sink := &fakeSink{}
 	clock := newClock(epoch)
-	r := newSessionRecorder(sink, testLogger(), clock.now)
+	r := newSessionRecorder(sink, testLogger(), clock.now, noSeqs)
 
 	r.logout(testSessionID())
 
@@ -128,7 +156,7 @@ func TestAFlappingSessionIsOneRowWithARisingCount(t *testing.T) {
 
 	sink := &fakeSink{}
 	clock := newClock(epoch)
-	r := newSessionRecorder(sink, testLogger(), clock.now)
+	r := newSessionRecorder(sink, testLogger(), clock.now, noSeqs)
 
 	for range 3 {
 		r.logon(testSessionID())
@@ -157,7 +185,7 @@ func TestAReconnectReopensTheRow(t *testing.T) {
 
 	sink := &fakeSink{}
 	clock := newClock(epoch)
-	r := newSessionRecorder(sink, testLogger(), clock.now)
+	r := newSessionRecorder(sink, testLogger(), clock.now, noSeqs)
 
 	r.logon(testSessionID())
 	clock.advance(time.Minute)
@@ -184,7 +212,7 @@ func TestASessionRecordFailureIsNotFatal(t *testing.T) {
 
 	sink := &fakeSink{}
 	sink.stop(errWriterGone)
-	r := newSessionRecorder(sink, testLogger(), newClock(epoch).now)
+	r := newSessionRecorder(sink, testLogger(), newClock(epoch).now, noSeqs)
 
 	r.logon(testSessionID())
 	r.logout(testSessionID())

@@ -134,11 +134,16 @@ type Venue interface {
 }
 ```
 
-Implementations: `fixVenue`, `paperVenue`, `cbVenue` (week 5), `baseVenue` (week 5). See [architecture §6](architecture.md#6-execution-architecture).
+Implementations: `fixVenue` (`fix.Initiator`, Part 8), `paperVenue`, `cbVenue` (week 5), `baseVenue` (week 5). See [architecture §6](architecture.md#6-execution-architecture).
+
+**The contract behind the three methods** ([ADR-0020](decisions/0020-initiator-delivery-guarantees.md)). `Submit` and `Cancel` return once the message is with the venue; an error means nothing was sent, so the caller never has to wonder. Both refuse with `ErrSessionDown` while the venue is unreachable rather than queueing — an order queued into a dead link would execute at a price chosen now whenever the link came back. `ExecReports()` is drained by the caller until the venue closes it, which it does only after logging out.
+
+**How far the delivery guarantee reaches, exactly.** A report is acknowledged to the venue only once it has been **handed to the channel** — not once the consumer has processed it. So a report still in flight when a process dies is one the venue must resend, while a report sitting in the channel's buffer has already been acknowledged and will not be. The buffer is therefore the size of what a `kill -9` can destroy; `internal/fix` sets it to 256 and records that as a chosen number rather than a measured one. Handing over never *drops* a report to make progress: abandonment is a timeout on a consumer that has stopped draining, never a race against a shutdown signal ([ADR-0020](decisions/0020-initiator-delivery-guarantees.md)). The `Ack` says the venue *has* the order; acceptance is the first `ExecReport`.
 
 ### 3.2 Core types
 
 ```go
+type OrderID string    // client-assigned ULID, minted by carry.NewOrderID — never by a venue
 type Leg string        // "spot" | "perp"
 type Side string       // "buy" | "sell"
 type OrdType string    // "limit" | "market"  (market ⇒ IOC limit at protected px)
@@ -167,6 +172,7 @@ type ExecState string  // "NEW" | "PARTIAL" | "FILLED" | "CANCELED" | "REJECTED"
 type ExecReport struct {
     ClOrdID   OrderID
     VenueID   string
+    ExecID    string          // venue's id for this report (FIX tag 17), unique per report; fills.venue_exec_id
     State     ExecState
     LastQty   decimal.Decimal // this fill
     LastPx    decimal.Decimal
@@ -180,6 +186,28 @@ type ExecReport struct {
 ```
 
 State machine (enforced in one place, `internal/exec`): `NEW → PARTIAL* → FILLED | CANCELED | REJECTED`. Out-of-order reports are sequenced by `CumQty` monotonicity; duplicates are idempotent.
+
+`ExecID` was added at Part 8 and is the one field here the earlier draft lacked. It is what makes a replayed report — a FIX resend after a reconnect — a recognisable duplicate rather than a second fill, and it is the `fills.venue_exec_id` that §5.3 requires every venue to supply; without it the schema's identity for a fill had no source in the type that carries one.
+
+**What the state machine does with a report** (`exec.Tracker`, one per venue). Every report is answered with an *outcome*, and the outcomes are counted (`carry_exec_reports_total`), because "the duplicates were recognised" is the evidence that a reconnect lost nothing:
+
+| Outcome | Meaning |
+|---|---|
+| `applied` | moved the order to the state reported |
+| `adopted` | applied, for an order the tracker had not been told about. After a restart every resting order is one of these — the tracker is memory, the venue's book is not, and a report for an order a previous process placed is a fact about a real order |
+
+| `duplicate` | already applied: the same `ExecID`, or the same state at the same `CumQty`. A resend produces these by design |
+| `stale` | describes less progress than is known (a `NEW` after a partial, a partial below the current `CumQty`); the order stays put |
+| `late` | a non-duplicate after the order ended |
+| `invalid` | the order cannot have produced it — more filled than ordered, a partial that moved nothing, a `FILLED` with quantity left, a cancel losing a fill, an unknown state. The order stays put and the report is logged in full: this is the one outcome that is not a protocol artefact |
+
+A report is also refused as `invalid` when its `OrdStatus` is one the system has no state for (pending cancel, expired, suspended); it is rejected back to the venue by tag rather than folded into the nearest state.
+
+**What an adopted order does not know, and what follows from that.** An adopted order has no `Order` and no `Ack`, so its quantity is unknown and its `SubmittedAt` is a report's own time. Two things follow, and both are properties a caller can rely on rather than accidents: the "more filled than ordered" guards do not apply to it (there is no ordered quantity to exceed), and it contributes **no** sample to `carry_order_roundtrip_seconds` — it has no acknowledgement, so it has no round trip, and observing the zero its two identical timestamps produce would file every restart recovery into the fastest bucket in the histogram. `Status.Adopted` says which kind of order a caller is holding. If the submitter catches up — `Track` called for a ClOrdID already adopted, which is the ordinary outcome of a venue acknowledgement beating the caller's next statement — the tracker **completes** the order rather than refusing it: the ordered quantity and the true submit time are filled in, the guards become live, and a round trip skipped at adoption is observed then.
+
+**Terminal reports are bounded like every other.** A `CANCELED` or a `REJECTED` states the quantity filled before it took effect, and that quantity can be neither less than what is already known filled nor more than was ordered; a report outside those bounds is `invalid` and moves nothing. `REJECTED` used to skip both checks, so a venue could drive an order terminal with any quantity at all while the identical numbers on a `CANCELED` were refused — in the one layer whose documented job is catching a venue whose reports disagree with themselves.
+
+**Per-order timeout.** Each tracked order carries a deadline, `Ack.At + ORDER_TIMEOUT` (§7). An open order past it is *overdue*: not dead — a resting limit order legitimately outlives any timeout — but something the router acts on rather than waits on, and on the second leg of an entry the trigger for unwinding the first ([architecture §6.4](architecture.md#64-live-carry-entry-week-5)). The tracker answers `Overdue(now)`; what to do about it is the router's and the risk engine's.
 
 ### 3.3 Decision output
 
@@ -264,7 +292,10 @@ Initiator: `carry` (`internal/fix`). Acceptor: `sim-venue` (later optionally a C
 | Resend | standard ResendRequest / SequenceReset-GapFill handling |
 | ResetOnLogon / ResetOnLogout / ResetOnDisconnect | **N**, all three set explicitly — sequence continuity is the point, and each defaults to N already: a default is not a decision, and a session that quietly renumbered itself would look healthy until a resend recovered the wrong messages |
 | StartTime / EndTime | **unset.** A session with no time range never rolls and never resets its sequence numbers. The venue trades around the clock apart from the weekly break, and that break is a trading rule the decision engine applies, not a reason to renumber |
-| Logs | quickfixgo FileLog under `FIX_STORE_PATH/log`, retained for demo/replay |
+| ReconnectInterval | 5 s (initiator) — the library's thirty is a long time to refuse orders after the venue comes back |
+| Logs | quickfixgo FileLog under `FIX_STORE_PATH/log`, retained for demo/replay. Both ends also **tee quickfix's event log into their structured log** (messages stay in the file): the first live contact between carry and sim-venue was refused with `MsgSeqNum too low, expecting 31 but received 6`, a Logout quickfix handles itself while the initiator is still waiting for its own Logon — it never reaches the application, and the only line explaining a session that logged out every five seconds was in a file inside the container |
+
+**A store is reset on both ends or on neither.** The two ends keep their own numbers (two Compose volumes, `fix-store` and `carry-fix-store`), and a session whose stores disagree never logs on: the side that is behind is refused as too low, reconnects on the interval, and consumes a new outbound sequence number every attempt. That is FIX working as designed, and it is what the Part 8 live run hit first — sim-venue's volume still held the Part 7 scripted client's position. The remedy is operational: stop both, remove both volumes, start both.
 
 ### 4.2 Messages
 
@@ -281,6 +312,8 @@ Initiator: `carry` (`internal/fix`). Acceptor: `sim-venue` (later optionally a C
 | 59 | TimeInForce | 1=GTC, 3=IOC. Conditionally required in FIX, so an absent tag is Day — which the simulator does not honour and refuses by name rather than treating as one of the two it does |
 | 60 | TransactTime | UTC |
 
+**`Order` → NewOrderSingle** (`internal/fix`, initiator side). `ClOrdID` is the caller's ULID. Both order types go out as `40=2`: a `Market` order is an IOC limit at the caller's `LimitPx` (§3.2), so the venue never sees an unpriced order from this system. `GTC`→`59=1`, `IOC`→`59=3`. Everything else is **refused before any I/O**, with `ErrUnsupportedOrder` and the reason: the spot leg (this session trades the perp only), a fractional or non-positive contract count (never rounded — the venue refuses a fraction too, but refusing here means no message, no sequence number and no reject to reconcile), a non-positive price, `ALO` (FIX 4.4 carries post-only as an `ExecInst` the simulator does not honour, and an ALO worked as a GTC would take the liquidity it was told not to), and a reused `ClOrdID`. `ReduceOnly` is not carried: FIX 4.4 has no standard tag for it and the simulator has no position to reduce; the router enforces reduce-only by what it asks for, not by a flag a venue might ignore.
+
 **ExecutionReport (35=8)** — sim-venue → carry
 
 | Tag | Field | Use |
@@ -295,9 +328,15 @@ Initiator: `carry` (`internal/fix`). Acceptor: `sim-venue` (later optionally a C
 | 6 | AvgPx | average |
 | 58 | Text | reject reason |
 
-**OrderCancelRequest (35=F):** 41 OrigClOrdID, 11 new ClOrdID, 55, 54, 60. Answered by ExecutionReport (4) or OrderCancelReject (35=9, tag 102 reason).
+**An order is never resent.** quickfix answers a ResendRequest by calling `ToApp` a second time with `PossDupFlag` set; the initiator returns `ErrDoNotSend` there, so the message is **gap-filled** instead of replayed. This is not a refinement — sim-venue keeps its book of live orders in memory and has no ClOrdID history across a restart, so a replayed `NewOrderSingle` is accepted as a brand-new order and filled a second time: a real position the client believes it already closed. The reachable trigger is one end's store being reset and not the other's. A gap fill tells the venue the sequence number was used and nothing more, which is exactly true — whatever that order was, it is no longer an instruction this process stands behind.
 
-**Reject (35=3):** 45 RefSeqNum, 371 RefTagID, 372 RefMsgType, 373 SessionRejectReason — surfaced as a metric and log, never silently dropped.
+**A BusinessMessageReject (35=j) is never answered with another.** Both ends refuse an unrouted application message with a 35=j, and a 35=j is itself an application message; answering one with another has the two engines rejecting each other's rejects until the connection dies, a sequence number per round trip. Both ends log it and accept it instead.
+
+**ExecutionReport → `ExecReport`** (initiator side). `OrdStatus` → `State` (0/1/2/4/8 → NEW/PARTIAL/FILLED/CANCELED/REJECTED; any other status is refused back to the venue as a Reject on tag 39). The report is filed under the **order's own** id — `OrigClOrdID` when present, so a cancel's acknowledgement lands on the order it withdrew rather than on the cancel request. `LastQty`/`LastPx` are read only when present (a `NEW` carries neither); `Text` → `Reason`; `TransactTime` → `At` (on a resent report it is the time of the original event, which is what the round trip and the fills row want), the clock when absent. `Fee` stays zero: the simulator sends no Commission tag and a live FIX venue's fee reporting is a Part 21 question.
+
+**OrderCancelRequest (35=F):** 41 OrigClOrdID, 11 new ClOrdID, 55, 54, 60. Answered by ExecutionReport (4) or OrderCancelReject (35=9, tag 102 reason). The initiator mints the request's own ClOrdID (a ULID) and repeats the order's symbol and side from its submission, which is why `Cancel` refuses with `ErrUnknownOrder` for an id this process did not submit — an order left resting by a previous run is the router's to reload (Part 15). **An OrderCancelReject is logged and counted, and does not move the order** ([ADR-0020](decisions/0020-initiator-delivery-guarantees.md)): a cancel that arrived too late is not a state the order can be in, and the `FILLED` that beat it is the truth.
+
+**Reject (35=3):** 45 RefSeqNum, 371 RefTagID, 372 RefMsgType, 373 SessionRejectReason — surfaced as a metric and log, never silently dropped. The initiator logs every field of one it receives, and a Logout carrying text (`58`) likewise.
 
 **Which refusal is which.** A message that cannot be *read* is a session-level Reject (35=3) naming the tag: a missing ClOrdID, a Side outside the enumeration, a price that is not a number. A well-formed order this venue will not *take* is an ExecutionReport with ExecType/OrdStatus = 8 and the reason in Text (58), so the client sees it against its own order id. The split matters because the two are different problems — the first is a client that cannot speak FIX, the second is a client asking for something real. sim-venue's business rejections are: an unknown symbol, a non-limit OrdType, an unsupported TimeInForce, a quantity that is not a positive whole number of contracts, a non-positive price, a reused ClOrdID, and no fresh market data (below). A message type the venue does not handle at all is a BusinessMessageReject (35=j), never silence.
 
@@ -477,6 +516,8 @@ fix_sessions (id PK, session_id text, started_at, ended_at,
               last_in_seq int, last_out_seq int, disconnects int)
 ```
 
+**`fix_sessions.last_in_seq` / `last_out_seq` are what the session's own messages carried**, not what quickfixgo's store holds. Part 8 moved the read: the recorder counts the highest `MsgSeqNum` seen in each direction as messages pass through the application callbacks, because reading quickfix's store from the session goroutine races the engine goroutine writing it (a data race the Part 8 review's tests exposed in Part 7 code). In an ordinary session the two agree — quickfix numbers an outbound message before the application sees it, and an inbound message reaches the application only after its number is checked. They diverge in one case worth knowing: a message the session **refuses**, such as a Logon whose sequence number is too low, is counted before it is rejected, so a row can report an inbound number the session never accepted. A refused Logon is exactly the state in which `fix_session_up` is 0, so the two read together.
+
 Conventions: `positions.venue` separates paper/sim/live P&L buckets; `funding_events` doubles as the observed funding series (position_id NULL) and per-position ledger.
 
 **Both sides of funding are rows.** `kind='ACCRUAL'` rows are what the system computed hourly; `kind='SETTLEMENT'` rows are cash adjustments actually observed on the account, twice daily. An accrual points at the settlement that cleared it via `settled_by` (NULL while pending), `positions.settlement_pending_funding` carries the unsettled sum, and the difference between matched accruals and their settlement is exactly what `carry_funding_reconciliation_error` measures. Storing only one side would make the reconciliation unfalsifiable.
@@ -531,7 +572,9 @@ Three obligations come with that table, and none of them is enforceable by the s
 
 ## 6. Prometheus metrics
 
-All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-cardinality (`product`, `stream`, `venue`, `leg`, `component`).
+All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-cardinality (`product`, `stream`, `venue`, `leg`, `component`, `outcome`, `msg_type`, `dir`, `session`).
+
+One of those is not like the others: **`msg_type` takes its value straight off the wire**, so it is the only label in this catalogue that needs a mechanism rather than a convention to stay bounded. FIX tag 35 is whatever the peer put there and no data dictionary is configured, so an unfiltered label would let one buggy — or hostile — client on the FIX port mint a Prometheus series per message. The counter therefore folds anything outside the twelve message types this system speaks (`0 1 2 3 4 5 8 9 A D F j`) into **`other`**, and a message whose own type could not be read into **`unknown`**. The two are different problems and are counted apart: `other` is something arriving that we do not handle, `unknown` is something we could not parse at all.
 
 The four writer metrics (`rows_written_total`, `rows_conflicted_total`, `write_batch_seconds`, `write_queue_depth`) come from shared code in `internal/db` and take the prefix of whichever binary owns that writer, so `carry_rows_written_total` and `simv_rows_written_total` exist alongside the `ingest_` ones listed below. "Is this binary keeping up with its writes?" is a per-binary question. `rows_written_total` and `rows_conflicted_total` are deliberately separate: with `ON CONFLICT` on every insert, a re-sent batch is silent in every other signal, and a single counter adding the two together would report a retry storm as healthy throughput.
 
@@ -568,12 +611,13 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `carry_account_margin_ratio` | gauge | — | from `cb_account_state`, polled |
 | `carry_pnl_usd` | gauge | venue, component=price\|funding\|fees\|slippage | P&L decomposition |
 | `carry_decision_state` | gauge | — | enum-coded decision state |
-| `carry_order_roundtrip_seconds` | histogram | venue | submit → terminal ExecReport |
+| `carry_order_roundtrip_seconds` | histogram | venue | submit → terminal ExecReport: from `Ack.At` to the terminal report's venue time. Observed once per order, on the terminal report; a resting order that waited an hour lands in the +Inf bucket, which is the right place for it. **An adopted order contributes nothing** (§3.2) — it has no acknowledgement, so it has no round trip, and the zero it would otherwise report would make a restart recovery read as the fastest execution the system has ever done |
+| `carry_exec_reports_total` | counter | venue, outcome | ExecReports by what the state machine did with them (§3.2): `applied`, `adopted`, `duplicate`, `stale`, `late`, `invalid`. All six initialized. `duplicate` rising after a reconnect is the resend recovery doing its job; `stale`, `late` and `invalid` are a venue whose reports disagree with themselves |
 | `carry_hard_stops_total` | counter | kind | hard-stop firings |
 | `carry_kill_switch_engaged` | gauge | — | 0/1 |
 | `carry_session_key_expiry_timestamp_seconds` | gauge | — | unix ts of session-key expiry |
 | `fix_session_up` | gauge | session | 0/1. Created at zero before anything connects: `FixSessionDown` is `fix_session_up == 0`, and PromQL over a series that does not exist yields nothing rather than firing |
-| `fix_msgs_total` | counter | session, msg_type, dir | message counts. `dir` is `in`/`out`; a message whose own MsgType could not be read is counted as `unknown` rather than skipped |
+| `fix_msgs_total` | counter | session, msg_type, dir | message counts. `dir` is `in`/`out`. `msg_type` is folded to the bounded vocabulary described above: the twelve types this system speaks, plus `other` for a type it does not handle and `unknown` for a message whose own MsgType could not be read. Nothing is skipped |
 | `fix_resend_events_total` | counter | session | sequence recoveries: ResendRequests seen on the session, either direction |
 | `simv_orders_total` | counter | result | orders by outcome — `accepted`, `rejected` (refused at entry), `filled`, `canceled`. All four initialized, so a rejection path that has never fired is a visible zero |
 | `simv_book_age_seconds` | gauge | — | age of the top-of-book the fill model last priced against. Past `SIM_BOOK_MAX_AGE_SECS` the simulator refuses orders, so this is the series that explains a venue rejecting everything |
@@ -630,7 +674,8 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `SPREAD_MAX_BPS`, `STALE_FEED_SECS` | carry | 5 / 60 |
 | `PRESSURE_WEIGHTS` | carry | `0.5,0.3,0.2` *(placeholder)* |
 | `FIX_SENDER`, `FIX_TARGET`, `FIX_HOST`, `FIX_PORT` | carry, sim-venue | `CARRY` / `SIMV` / `sim-venue` / 5001 — named from the initiator's point of view; §4.1 on which is which for the acceptor |
-| `FIX_STORE_PATH` | sim-venue *(carry from Part 8)* | `/var/lib/carry/fix` — quickfixgo's sequence store and message log (one subdirectory each). A Compose volume on the `sim-venue` service; **carry has no FIX code and no volume yet**, and Part 8 must add one when it gains the initiator, or its sequence numbers will be as ephemeral as its container. `ResetOnLogon` is off, so a store that did not survive a restart would give a session that silently renumbered itself |
+| `ORDER_TIMEOUT` | carry | `30s` *(placeholder — a PO decision is pending; the plan names a per-order timeout and gives it no value, Part 8)* — the per-order deadline the state machine measures from `Submit` (§3.2). An open order past it is overdue, which is a question for the router rather than an action the tracker takes |
+| `FIX_STORE_PATH` | carry, sim-venue | `/var/lib/carry/fix` — quickfixgo's sequence store and message log (one subdirectory each). A Compose volume on **each** service (`fix-store` for sim-venue, `carry-fix-store` for carry): the two ends keep their own numbers and must never share one. `ResetOnLogon` is off, so a store that did not survive a restart would give a session that silently renumbered itself — and a store reset on one end only gives a session that never logs on (§4.1) |
 | `SIM_LATENCY_MS`, `SIM_SLIPPAGE_BPS` | sim-venue | 20 / 2 — latency jittered over [half, one and a half]; slippage always adverse and never through the limit |
 | `SIM_PARTIAL_THRESHOLD`, `SIM_PARTIAL_SLICES` | sim-venue | 10 / 3 — an order above the threshold prints in this many reports, whole contracts, summing to the order |
 | `SIM_BOOK_POLL_SECS`, `SIM_BOOK_MAX_AGE_SECS` | sim-venue | 1 / 60 — how often the recorded top-of-book is re-read, and how old it may be before orders are refused rather than filled at a price the market has left behind |

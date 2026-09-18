@@ -1,15 +1,11 @@
 package fix
 
 import (
-	"context"
-	"fmt"
-	"net"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/quickfixgo/enum"
 	"github.com/quickfixgo/field"
 	"github.com/quickfixgo/fix44/newordersingle"
@@ -236,96 +232,21 @@ func wireUp(t *testing.T) *wiring {
 func wireUpWith(t *testing.T, fill config.FillModel) *wiring {
 	t.Helper()
 
-	venueStore, clientStore := t.TempDir(), t.TempDir()
-	session := config.FIXSession{
-		Sender: "CARRY", Target: "SIMV", Host: "127.0.0.1", StorePath: venueStore,
-	}
-	books := newBooks(time.Now().UTC(), "2344.50", "2345.00")
-	sink := &fakeSink{}
-
-	w := &wiring{sink: sink, books: books, fill: fill}
-
-	var venueCancel context.CancelFunc
-	var venueDone chan error
-
-	// startVenue starts an acceptor and returns only once it is actually
-	// accepting connections, or reports why it could not.
-	//
-	// Both halves matter, and the flake that prompted them was real: freePort
-	// reserves a port and immediately gives it back, so anything on the machine
-	// can take it before the acceptor binds. That surfaced as
-	// "bind: address already in use" on a goroutine, and the test that saw it
-	// reported "timed out waiting for the client to log on" — a symptom five
-	// steps from its cause. Waiting for the listener also removes the second of
-	// reconnect delay the client used to spend when it dialled first.
-	startVenue := func() error {
-		a, err := NewAcceptor(Options{Product: testPerp, Session: session, Fill: fill},
-			books, sink, NewMetrics(prometheus.NewRegistry()), testLogger())
-		if err != nil {
-			return err
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- a.Run(ctx) }()
-
-		addr := net.JoinHostPort(session.Host, strconv.Itoa(session.Port))
-		deadline := time.Now().Add(5 * time.Second)
-		for {
-			select {
-			case err := <-done:
-				cancel()
-				return fmt.Errorf("acceptor stopped before it listened: %w", err)
-			default:
-			}
-			if conn, derr := net.DialTimeout("tcp", addr, 50*time.Millisecond); derr == nil {
-				_ = conn.Close()
-				venueCancel, venueDone = cancel, done
-				return nil
-			}
-			if time.Now().After(deadline) {
-				cancel()
-				<-done
-				return fmt.Errorf("acceptor never listened on %s", addr)
-			}
-		}
-	}
-	stopVenue := func() {
-		venueCancel()
-		if err := <-venueDone; err != nil {
-			t.Errorf("acceptor: %v", err)
-		}
-	}
-
-	// A port is reserved and released before it can be bound, so losing the race
-	// is possible and retrying with a fresh one is the honest fix — the
-	// alternative is a suite that fails a few times a week for a reason that has
-	// nothing to do with what it tests.
-	var startErr error
-	for attempt := range 3 {
-		session.Port = freePort(t)
-		if startErr = startVenue(); startErr == nil {
-			break
-		}
-		t.Logf("attempt %d: %v; retrying on another port", attempt+1, startErr)
-	}
-	if startErr != nil {
-		t.Fatalf("could not start the simulator: %v", startErr)
-	}
-	w.session = session
-
+	sim := startSimVenue(t, fill)
 	client := &scriptedClient{t: t}
-	initiator := startClient(t, client, session, clientStore)
+	initiator := startClient(t, client, sim.session, t.TempDir())
 
-	w.client = client
-	w.restart = func() {
-		stopVenue()
-		if err := startVenue(); err != nil {
-			t.Fatalf("restart: %v", err)
-		}
+	w := &wiring{
+		client:  client,
+		sink:    sim.sink,
+		books:   sim.books,
+		session: sim.session,
+		fill:    fill,
+		restart: sim.restart,
 	}
 	w.stop = func() {
 		initiator.Stop()
-		stopVenue()
+		sim.stop()
 	}
 	t.Cleanup(w.stop)
 
@@ -369,21 +290,6 @@ func startClient(t *testing.T, app quickfix.Application, s config.FIXSession, st
 		t.Fatalf("start initiator: %v", err)
 	}
 	return initiator
-}
-
-// freePort asks the kernel for a port and gives it straight back, which is how a
-// test binds something that cannot collide with a running stack.
-func freePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve a port: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	if err := l.Close(); err != nil {
-		t.Fatalf("release the port: %v", err)
-	}
-	return port
 }
 
 // waitQuiet blocks until the client has received nothing new for the given

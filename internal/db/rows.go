@@ -604,6 +604,12 @@ func (r RiskEventRow) row() rowData {
 // store holds the authoritative sequence numbers; these rows are what the
 // dashboard and the resend demo read.
 //
+// The two sequence columns are what the session's own messages carried — the
+// highest MsgSeqNum seen in each direction — not a reading of quickfix's store,
+// which cannot be read safely from the callback that writes this row. In an
+// ordinary session the two agree; a message the session refused is the case
+// where they do not (API spec section 5.2).
+//
 // It is the second row type that upserts rather than doing nothing on conflict,
 // and for the same reason cb_products does: this is a record of something still
 // happening, not an observation of a moment. One row covers one process's whole

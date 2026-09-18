@@ -36,12 +36,29 @@ import (
 //     scripted client IS an initiator, and it is what carry will leak once Part
 //     8 gives it a FIX session.
 //
-// Ignored here rather than papered over: both are real, both are upstream, and
-// both are visible in production through go_goroutines, which every binary
-// already exports. A sim-venue whose client flaps would show it as a slow climb.
+// Part 8 added a third, again an initiator's, found when its tests stopped a
+// session that had nothing to connect to. Initiator.handleConnection asks the
+// session whether it is inside its session time by spawning a goroutine that
+// sends a request on the session's admin channel:
+//
+//	go func() { session.waitForInSessionTime(); close(inSessionTime) }()
+//
+// and then selects on the answer or on Stop. When Stop wins, handleConnection
+// returns and its deferred session.stop() ends the session's run loop — the
+// only reader of that admin channel — while the spawned goroutine may not yet
+// have sent. It then blocks on the send for the life of the process. The race
+// is between Stop and the reconnect loop, so it fires when the venue is down
+// at the moment carry is stopped: one goroutine per such stop.
+//
+// Ignored here rather than papered over: all three are real, all three are
+// upstream, and all three are visible in production through go_goroutines,
+// which every binary already exports. A sim-venue whose client flaps, or a
+// carry whose venue is down when it is restarted, would show it as a slow
+// climb.
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m,
 		goleak.IgnoreTopFunction("github.com/quickfixgo/quickfix.(*session).initiateLogoutInReplyTo.func1"),
 		goleak.IgnoreTopFunction("github.com/quickfixgo/quickfix.(*stateMachine).Connect.func1"),
+		goleak.IgnoreTopFunction("github.com/quickfixgo/quickfix.(*session).waitForInSessionTime"),
 	)
 }

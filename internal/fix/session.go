@@ -3,7 +3,6 @@ package fix
 import (
 	"context"
 	"log/slog"
-	"math"
 	"sync"
 	"time"
 
@@ -28,18 +27,23 @@ import (
 // SIGTERM erased the record of the session it was ending.
 const recordTimeout = 5 * time.Second
 
+// seqSource is where the recorder reads the session's sequence numbers: the
+// message counter, which sees every message and its number in both directions.
+type seqSource func() (in, out *int32)
+
 type sessionRecorder struct {
 	sink Sink
 	log  *slog.Logger
 	now  func() time.Time
+	seqs seqSource
 
 	mu          sync.Mutex
 	startedAt   time.Time
 	disconnects int32
 }
 
-func newSessionRecorder(sink Sink, log *slog.Logger, now func() time.Time) *sessionRecorder {
-	return &sessionRecorder{sink: sink, log: log.With("component", "fix_session"), now: now}
+func newSessionRecorder(sink Sink, log *slog.Logger, now func() time.Time, seqs seqSource) *sessionRecorder {
+	return &sessionRecorder{sink: sink, log: log.With("component", "fix_session"), now: now, seqs: seqs}
 }
 
 // logon opens the record, or reopens it: a row with no end, and the sequence
@@ -66,11 +70,12 @@ func (r *sessionRecorder) logon(id quickfix.SessionID) {
 	r.mu.Unlock()
 
 	// The sequence numbers are read here as well as at logout, and on a
-	// reconnect that is the interesting half: the store has just resumed from
-	// them, so this row records the position the session came back on. It is the
-	// audit trail for the one thing a restart has to preserve — and writing them
-	// is also what stops the reconnect from blanking what the logout recorded.
-	in, out := sequenceNumbers(id)
+	// reconnect that is the interesting half: the Logon that just arrived
+	// carried the next number after the one the Logout left, so this row
+	// records the position the session came back on. It is the audit trail for
+	// the one thing a restart has to preserve — and writing them is also what
+	// stops the reconnect from blanking what the logout recorded.
+	in, out := r.seqs()
 	r.log.Info("session logged on", "session", id.String(),
 		"started_at", started, "disconnects", disconnects,
 		"resumed_in_seq", seqValue(in), "resumed_out_seq", seqValue(out))
@@ -85,7 +90,7 @@ func (r *sessionRecorder) logon(id quickfix.SessionID) {
 	})
 }
 
-// logout closes the record with the sequence numbers the store reached.
+// logout closes the record with the sequence numbers the session reached.
 //
 // The row upserts on (session_id, started_at), so this rewrites the row logon
 // opened rather than adding a second one — and a reconnect rewrites it again.
@@ -108,7 +113,7 @@ func (r *sessionRecorder) logout(id quickfix.SessionID) {
 	r.mu.Unlock()
 
 	ended := r.now().UTC()
-	in, out := sequenceNumbers(id)
+	in, out := r.seqs()
 	r.log.Info("session logged out", "session", id.String(),
 		"started_at", started, "ended_at", ended, "disconnects", disconnects)
 	r.write(db.FIXSessionRow{
@@ -119,35 +124,6 @@ func (r *sessionRecorder) logout(id quickfix.SessionID) {
 		LastOutSeq:  out,
 		Disconnects: disconnects,
 	})
-}
-
-// sequenceNumbers reads what the store finished on.
-//
-// quickfix reports the *next* number it expects in each direction, so the last
-// one used is one below it. A session that has never exchanged a message reports
-// 1 and 1, which would be a last-used of zero — not a sequence number, so the
-// columns stay NULL rather than claiming a message that never existed.
-func sequenceNumbers(id quickfix.SessionID) (in, out *int32) {
-	if expected, err := quickfix.GetExpectedTargetNum(id); err == nil {
-		in = lastUsed(expected)
-	}
-	if expected, err := quickfix.GetExpectedSenderNum(id); err == nil {
-		out = lastUsed(expected)
-	}
-	return in, out
-}
-
-// lastUsed turns quickfix's next-expected number into the last one used, or NULL.
-//
-// The column is an integer, and FIX sequence numbers are counted in an int: the
-// bound is checked rather than converted blind, because a session that had
-// somehow run past it would otherwise write a negative sequence number, which is
-// a worse answer than none.
-func lastUsed(expected int) *int32 {
-	if expected <= 1 || expected > math.MaxInt32 {
-		return nil
-	}
-	return db.Opt(int32(expected - 1))
 }
 
 // seqValue renders a sequence number for a log line, where a nil pointer is a

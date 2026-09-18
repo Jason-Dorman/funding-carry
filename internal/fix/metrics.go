@@ -31,25 +31,23 @@ const (
 	resultCanceled = "canceled"
 )
 
-// Metrics is the FIX session catalogue plus sim-venue's own three series.
+// SessionCatalogue is the three fix_* series both ends of the session export.
 //
-// The fix_* names carry no binary prefix, which is deliberate and is how API
-// spec section 6 lists them: the initiator in carry (Part 8) exports the same
-// three names, and the session label is what separates them. A dashboard asking
-// "is the FIX link up" should not have to ask it twice with two spellings.
-type Metrics struct {
+// The names carry no binary prefix, which is deliberate and is how API spec
+// section 6 lists them: the acceptor in sim-venue and the initiator in carry
+// export the same three, and the session label is what separates them. A
+// dashboard asking "is the FIX link up" should not have to ask it twice with
+// two spellings. This is what carry registers; sim-venue registers Metrics,
+// which is this plus its own.
+type SessionCatalogue struct {
 	sessionUp *prometheus.GaugeVec
 	msgs      *prometheus.CounterVec
 	resends   *prometheus.CounterVec
-
-	orders  *prometheus.CounterVec
-	bookAge prometheus.Gauge
-	resting prometheus.Gauge
 }
 
-// NewMetrics registers the collectors on the binary's own registry.
-func NewMetrics(reg prometheus.Registerer) *Metrics {
-	m := &Metrics{
+// NewSessionCatalogue registers the session series on a registry.
+func NewSessionCatalogue(reg prometheus.Registerer) *SessionCatalogue {
+	c := &SessionCatalogue{
 		sessionUp: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "fix_session_up",
 			Help: "1 while the FIX session is logged on, 0 otherwise.",
@@ -62,6 +60,24 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "fix_resend_events_total",
 			Help: "Sequence recoveries: ResendRequests seen on the session, either direction.",
 		}, []string{"session"}),
+	}
+	reg.MustRegister(c.sessionUp, c.msgs, c.resends)
+	return c
+}
+
+// Metrics is the session catalogue plus sim-venue's own three series.
+type Metrics struct {
+	*SessionCatalogue
+
+	orders  *prometheus.CounterVec
+	bookAge prometheus.Gauge
+	resting prometheus.Gauge
+}
+
+// NewMetrics registers the collectors on the binary's own registry.
+func NewMetrics(reg prometheus.Registerer) *Metrics {
+	m := &Metrics{
+		SessionCatalogue: NewSessionCatalogue(reg),
 		orders: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: Namespace,
 			Name:      "orders_total",
@@ -80,7 +96,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Help:      "Orders live on the simulator's book: accepted, not yet filled or canceled.",
 		}),
 	}
-	reg.MustRegister(m.sessionUp, m.msgs, m.resends, m.orders, m.bookAge, m.resting)
+	reg.MustRegister(m.orders, m.bookAge, m.resting)
 
 	for _, result := range []string{resultAccepted, resultRejected, resultFilled, resultCanceled} {
 		m.orders.WithLabelValues(result).Add(0)
@@ -91,8 +107,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 // session binds the session label once, which is the only label the three fix_*
 // series share and the one a caller would otherwise have to remember to spell
 // identically in three places.
-func (m *Metrics) session(id string) *SessionMetrics {
-	s := &SessionMetrics{id: id, up: m.sessionUp.WithLabelValues(id), msgs: m.msgs, resends: m.resends.WithLabelValues(id)}
+func (c *SessionCatalogue) session(id string) *SessionMetrics {
+	s := &SessionMetrics{id: id, up: c.sessionUp.WithLabelValues(id), msgs: c.msgs, resends: c.resends.WithLabelValues(id)}
 	// The gauge exists before the first logon, at zero: FixSessionDown alerts on
 	// `fix_session_up == 0`, and PromQL over a series that does not exist yields
 	// nothing rather than firing. A venue that never accepted a connection at all
