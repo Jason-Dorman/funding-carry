@@ -4,6 +4,22 @@ Notable changes to the system and its contracts. Structural decisions get an ADR
 
 ## [Unreleased]
 
+### CHANGE-002 — Acknowledgement latency instrumented; the order-timeout open item closed — 2026-09-21
+
+**Additive observability; no behaviour change and the 30 s timeout is unchanged.** Directive and the judgement calls made applying it: [CHANGE-002](docs/CHANGE-002-ack-latency-histogram.md).
+
+`ORDER_TIMEOUT` bounds how long the venue has to acknowledge an order, and it was chosen without measurement. The two gauges added to settle it — `carry_orders_open`, `carry_orders_overdue` — turned out to be unable to: Prometheus scrapes every 15 s, a marginally late acknowledgement raises a gauge for a second or two and is usually invisible, and a gauge carries a count and never a latency, so an ack at 31 s and one at 45 s are the same observation. The distribution is now measured directly.
+
+**New metrics:** `carry_order_ack_seconds` (histogram, `venue`+`leg`, buckets `0.05 0.1 0.25 0.5 1 2 5 10 30 60` — fine where acknowledgements land, coarse out to and past the deadline being defended) and `carry_order_ack_timeouts_total` (counter, `venue`+`leg`, one per order that passed the deadline unanswered). The two **overlap** rather than partition: the histogram holds every order that eventually got a response, at its true latency; the counter holds every order whose response missed the deadline, including the ones that later arrived. A late answer is in both; an order never answered is in the counter only. **No synthetic observation is ever written for a timeout** — that would corrupt the one distribution the value is set from — and dividing the counter into the histogram's count double-counts the late answers.
+
+The interval is measured over the edge the deadline actually judges — the report that takes an order out of `PENDING`, whether it says `NEW` or arrives already filled or rejected — so despite the metric's name it is **time to first response**, not time to a `NEW`. Measuring only a `NEW` would drop the orders the venue answered fastest out of the distribution.
+
+**And it is measured on one clock.** `ExecReport` gains a `ReceivedAt`, stamped once by the venue implementation as the report arrives in this process. `ORDER_TIMEOUT` runs on our clock waiting for a report to reach us, so the distribution validating it runs between the `Ack` returned by `Submit` and `ReceivedAt`. The venue's own `TransactTime` — which `At` carries, correctly, for the `fills` row — excludes inbound network and parse time, exactly the tail the deadline exists to catch, and on a **resent** report it is the original event's time, which can be hours stale: the first draft of this change would have read a forty-five-second recovery as an instant answer. A venue that stamps no `ReceivedAt` contributes nothing rather than a wrong number.
+
+An adopted order contributes to neither series — it has no acknowledgement, and the fabricated zero that would produce was a Part 8 review finding on the sibling round-trip histogram.
+
+30 s is retained pending data; [Part 15](docs/build-plan.md#part-15--execution-router-wiring-full-loop)'s 24 h soak now carries the deliverable and an acceptance item to set it from the observed distribution, and the constant carries a `TODO(revisit)` pointing there.
+
 ### sim-venue: the FIX 4.4 acceptor — 2026-09-16 (Part 7, built; PO diff review pending)
 
 `cmd/sim-venue` becomes an exchange: a quickfixgo acceptor with a fill model driven by the system's **own recorded market data**. It reads the same `cb_book_snapshots` rows the feature engine and the replay read, which is what makes a simulated fill reproducible from the database instead of from a private model — and it is the reason the simulator can be wrong in a way anyone can check, rather than plausible.

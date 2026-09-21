@@ -173,7 +173,14 @@ func parseExecReport(msg *quickfix.Message, now time.Time) (carry.ExecReport, qu
 	if err != nil {
 		return carry.ExecReport{}, err
 	}
+	// Two different questions, two different fields. At defaults to now and
+	// is replaced below by the venue's TransactTime when it sends one, because
+	// a resent report's At must be the original event's time. ReceivedAt is
+	// this process's clock and is never overwritten: it is the far end of the
+	// interval ORDER_TIMEOUT races, and the only stamp of it this system will
+	// ever get is here, at the boundary.
 	r.At = now
+	r.ReceivedAt = now
 	if err := optionalReportFields(er, msg, &r); err != nil {
 		return carry.ExecReport{}, err
 	}

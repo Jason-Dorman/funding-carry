@@ -92,11 +92,20 @@ func (p *probeOrder) observe(s exec.Status, _ exec.Outcome) {
 	}
 }
 
-// run sends the order and waits for it to end. If it is still open at the
-// order timeout, it is cancelled and the cancel is waited for. If the process
-// is told to stop first, the order is left working at the venue on purpose:
-// that is the restart case, and the report it produces while carry is down is
-// what the next start recovers.
+// run sends the order and waits for it to end. If it is still working when
+// the wait runs out, it is cancelled and the cancel is waited for. If the
+// process is told to stop first, the order is left working at the venue on
+// purpose: that is the restart case, and the report it produces while carry
+// is down is what the next start recovers.
+//
+// The wait is ORDER_TIMEOUT, and that reuse is the probe's alone. ORDER_TIMEOUT
+// bounds the ACKNOWLEDGEMENT for everything else in the system — an
+// acknowledged order resting past it is the order working, and `Tracker.Overdue`
+// says so (api-spec section 3.2). The probe is a one-shot CLI trigger that has
+// to terminate, so it needs a bound on the FILL as well and has no other clock
+// to take one from; it deliberately stops short of calling that "overdue",
+// because the router will not behave this way. The Part 8 follow-up adversarial
+// review found this file still using the word for the deleted meaning.
 func (p *probeOrder) run(ctx context.Context, venue carry.Venue, tracker *exec.Tracker, log *slog.Logger) error {
 	log = log.With("component", "probe", "cl_ord_id", p.order.ClOrdID)
 
@@ -113,17 +122,18 @@ func (p *probeOrder) run(ctx context.Context, venue carry.Venue, tracker *exec.T
 	status, _ := tracker.Status(p.order.ClOrdID)
 	timeout := status.Deadline.Sub(status.SubmittedAt)
 	status, outcome := p.await(ctx, tracker, log, time.Until(status.Deadline))
-	if outcome != waitOverdue {
+	if outcome != waitUnfilled {
 		return nil
 	}
 
-	// Overdue: cancel, and give the venue's answer a window of its own, the
-	// same length again.
-	log.Warn("probe order overdue; cancelling", "state", string(status.State), "cum_qty", status.CumQty.String())
+	// Still working: cancel, and give the venue's answer a window of its own,
+	// the same length again.
+	log.Warn("probe order still working when its wait ran out; cancelling",
+		"state", string(status.State), "cum_qty", status.CumQty.String())
 	if err = venue.Cancel(ctx, p.order.ClOrdID); err != nil {
 		return fmt.Errorf("cancel probe order: %w", err)
 	}
-	if status, outcome = p.await(ctx, tracker, log, timeout); outcome == waitOverdue {
+	if status, outcome = p.await(ctx, tracker, log, timeout); outcome == waitUnfilled {
 		return fmt.Errorf("probe order %s still %s after the cancel timed out", p.order.ClOrdID, status.State)
 	}
 	return nil
@@ -135,12 +145,15 @@ type waitOutcome int
 const (
 	// waitTerminal: the order ended.
 	waitTerminal waitOutcome = iota
-	// waitOverdue: the window ran out with the order still open.
-	waitOverdue
+	// waitUnfilled: the window ran out with the order still working. NOT the
+	// tracker's "overdue", which is an unacknowledged order (api-spec section
+	// 3.2); this is the probe's own bound on the fill, and only the probe has
+	// one.
+	waitUnfilled
 	// waitStopped: the process was told to stop. The order is left working
 	// at the venue on purpose — the first live run of this probe went on to
 	// cancel it on a context that was already dead, which is how this became
-	// its own outcome rather than a flavour of overdue.
+	// its own outcome rather than a flavour of the wait running out.
 	waitStopped
 )
 
@@ -188,7 +201,7 @@ func (p *probeOrder) await(ctx context.Context, tracker *exec.Tracker, log *slog
 				"state", string(status.State))
 			return status, waitStopped
 		case <-timer.C:
-			return status, waitOverdue
+			return status, waitUnfilled
 		case s := <-p.updates:
 			if s.ClOrdID == p.order.ClOrdID {
 				status = s

@@ -126,7 +126,25 @@ type ExecReport struct {
 	AvgPx     decimal.Decimal
 	Fee       decimal.Decimal // venue fee or gas, quote currency
 	Reason    string          // reject/cancel reason
-	At        time.Time
+	// At is the venue's own time for the event. On a resent report it is the
+	// time of the ORIGINAL event, which is what the round trip and the fills
+	// row want, and it is the venue's clock rather than ours.
+	At time.Time
+	// ReceivedAt is when this report arrived in THIS process, stamped once by
+	// the venue implementation at its own receipt boundary and never taken
+	// off the wire. It exists because At cannot answer the question the
+	// acknowledgement deadline asks.
+	//
+	// ORDER_TIMEOUT runs on our clock and waits for a report to reach this
+	// process, so the distribution that validates it has to be measured
+	// between two instants on that same clock: the Ack we returned from
+	// Submit, and this. At would exclude inbound network and parse time —
+	// exactly the tail the deadline exists to catch — and on a resend it is
+	// the original event's time, which could be hours stale.
+	//
+	// A venue that leaves this zero contributes no acknowledgement latency
+	// rather than a wrong one (internal/exec).
+	ReceivedAt time.Time
 }
 
 // Venue is what carry needs from an execution path, and nothing more.

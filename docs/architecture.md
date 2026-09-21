@@ -459,6 +459,9 @@ Reading the database is otherwise reserved to `carry`; `internal/db.Reader` is t
 | FIX session drop | quickfixgo session state | auto re-logon, sequence recovery from disk store; alert |
 | Hard stop breach (notional, leverage, margin-ratio floor, basis blowout, funding flip, cascade) | risk engine, every tick | flatten via fastest venue path, `risk_event` row, alert; manual reset required |
 | Leg failure on entry | ExecReport timeout on second leg | unwind first leg immediately |
+| Venue reports disagree with themselves (an `invalid` ExecReport: more filled than ordered, a cancel losing a fill) | exec state machine, per report | invariant violation: `risk_event` row, submission halted on that venue until manual reset (Part 13). Until then: Error log + `carry_exec_reports_total{outcome="invalid"}` |
+| Venue not acknowledging orders | `carry_orders_overdue` > 0 past `ORDER_TIMEOUT` | router (Part 15) cancels and, on an entry's second leg, unwinds the first. The gauge says *that* acks are being missed, not by how much ([api-spec §3.2](api-spec.md#32-exec-report-state-machine)) |
+| FIX session pointed at something that is not the simulator | `FIX_TARGET` checked when the config loads, in **both** binaries | refuse to start, naming the variable. The order path is sim-only in v1 ([api-spec §7](api-spec.md#7-configuration-surface-env)), so this is a startup failure rather than a runtime response — the rail cannot be crossed at all |
 | Daily loss limit | realized+unrealized P&L vs limit | flatten, `BLOCKED` until UTC day roll |
 | Operator kill switch | config flag / signal | cancel all open orders, flatten, halt submission on both live venues |
 | Process crash | Compose restart policy | on restart: reload positions from DB, resume FIX with persisted seq nums, re-derive state — DB is the source of truth, no in-memory-only state |

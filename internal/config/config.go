@@ -148,6 +148,16 @@ type PollIntervals struct {
 	BookSnap time.Duration
 }
 
+// SimVenueCompID is the simulator's comp id, and in v1 the only FIX
+// counterparty either binary will accept. FIX is sim-only by spec (section 12,
+// item 3: FIX beyond sim-venue is a Part 21 question) and the live perp venue is
+// REST, so a FIX session whose target calls itself anything else is a session
+// pointed somewhere this system has no business sending an order. Both loads
+// refuse it (Carry.validate, SimVenue.validate) — the PO's decision after the
+// Part 8 review, so that the sim-only claim in the safety rails is enforced in
+// code rather than resting on a configuration value.
+const SimVenueCompID = "SIMV"
+
 // FIXSession is the FIX 4.4 session identity shared by the initiator (carry) and
 // the acceptor (sim-venue).
 //
@@ -203,11 +213,10 @@ type TreasuryTimeouts struct {
 
 // Execution is carry's order-entry configuration.
 //
-// OrderTimeout is the per-order deadline the state machine measures from
-// Submit. An open order past it is overdue: not dead — a resting limit order
-// legitimately outlives any timeout — but something the router has to look at
-// rather than wait on, and on the second leg of an entry the trigger for
-// unwinding the first (architecture section 6.4).
+// OrderTimeout is how long the venue has to acknowledge an order, measured
+// from Submit. An unacknowledged order past it is overdue; an acknowledged one
+// never is, however long it rests. On the second leg of an entry an overdue
+// order is the trigger for unwinding the first (architecture section 6.4).
 type Execution struct {
 	OrderTimeout time.Duration
 }
@@ -425,11 +434,17 @@ const (
 	// here, which is what carries the sequence numbers across a restart.
 	defaultFIXStorePath = "/var/lib/carry/fix"
 
-	// defaultOrderTimeout is a placeholder, not a measured value: the plan names
-	// a per-order timeout and gives it no number, and this one is a bound on
-	// how long an acknowledged order may go unanswered before the router is
-	// told — long enough for the simulator's jittered latency, short enough to
-	// notice a venue that has stopped answering. Flagged to the PO at Part 8.
+	// defaultOrderTimeout bounds how long the venue has to ACKNOWLEDGE an order
+	// (PO decision after the Part 8 review: the timeout is about the
+	// acknowledgement, never about the fill — a resting order is the order
+	// working). Thirty seconds is a starting value, not a measured one — and
+	// it is now measurable: carry_order_ack_seconds records the distribution
+	// this number bounds (api-spec section 3.2, CHANGE-002).
+	//
+	// TODO(revisit): set this from the Part 15 soak's observed
+	// carry_order_ack_seconds distribution, and record the value and its
+	// evidence in the build plan. Until then it is a chosen number that is
+	// finally checkable rather than a guess nobody can test.
 	defaultOrderTimeout = 30 * time.Second
 
 	defaultMaintenanceBreak = "Fri 17:00-18:00 America/New_York"
@@ -525,7 +540,22 @@ func (c *Carry) validate() error {
 			c.Risk.DeltaToleranceETH, halfContract))
 	}
 
+	// The order path is sim-only in v1, and this is where that stops being a
+	// sentence in the safety rails and becomes a startup failure.
+	if err := c.FIX.simOnly("FIX_TARGET", c.FIX.Target); err != nil {
+		errs = append(errs, err)
+	}
+
 	return errors.Join(errs...)
+}
+
+// simOnly refuses a FIX counterparty that is not the simulator.
+func (FIXSession) simOnly(key, compID string) error {
+	if compID != SimVenueCompID {
+		return fmt.Errorf("%s=%q: the FIX session is sim-only in v1 and the simulator's comp id is %q "+
+			"(spec section 12, FIX beyond sim-venue is a Part 21 question)", key, compID, SimVenueCompID)
+	}
+	return nil
 }
 
 // validate enforces the two fill-model invariants a zero or a negative would
@@ -562,6 +592,13 @@ func (c *SimVenue) validate() error {
 			"SIM_BOOK_MAX_AGE_SECS=%s: must not be shorter than SIM_BOOK_POLL_SECS=%s, "+
 				"or the book is stale before it can be refreshed",
 			c.Fill.BookMaxAge, c.Fill.BookPoll))
+	}
+
+	// The simulator's own comp id is FIX_TARGET (section 4.1: the variables are
+	// named from the initiator's side). It answers to SIMV and nothing else, so
+	// the two binaries agree on what a simulator is called by construction.
+	if err := c.FIX.simOnly("FIX_TARGET", c.FIX.Target); err != nil {
+		errs = append(errs, err)
 	}
 
 	return errors.Join(errs...)

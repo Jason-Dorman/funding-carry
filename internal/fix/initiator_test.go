@@ -526,9 +526,52 @@ func TestParseExecReportReadsTheDictionary(t *testing.T) {
 	want := carry.ExecReport{
 		ClOrdID: "A1", VenueID: "O-1", ExecID: "E-1", State: carry.StatePartial,
 		LastQty: dec("1"), LastPx: dec("2345.47"), CumQty: dec("1"), LeavesQty: dec("2"),
-		AvgPx: dec("2345.47"), At: time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC),
+		AvgPx: dec("2345.47"),
+		// An hour apart on purpose. At is the venue's TransactTime, which a
+		// resent report states as the ORIGINAL event's time; ReceivedAt is
+		// when the report reached this process, which is the far end of the
+		// interval ORDER_TIMEOUT races. Stamping only one of them is how the
+		// acknowledgement histogram ends up measuring the wrong wait.
+		At:         time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC),
+		ReceivedAt: now,
 	}
 	assertReport(t, r, want)
+}
+
+// The receipt stamp is this process's clock and survives whatever the venue
+// says, including a venue that sends no TransactTime at all — the case where
+// At falls back to the same instant and the two fields stop being
+// distinguishable by inspection. (PO revision to CHANGE-002.)
+func TestParseExecReportStampsOurOwnReceiptTime(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 9, 17, 13, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name   string
+		mutate func(executionreport.ExecutionReport, *quickfix.Message)
+		wantAt time.Time
+	}{
+		{"the venue sends its own time", nil, time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)},
+		{"the venue sends none", func(_ executionreport.ExecutionReport, msg *quickfix.Message) {
+			msg.Body.Remove(tag.TransactTime)
+		}, now},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r, err := parseExecReport(testER(tt.mutate), now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !r.ReceivedAt.Equal(now) {
+				t.Errorf("ReceivedAt = %v, want %v — the report reached this process then, "+
+					"whatever the venue's clock says", r.ReceivedAt, now)
+			}
+			if !r.At.Equal(tt.wantAt) {
+				t.Errorf("At = %v, want %v", r.At, tt.wantAt)
+			}
+		})
+	}
 }
 
 func TestParseExecReportFilesACancelUnderTheOriginalOrder(t *testing.T) {
@@ -612,7 +655,8 @@ func TestParseExecReportRejectsWhatItCannotRead(t *testing.T) {
 func assertReport(t *testing.T, got, want carry.ExecReport) {
 	t.Helper()
 	if got.ClOrdID != want.ClOrdID || got.VenueID != want.VenueID || got.ExecID != want.ExecID ||
-		got.State != want.State || got.Reason != want.Reason || !got.At.Equal(want.At) {
+		got.State != want.State || got.Reason != want.Reason || !got.At.Equal(want.At) ||
+		!got.ReceivedAt.Equal(want.ReceivedAt) {
 		t.Errorf("got %+v\nwant %+v", got, want)
 	}
 	for _, f := range []struct {
