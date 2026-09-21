@@ -157,9 +157,11 @@ func TestProbeRunsAnOrderToTerminal(t *testing.T) {
 	}
 }
 
-// An order the venue will not fill is cancelled at the order timeout and the
-// probe still exits cleanly — the cancel is the terminal state.
-func TestProbeCancelsAnOverdueOrder(t *testing.T) {
+// An order the venue will not fill is cancelled when the probe's wait runs
+// out and the probe still exits cleanly — the cancel is the terminal state.
+// The order here is ACKNOWLEDGED and resting, so the tracker does not call it
+// overdue; bounding the fill is the probe's own business (probe.go).
+func TestProbeCancelsAnOrderThatNeverFills(t *testing.T) {
 	sim := startSim(t)
 	cfg := testConfig(t, sim.Port)
 	cfg.Execution.OrderTimeout = 500 * time.Millisecond
@@ -180,6 +182,73 @@ func TestProbeCancelsAnOverdueOrder(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the probe never finished")
 	}
+}
+
+// The gauge watcher is the only production path that ever raises
+// carry_orders_overdue: an order the venue never acknowledges produces no
+// report at all, and Apply refreshes only the open gauge. Nothing guarded it —
+// deleting the goroutine, stretching observeEvery to an hour, or emptying
+// watch all left the suite green. It also has to leave a COHERENT last reading
+// behind when it stops, because trade keeps the metrics endpoint alive past
+// the shutdown for the final scrape: with the watcher dead while the drain was
+// still applying reports, that scrape could read carry_orders_open=0 beside
+// carry_orders_overdue=1, a pair the tracker cannot produce. Found by the
+// Part 8 follow-up adversarial review.
+func TestTheGaugeWatcherRefreshesAndStopsCoherently(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	tracker := exec.NewTracker(exec.Options{Venue: db.VenueSim, Timeout: time.Nanosecond},
+		exec.NewMetrics(reg), testLogger())
+	if err := tracker.Track(carry.Order{ClOrdID: "P1", Qty: decimal.RequireFromString("1")},
+		carry.Ack{At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { defer close(stopped); watch(ctx, tracker) }()
+
+	// Nothing but the ticker can raise this: no report has arrived, and an
+	// order the venue never answers produces none.
+	deadline := time.After(10 * time.Second)
+	for gaugeValue(t, reg, "carry_orders_overdue") != 1 {
+		select {
+		case <-deadline:
+			t.Fatal("carry_orders_overdue never rose: the watcher is not refreshing the gauges")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// The order ends. Apply drops the open gauge and leaves the overdue gauge
+	// to the watcher, so the watcher's last act is what the final scrape sees.
+	tracker.Apply(carry.ExecReport{ClOrdID: "P1", ExecID: "E1", State: carry.StateCanceled, At: time.Now()})
+	cancel()
+	<-stopped
+
+	open, overdue := gaugeValue(t, reg, "carry_orders_open"), gaugeValue(t, reg, "carry_orders_overdue")
+	if open != 0 || overdue != 0 {
+		t.Errorf("after the watcher stopped: carry_orders_open=%v, carry_orders_overdue=%v, want 0 and 0 — "+
+			"the last scrape of the process must never read more orders overdue than open", open, overdue)
+	}
+}
+
+// gaugeValue reads a gauge out of a registry by its exported name.
+func gaugeValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		if n := len(f.GetMetric()); n != 1 {
+			t.Fatalf("%s: %d series, want 1", name, n)
+		}
+		return f.GetMetric()[0].GetGauge().GetValue()
+	}
+	t.Fatalf("%s: no such series in the registry", name)
+	return 0
 }
 
 // Told to stop with the probe order still resting, the probe leaves the order

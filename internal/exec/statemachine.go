@@ -83,24 +83,31 @@ type Status struct {
 	// first report for an adopted order.
 	SubmittedAt time.Time
 	UpdatedAt   time.Time
-	// Deadline is SubmittedAt plus the per-order timeout. An order past it and
-	// not terminal is overdue: not dead — a resting limit order legitimately
-	// outlives any timeout — but something the caller has to look at rather
-	// than wait on.
+	// Deadline is SubmittedAt plus the per-order timeout, and it bounds the
+	// ACKNOWLEDGEMENT, not the fill: an order the venue has not answered by
+	// then is overdue. An order the venue has acknowledged is never overdue,
+	// however long it rests — a resting limit order outliving a timeout is the
+	// order working, and whether to keep it working is the router's call, not
+	// a deadline's. Decided by the PO after the Part 8 review.
 	Deadline time.Time
 }
 
 // Terminal reports whether the order has ended.
 func (s Status) Terminal() bool { return s.State.Terminal() }
 
-// Overdue reports whether the order is still open past its deadline.
-func (s Status) Overdue(now time.Time) bool { return !s.Terminal() && now.After(s.Deadline) }
+// Overdue reports whether the venue has failed to acknowledge the order by its
+// deadline. Only a PENDING order can be overdue, and a pending order is always
+// one this process submitted: adoption starts a record pending, but Apply
+// either moves it on with the report that caused it or removes it again, so an
+// adopted order is never left pending to go overdue.
+func (s Status) Overdue(now time.Time) bool { return s.State == StatePending && now.After(s.Deadline) }
 
 // Options configure a Tracker.
 type Options struct {
 	// Venue names the venue this tracker follows, as the metrics label.
 	Venue string
-	// Timeout is the per-order deadline, measured from Submit.
+	// Timeout is how long the venue has to acknowledge an order, measured from
+	// Submit (ORDER_TIMEOUT).
 	Timeout time.Duration
 }
 
@@ -140,6 +147,14 @@ type tracked struct {
 	// seen holds every ExecID applied to this order, which is what makes a
 	// replayed report a recognised duplicate rather than a second fill.
 	seen map[string]bool
+	// leg labels this order's two acknowledgement series. An adopted order
+	// has none — nothing on the wire carries the leg — and an adopted order
+	// is neither acknowledged nor overdue, so neither series needs one.
+	leg carry.Leg
+	// ackTimedOut records that this order has already been counted as having
+	// missed its acknowledgement deadline, so the count is one per order
+	// rather than one per tick of the observer.
+	ackTimedOut bool
 }
 
 // NewTracker builds a tracker for one venue.
@@ -175,6 +190,7 @@ func (t *Tracker) Track(o carry.Order, ack carry.Ack) error {
 		t.complete(existing, o, ack)
 		return nil
 	}
+	defer func() { t.m.observeOpen(t.countOpen()) }()
 	t.orders[o.ClOrdID] = &tracked{
 		status: Status{
 			ClOrdID:     o.ClOrdID,
@@ -187,6 +203,7 @@ func (t *Tracker) Track(o carry.Order, ack carry.Ack) error {
 			Deadline:    ack.At.Add(t.timeout),
 		},
 		seen: make(map[string]bool),
+		leg:  o.Leg,
 	}
 	return nil
 }
@@ -199,6 +216,7 @@ func (t *Tracker) Track(o carry.Order, ack carry.Ack) error {
 // filled quantity, average price — stands, because those came from the venue.
 func (t *Tracker) complete(o *tracked, order carry.Order, ack carry.Ack) {
 	o.adopted = false
+	o.leg = order.Leg
 	o.status.Adopted = false
 	o.status.Qty = order.Qty
 	o.status.SubmittedAt = ack.At
@@ -230,12 +248,83 @@ func (t *Tracker) Apply(r carry.ExecReport) (Status, Outcome) {
 	}
 
 	outcome := t.apply(o, r)
-	if !known && outcome == OutcomeApplied {
-		outcome = OutcomeAdopted
+	if !known {
+		if outcome == OutcomeApplied {
+			outcome = OutcomeAdopted
+		} else {
+			// The adoption is undone when the report that caused it was not
+			// applied. adopt has to create the record before the rule table
+			// can judge the report, and a record left behind by a refused
+			// report is a PENDING order that no report will ever move and
+			// nothing can remove: permanently open, permanently overdue
+			// against the acknowledgement deadline, and — once Part 15 reads
+			// the gauge — a standing instruction to unwind the other leg of
+			// an entry for an order that exists at no venue. A PARTIAL that
+			// filled nothing reaches this, and so does an OrdStatus the
+			// machine has no rule for. Found by the Part 8 follow-up
+			// adversarial review; the report is still counted and logged,
+			// because refusing it is not forgetting that it arrived.
+			delete(t.orders, r.ClOrdID)
+		}
 	}
 	t.m.report(outcome)
 	t.record(o.status, r, outcome)
+	t.m.observeOpen(t.countOpen())
 	return o.status, outcome
+}
+
+// Observe refreshes the gauges that need a clock: how many orders are open and
+// how many the venue has failed to acknowledge. The instant is an argument for
+// the same reason Overdue's is — the tracker has no clock of its own — so the
+// binary calls this on a ticker, and once more as it stops so the last scrape
+// sees a coherent pair.
+//
+// What the pair is good for is narrower than it first looks: a rising overdue
+// count says acknowledgements are missing the deadline, and a count that rises
+// and stays says the venue has stopped answering. It cannot say by how much
+// the deadline was missed — a gauge carries no latency, and at a 15 s scrape a
+// marginally late acknowledgement is usually invisible — so it can falsify
+// ORDER_TIMEOUT but not produce the value to replace it. The Part 8 follow-up
+// adversarial review measured that arithmetic against the claim this comment
+// used to make. The value itself comes from carry_order_ack_seconds, which
+// measures the interval rather than counting threshold crossings (CHANGE-002).
+func (t *Tracker) Observe(now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	open, overdue := 0, 0
+	for _, o := range t.orders {
+		if o.status.Terminal() {
+			continue
+		}
+		open++
+		if o.status.Overdue(now) {
+			overdue++
+			// Nothing in this system "fires" a timeout — the tracker answers
+			// a question and the binary asks it on a ticker — so the edge is
+			// detected here and counted once. A response that turns up later
+			// is still observed at its true latency, so the two series
+			// OVERLAP: a late answer is in both, one that never comes is
+			// here only, and dividing this into the histogram's count would
+			// double-count the late answers (CHANGE-002).
+			if !o.ackTimedOut {
+				o.ackTimedOut = true
+				t.m.ackTimedOut(o.leg)
+			}
+		}
+	}
+	t.m.observeOpen(open)
+	t.m.observeOverdue(overdue)
+}
+
+// countOpen is Observe's open half, for callers already holding the lock.
+func (t *Tracker) countOpen() int {
+	n := 0
+	for _, o := range t.orders {
+		if !o.status.Terminal() {
+			n++
+		}
+	}
+	return n
 }
 
 // adopt opens a record for an order the tracker was never told about. The
@@ -262,6 +351,9 @@ func (t *Tracker) apply(o *tracked, r carry.ExecReport) Outcome {
 	if r.ExecID != "" && o.seen[r.ExecID] {
 		return OutcomeDuplicate
 	}
+	// Whether this report is the venue's first answer, read before the
+	// transition overwrites the state it is read from.
+	wasPending := o.status.State == StatePending
 	next, outcome := transition(o.status, r)
 	if outcome != OutcomeApplied {
 		return outcome
@@ -270,24 +362,55 @@ func (t *Tracker) apply(o *tracked, r carry.ExecReport) Outcome {
 		o.seen[r.ExecID] = true
 	}
 	o.status = next
-	// An adopted order has no acknowledgement, so it has no round trip. Its
-	// SubmittedAt is the first report's own time, and when that first report is
-	// the terminal one — the restart-and-resend path, which is exactly what
-	// adoption is for — the subtraction below is zero. Observing it would file
-	// a multi-second recovery into the fastest bucket in the histogram and make
-	// an outage read as a fast venue. If the submitter catches up later, Track
-	// completes the order and observes the round trip then. Found by the Part 8
-	// adversarial review.
-	if next.Terminal() && !o.adopted {
+	t.observeTimings(o, wasPending, next, r)
+	return OutcomeApplied
+}
+
+// observeTimings records what an applied report was worth to the two
+// histograms: the round trip if it ended the order, the venue's first response
+// if it answered one.
+//
+// Neither is observed for an ADOPTED order, and that is the same lesson twice.
+// Such an order has no acknowledgement — its SubmittedAt is its own first
+// report's time — so both intervals would be a fabricated zero, filing a
+// multi-second restart recovery into the fastest bucket and making an outage
+// read as the fastest venue the system has ever seen. Found by the Part 8
+// adversarial review on the round trip; kept out of the acknowledgement
+// series by construction. If the submitter catches up later, Track completes
+// the order and observes the round trip then.
+func (t *Tracker) observeTimings(o *tracked, wasPending bool, next Status, r carry.ExecReport) {
+	if o.adopted {
+		return
+	}
+	if next.Terminal() {
 		t.m.observeRoundtrip(next.UpdatedAt.Sub(next.SubmittedAt))
 	}
-	return OutcomeApplied
+	// The venue's first response, measured over exactly the interval
+	// ORDER_TIMEOUT races and on exactly the clock it races it on.
+	//
+	// The edge is the report that takes an order out of PENDING, whether it
+	// says NEW, or arrives already filled, or rejects: all three are the venue
+	// answering, all three stop the order being overdue, and measuring only a
+	// NEW would leave the orders answered fastest out of the distribution.
+	//
+	// The instants are the Ack we returned from Submit and the moment the
+	// report reached this process — both our clock. NOT r.At, which is the
+	// venue's TransactTime when it sends one: that excludes inbound network
+	// and parse time, which is the tail the deadline exists to catch, and on a
+	// resent report it is the original event's time, which can be hours stale.
+	// A venue that stamps no ReceivedAt contributes nothing rather than a
+	// wrong number. (PO revision to CHANGE-002.)
+	if wasPending && next.State != StatePending && !r.ReceivedAt.IsZero() {
+		t.m.observeAck(o.leg, r.ReceivedAt.Sub(next.SubmittedAt))
+	}
 }
 
 // record logs the report at a level matching what it meant. Applied reports
 // are the order's life and go at Info; a duplicate is expected after a
-// reconnect and is Debug; the three that say the venue disagrees with itself
-// are Warn, with the report spelled out so the disagreement can be read.
+// reconnect and is Debug; a stale or late report is a protocol artefact and is
+// Warn; an invalid one is an invariant violation and is Error (PO decision
+// after the Part 8 review). The three that say the venue disagrees with itself
+// all spell the report out, so the disagreement can be read.
 func (t *Tracker) record(s Status, r carry.ExecReport, outcome Outcome) {
 	attrs := []any{
 		"cl_ord_id", r.ClOrdID, "exec_id", r.ExecID, "outcome", string(outcome),
@@ -305,6 +428,16 @@ func (t *Tracker) record(s Status, r carry.ExecReport, outcome Outcome) {
 		t.log.Info("exec report", attrs...)
 	case OutcomeDuplicate:
 		t.log.Debug("exec report repeated", attrs...)
+	case OutcomeInvalid:
+		// The one outcome that is not a protocol artefact: the venue's reports
+		// disagree with themselves, so the system's belief about its own
+		// position is in doubt. The PO decided (after the Part 8 review) that
+		// this is an invariant violation — Part 13 wires it to a risk_event
+		// and halts submission on the venue until a manual reset. Until then it
+		// is the loudest thing this package can say.
+		t.log.Error("exec report invalid: the venue's reports disagree with themselves", append(attrs,
+			"report_cum_qty", r.CumQty.String(), "report_leaves_qty", r.LeavesQty.String(),
+			"order_qty", s.Qty.String())...)
 	default:
 		t.log.Warn("exec report not applied", append(attrs,
 			"report_cum_qty", r.CumQty.String(), "report_leaves_qty", r.LeavesQty.String(),
@@ -436,9 +569,9 @@ func (t *Tracker) Open() []Status {
 	return t.filter(func(s Status) bool { return !s.Terminal() })
 }
 
-// Overdue returns every open order past its deadline, oldest first. It is a
-// question, not an action: what to do about an overdue order — cancel it,
-// unwind the other leg, alert — is the router's and the risk engine's.
+// Overdue returns every order the venue has not acknowledged by its deadline,
+// oldest first. It is a question, not an action: what to do about one — cancel
+// it, unwind the other leg, alert — is the router's and the risk engine's.
 func (t *Tracker) Overdue(now time.Time) []Status {
 	return t.filter(func(s Status) bool { return s.Overdue(now) })
 }
@@ -461,18 +594,10 @@ func (t *Tracker) filter(keep func(Status) bool) []Status {
 	return out
 }
 
-// Forget drops an order the caller has finished with. Terminal orders are
-// otherwise kept, because a resend can replay their reports long after they
-// ended and a forgotten order would be adopted back as a new one.
-//
-// Nothing calls this yet, and the retention policy it implements one half of is
-// an OPEN ITEM, not a decision: the map only grows, one Tracker lives for the
-// life of the carry process, and Part 15's router submits continuously. How
-// long an ended order must stay remembered is a trade between the resend window
-// it protects and unbounded memory, and neither the plan nor the spec says.
-// Named for the PO at Part 8 rather than answered here (build-plan changelog).
-func (t *Tracker) Forget(id carry.OrderID) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	delete(t.orders, id)
-}
+// Orders are kept for the life of the process, and there is deliberately no way
+// to drop one. A resend can replay an order's reports long after it ended, and
+// a forgotten order would be adopted back as a new one — the duplicate this
+// tracker exists to recognise. The cost is a few hundred bytes per order for a
+// system that places a handful a day, which is not memory under pressure; the
+// PO decided it that way after the Part 8 review, to be revisited only if the
+// order rate changes by orders of magnitude.

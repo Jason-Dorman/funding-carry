@@ -212,6 +212,7 @@ func TestSimVenueValidationRejectsAFillModelThatWouldLie(t *testing.T) {
 		{"slippage that improves the price", map[string]string{"SIM_SLIPPAGE_BPS": "-2"}, "SIM_SLIPPAGE_BPS"},
 		{"a partial threshold of zero", map[string]string{"SIM_PARTIAL_THRESHOLD": "0"}, "SIM_PARTIAL_THRESHOLD"},
 		{"a negative partial threshold", map[string]string{"SIM_PARTIAL_THRESHOLD": "-1"}, "SIM_PARTIAL_THRESHOLD"},
+		{"a comp id that is not the simulator's", map[string]string{"FIX_TARGET": "SIMV2"}, "FIX_TARGET"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
@@ -352,6 +353,15 @@ func TestCarryValidationRejectsUnsafeConfigurations(t *testing.T) {
 			name:     "contract size of zero",
 			env:      map[string]string{"CONTRACT_SIZE_ETH": "0"},
 			wantText: "CONTRACT_SIZE_ETH",
+		},
+		{
+			// The order path is sim-only in v1. Pointing carry's FIX session at
+			// a counterparty that is not the simulator is refused at startup,
+			// so the safety-rail sentence is enforced by code rather than by a
+			// configuration value happening to be right.
+			name:     "FIX session pointed at something other than the simulator",
+			env:      map[string]string{"FIX_TARGET": "COINBASE"},
+			wantText: "FIX_TARGET",
 		},
 	}
 
