@@ -22,12 +22,14 @@ type AccountSource interface {
 }
 
 // AccountPoller writes cb_account_state: the polled truth the risk engine reads
-// its margin ratio from, and the balances the treasury reconciles against.
+// its margin health from, and the balances the treasury reconciles against.
 //
 // The system never derives a liquidation price of its own (API spec section
 // 5.2). It reads the venue's own available margin and liquidation threshold and
 // divides them, which is why a failure here degrades to staleness rather than
-// to an estimate.
+// to an estimate. That divided ratio is a cross-check; the figure the hard stop
+// will read is the venue's reported liquidation_buffer_percentage, which this
+// poller does not yet capture — Part 5A adds it (ADR-0022).
 type AccountPoller struct {
 	source   AccountSource
 	product  string

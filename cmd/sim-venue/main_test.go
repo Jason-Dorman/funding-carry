@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -190,6 +191,36 @@ func TestSimulateFailsOnAnUnusableStorePath(t *testing.T) {
 	err := simulate(context.Background(), cfg, &recordingSender{}, fakeBooks{}, testLogger())
 	if err == nil {
 		t.Fatal("simulate succeeded with a store path it could not create")
+	}
+}
+
+// A metrics endpoint that cannot bind fails the startup, rather than leaving
+// the simulator accepting orders with no way to observe it (metrics.Listen).
+func TestSimulateFailsWhenTheMetricsEndpointCannotBind(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy a port: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+
+	cfg := testConfig(t)
+	cfg.MetricsAddr = occupied.Addr().String()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- simulate(context.Background(), cfg, &recordingSender{}, fakeBooks{}, testLogger())
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("simulate succeeded with a metrics address it could not bind")
+		}
+		if !strings.Contains(err.Error(), "listen on") {
+			t.Errorf("error is %v, want the bind failure named", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("simulate kept running with no metrics endpoint")
 	}
 }
 

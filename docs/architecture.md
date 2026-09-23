@@ -97,7 +97,7 @@ internal/treasury/   internal/db/        internal/config/
 research/            deploy/             docs/
 ```
 
-`internal/db` is the shared persistence layer: the pgx pool (with the shopspring codec registered so `numeric` is a `decimal` on the wire), the embedded SQL migrations, the typed row structs that enumerate every table the system writes to, and the batch writer. `cmd/migrate` is a fourth, one-shot binary that applies those migrations and seeds the product row; it is not a service and is not part of `make up`. `internal/config` loads each binary's typed configuration from the environment ([API spec §7](api-spec.md#7-configuration-surface)) and is the one place that knows how a credential is redacted; `internal/metrics` owns each binary's Prometheus registry and its `/metrics` and `/healthz` endpoints. Everything else matches spec §6.11.
+`internal/db` is the shared persistence layer: the pgx pool (with the shopspring codec registered so `numeric` is a `decimal` on the wire), the embedded SQL migrations, the typed row structs that enumerate every table the system writes to, the batch writer, and the read-only `Reader` — the "latest row per source" reads behind `carry`'s venue state cache (`internal/venue`, [API spec §3.7](api-spec.md#37-venue-state-cache-internalvenue)) and the coverage reads behind ingest's backfill. `carry` consumes the reads through a `Store` interface it defines itself, so the cache is tested against a fake and against a seeded schema, and reads through the pool `cmd/carry` opens at start and closes last. `cmd/migrate` is a fourth, one-shot binary that applies those migrations and seeds the product row; it is not a service and is not part of `make up`. `internal/config` loads each binary's typed configuration from the environment ([API spec §7](api-spec.md#7-configuration-surface)) and is the one place that knows how a credential is redacted; `internal/metrics` owns each binary's Prometheus registry and its `/metrics` and `/healthz` endpoints. Everything else matches spec §6.11.
 
 ---
 
@@ -142,7 +142,7 @@ Rules, enforced in review:
 
 1. **One writer per binary.** Stream goroutines never call the DB.
 
-   **Reading is a narrow, named exception.** The rule exists to keep *writes* serialized through one goroutine, so insert order, batching and failure handling have exactly one home; a read is none of those. `internal/db.Reader` exists for one caller — the backfill, which has to know what it already holds before deciding what to download, and would otherwise re-fetch forty-five days to discover that forty-five days are present. It also buys something less obvious: a reconstruction computed from *stored* bars is a function of the database, so anyone can recompute it and get the same answer, where one computed from a particular download is a function of what that call happened to return. For the series the whole signal rests on, reproducibility is worth more than the simplicity of not reading. They publish typed structs to channels; the writer batches inserts (interval- and size-triggered flush) and sends each flush as a single pgx batch, which Postgres runs in one implicit transaction — so a flush lands whole or not at all, in one round trip (demonstrated in `TestBatchIsAtomic`, not assumed). The channel is bounded: when it fills, producers block, which is the backpressure that keeps an unreachable database from turning into unbounded memory.
+   **Reading is a narrow, named exception.** The rule exists to keep *writes* serialized through one goroutine, so insert order, batching and failure handling have exactly one home; a read is none of those. `internal/db.Reader` now has three callers — ingest's backfill, sim-venue's `LatestBook`, and `carry`'s venue state cache — and the rule they are an exception to is *one-writer*, not "nobody reads": the reader is read-only, and none of them can insert. The backfill is the one that shaped it: it has to know what it already holds before deciding what to download, and would otherwise re-fetch forty-five days to discover that forty-five days are present. It also buys something less obvious: a reconstruction computed from *stored* bars is a function of the database, so anyone can recompute it and get the same answer, where one computed from a particular download is a function of what that call happened to return. For the series the whole signal rests on, reproducibility is worth more than the simplicity of not reading. They publish typed structs to channels; the writer batches inserts (interval- and size-triggered flush) and sends each flush as a single pgx batch, which Postgres runs in one implicit transaction — so a flush lands whole or not at all, in one round trip (demonstrated in `TestBatchIsAtomic`, not assumed). The channel is bounded: when it fills, producers block, which is the backpressure that keeps an unreachable database from turning into unbounded memory.
 
    **A failed flush is re-sent, and re-sending is safe by construction.** Every insert carries `ON CONFLICT … DO NOTHING` against the natural key of its table ([ADR-0012](decisions/0012-idempotent-inserts-natural-keys.md)), so a batch that turns out to have already committed lands the second time as a no-op. That matters because a send can fail in a state where the outcome is unknowable — every statement acknowledged, the connection lost before the commit's acknowledgement — and the driver cannot tell that from "never sent". Without the keys the writer had to abandon those batches, which bought correctness with availability at the worst moment: a dropped connection became a restart, a restart became a gap, and a gap in the self-recorded series (`cb_venue_state`, `cb_features`, `cb_book_snapshots`, `cb_trades_agg`) is unrecoverable, because those series are computed here and exist nowhere else to backfill from.
 
@@ -219,7 +219,7 @@ States and transitions per spec §8. Thresholds (`z_enter`, `z_exit`, `f_flip`, 
 ```mermaid
 stateDiagram-v2
     [*] --> FLAT
-    FLAT --> ENTER: funding positive AND z >= z_enter<br/>AND carry >= k x costs AND basis positive but under extreme<br/>AND margin ratio OK AND one whole contract affordable<br/>AND not in maintenance window AND not blocked
+    FLAT --> ENTER: funding positive AND z >= z_enter<br/>AND carry >= k x costs AND basis positive but under extreme<br/>AND margin health OK AND one whole contract affordable<br/>AND not in maintenance window AND not blocked
     ENTER --> HOLD: both legs filled
     HOLD --> REBALANCE: abs residual delta > tolerance<br/>trimmed on the spot leg
     REBALANCE --> HOLD: delta restored
@@ -390,6 +390,11 @@ erDiagram
         timestamptz ts
         numeric available_margin
         numeric liquidation_threshold
+        numeric liquidation_buffer_pct
+        text liquidation_buffer_pct_raw
+        text margin_health_provenance
+        numeric overnight_maintenance_margin
+        numeric intraday_maintenance_margin
         numeric margin_ratio
         numeric cfm_usd_balance
         numeric cbi_usd_balance
@@ -455,9 +460,10 @@ Reading the database is otherwise reserved to `carry`; `internal/db.Reader` is t
 |---|---|---|
 | WS disconnect | read error / heartbeat miss | per-stream reconnect with backoff + jitter; gap counter; resubscribe |
 | Data gap | sequence/timestamp discontinuity per stream | gap metric; backfill via REST where history allows |
-| Stale feed | `last_seen` age > threshold | `BLOCKED` for new entries; alert at 60s; hard-stop evaluation continues on last good data |
+| Stale feed | in `ingest`, `last_seen` age > threshold; in `carry`, the venue state cache judges each source by the age of its newest **row** against `STALE_FEED_SECS` and exports the flag it decided on ([API spec §3.7](api-spec.md#37-venue-state-cache-internalvenue)) | `BLOCKED` for new entries; alert at 60s; hard-stop evaluation continues on last good data — which the cache guarantees by keeping a source's last row when a read fails and letting it age rather than dropping it |
 | FIX session drop | quickfixgo session state | auto re-logon, sequence recovery from disk store; alert |
-| Hard stop breach (notional, leverage, margin-ratio floor, basis blowout, funding flip, cascade) | risk engine, every tick | flatten via fastest venue path, `risk_event` row, alert; manual reset required |
+| Hard stop breach (notional, leverage, **liquidation-buffer floor**, basis blowout, funding flip, cascade) | risk engine, every tick | flatten via fastest venue path, `risk_event` row, alert; manual reset required |
+| Venue margin health missing or stale (`liquidation_buffer_percentage` absent, unparsed, or older than `STALE_FEED_SECS`) | risk engine, every tick | **block new entries**, `MARGIN_DATA_UNAVAILABLE` risk event, alert. The derived `margin_ratio` is **not** substituted — it is a reconciliation metric, and trading on it here would mean acting on a number that happens to still divide ([ADR-0022](decisions/0022-margin-health-from-venue-buffer.md)) |
 | Leg failure on entry | ExecReport timeout on second leg | unwind first leg immediately |
 | Venue reports disagree with themselves (an `invalid` ExecReport: more filled than ordered, a cancel losing a fill) | exec state machine, per report | invariant violation: `risk_event` row, submission halted on that venue until manual reset (Part 13). Until then: Error log + `carry_exec_reports_total{outcome="invalid"}` |
 | Venue not acknowledging orders | `carry_orders_overdue` > 0 past `ORDER_TIMEOUT` | router (Part 15) cancels and, on an entry's second leg, unwinds the first. The gauge says *that* acks are being missed, not by how much ([api-spec §3.2](api-spec.md#32-exec-report-state-machine)) |
@@ -465,6 +471,7 @@ Reading the database is otherwise reserved to `carry`; `internal/db.Reader` is t
 | Daily loss limit | realized+unrealized P&L vs limit | flatten, `BLOCKED` until UTC day roll |
 | Operator kill switch | config flag / signal | cancel all open orders, flatten, halt submission on both live venues |
 | Process crash | Compose restart policy | on restart: reload positions from DB, resume FIX with persisted seq nums, re-derive state — DB is the source of truth, no in-memory-only state |
+| Metrics endpoint cannot bind | `metrics.Listen`, called by all three binaries before anything else starts | **refuse to start**, naming the address. The endpoint is bound synchronously so the failure is a startup failure: a bind that failed inside the serving goroutine went unread until shutdown, and the process ran on with a live session and a live decision loop, no `/metrics` and no `/healthz`. Compose restart policies fire on **exit**, not on `unhealthy`, so nothing recovered it — the same way a writer that dies without cancelling its producers defeats the restart policy the row above relies on. Binding first also keeps the rule safe: after the bind, `Serve` returns only on failure or cancellation, so this can only fire before any session is up and before any position exists *(found by the Part 9 review in Part 1/8 wiring)* |
 | Maintenance window (Fri 17:00–18:00 ET) | venue calendar + `status` channel | no new orders, no rebalances; no funding published for that hour, so the funding series records a gap rather than a zero |
 | Funding reconciliation drift | computed accrual vs cash adjustments applied twice daily | `funding_reconciliation_error` metric; alert on drift beyond tolerance; computed rate flagged `funding_source = "computed"` |
 
@@ -512,9 +519,9 @@ Compose restart policy the table above relies on never fires
 
 ## 9. Observability
 
-- **Prometheus** (catalog in [API spec §6](api-spec.md#6-prometheus-metrics)): funding rate/z, basis, net delta, accrued funding, P&L split by component, order round-trip latency, FIX session state, WS gap counts, feed staleness, margin ratio, funding reconciliation error.
+- **Prometheus** (catalog in [API spec §6](api-spec.md#6-prometheus-metrics)): funding rate/z, basis, net delta, accrued funding, P&L split by component, order round-trip latency, FIX session state, WS gap counts, feed staleness, margin health (the venue's reported liquidation buffer; the derived ratio beside it as a cross-check), funding reconciliation error.
 - **Grafana**, four panels: (1) funding & basis, (2) position & delta, (3) P&L decomposition, (4) system health. Headline card: *"Who is paying whom, how much, and is the crowd getting exhausted?"*
-- **Alertmanager:** FIX session down, WS gap > 30s, delta breach, hard-stop trigger, margin ratio < floor, feed stale > 60s, funding reconciliation drift.
+- **Alertmanager:** FIX session down, WS gap > 30s, delta breach, hard-stop trigger, liquidation buffer < floor, venue margin data unavailable, feed stale > 60s, funding reconciliation drift.
 
 ---
 

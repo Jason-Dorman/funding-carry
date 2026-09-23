@@ -286,7 +286,15 @@ type Carry struct {
 	Execution       Execution
 	FIX             FIXSession
 	Maintenance     MaintenanceWindow
-	Secrets         Secrets
+	// VenueRefresh is how often the venue state cache re-reads the newest
+	// rows. It is POLL_REST_SECS, the same value ingest samples
+	// cb_venue_state and cb_account_state on (ADR-0014), because rows cannot
+	// change faster than they are written and one variable cannot disagree
+	// with itself: reading on the cadence the rows land on is what makes
+	// "age of the newest row" mean "how far behind the feed is" rather than
+	// "how the two intervals happened to beat".
+	VenueRefresh time.Duration
+	Secrets      Secrets
 }
 
 // MigrateCmd configures cmd/migrate, which applies the schema and seeds the
@@ -360,8 +368,8 @@ func loadCarry(lookup lookupFunc) (*Carry, error) {
 			MaxLeverage:              l.Decimal("MAX_LEVERAGE", "3"),
 			MarginRatioFloor:         l.Decimal("MARGIN_RATIO_FLOOR", "1.5"),
 			IntradayMarginOptIn:      l.Bool("INTRADAY_MARGIN_OPT_IN", false),
-			DailyLossLimitUSD:        l.Decimal("DAILY_LOSS_LIMIT_USD", "25"),
-			FundingReconToleranceUSD: l.Decimal("FUNDING_RECON_TOLERANCE_USD", "0.50"),
+			DailyLossLimitUSD:        l.Decimal("DAILY_LOSS_LIMIT_USD", "50"),
+			FundingReconToleranceUSD: l.Decimal("FUNDING_RECON_TOLERANCE_USD", "0.02"),
 			StaleFeed:                l.Seconds("STALE_FEED_SECS", 60*time.Second),
 			KillSwitch:               l.Bool("KILL_SWITCH", false),
 		},
@@ -374,9 +382,10 @@ func loadCarry(lookup lookupFunc) (*Carry, error) {
 		Execution: Execution{
 			OrderTimeout: l.Duration("ORDER_TIMEOUT", defaultOrderTimeout),
 		},
-		FIX:         l.fix(),
-		Maintenance: l.Window("MAINTENANCE_BREAK", defaultMaintenanceBreak),
-		Secrets:     l.secrets(),
+		VenueRefresh: l.Seconds("POLL_REST_SECS", 5*time.Second),
+		FIX:          l.fix(),
+		Maintenance:  l.Window("MAINTENANCE_BREAK", defaultMaintenanceBreak),
+		Secrets:      l.secrets(),
 	}
 	// Parse errors are reported on their own: validating values that failed to
 	// parse would report a second, misleading error for the same mistake.

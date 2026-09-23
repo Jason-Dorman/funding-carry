@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -271,6 +273,40 @@ func (s *recordingSender) batches() int {
 // that does not parse would take base_state down at startup on a machine that
 // never overrode it. This runs the real production path over the real committed
 // values rather than over a fixture.
+// A metrics endpoint that cannot bind fails the startup, rather than leaving
+// ingest recording with no way to observe it (metrics.Listen). Compose restart
+// policies fire on exit, not on unhealthy, so a binary that kept running here
+// would sit up and unobservable until someone stopped it.
+func TestPipelineFailsWhenTheMetricsEndpointCannotBind(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy a port: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+
+	cfg := testConfig(t)
+	cfg.MetricsAddr = occupied.Addr().String()
+
+	sender := &recordingSender{}
+	done := make(chan error, 1)
+	go func() {
+		done <- pipeline(context.Background(), cfg, sender, nil,
+			&tickingDialer{interval: 5 * time.Millisecond}, testLogger())
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("pipeline succeeded with a metrics address it could not bind")
+		}
+		if !strings.Contains(err.Error(), "listen on") {
+			t.Errorf("error is %v, want the bind failure named", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("pipeline kept running with no metrics endpoint")
+	}
+}
+
 func TestChainReaderParsesTheCommittedDefaults(t *testing.T) {
 	// Emptied rather than assumed absent: config treats an empty value as unset
 	// and falls back to the default, so this pins the test to the committed

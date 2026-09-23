@@ -128,7 +128,11 @@ func TestServerUsesItsOwnRegistry(t *testing.T) {
 	}
 }
 
-func TestServeReportsBindFailure(t *testing.T) {
+// The bind is reported by Listen, synchronously, which is what lets a binary
+// treat it as a startup failure. It used to happen inside Serve, whose error no
+// caller read until shutdown — so a taken port left the process running with no
+// endpoint (Part 9 adversarial review; see Listen).
+func TestListenReportsBindFailure(t *testing.T) {
 	// Take a port, then ask the server for the same one.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -136,12 +140,26 @@ func TestServeReportsBindFailure(t *testing.T) {
 	}
 	defer func() { _ = listener.Close() }()
 
-	err = NewServer(listener.Addr().String(), discardLogger()).Serve(context.Background())
+	err = NewServer(listener.Addr().String(), discardLogger()).Listen(context.Background())
 	if err == nil {
-		t.Fatal("Serve on a taken port: want error, got nil")
+		t.Fatal("Listen on a taken port: want error, got nil")
 	}
 	if !strings.Contains(err.Error(), "listen") {
 		t.Errorf("error = %v, want it to name the failed listen", err)
+	}
+}
+
+// Serving is not allowed to fall back to binding on its own. If it did, the
+// startup check above would be advisory: a binary that forgot to call Listen
+// would bind late, inside the goroutine, and be headless again the moment that
+// bind failed.
+func TestServeRefusesWithoutListen(t *testing.T) {
+	err := NewServer("127.0.0.1:0", discardLogger()).Serve(context.Background())
+	if err == nil {
+		t.Fatal("Serve without Listen: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "before Listen") {
+		t.Errorf("error = %v, want it to name the missing Listen", err)
 	}
 }
 
@@ -149,7 +167,13 @@ func TestServeStopsWhenContextIsAlreadyCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	if err := NewServer("127.0.0.1:0", discardLogger()).Serve(ctx); err != nil {
+	srv := NewServer("127.0.0.1:0", discardLogger())
+	// Bind on a live context: the point of the test is the serving half, and a
+	// canceled context would fail the bind for a different reason.
+	if err := srv.Listen(context.Background()); err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	if err := srv.Serve(ctx); err != nil {
 		t.Errorf("Serve with a canceled context returned %v, want nil", err)
 	}
 }

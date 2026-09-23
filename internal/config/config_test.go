@@ -137,6 +137,18 @@ func TestLoadCarryDefaults(t *testing.T) {
 	assertDecimal(t, "Signals.ZEnter", cfg.Signals.ZEnter, "1.5")
 	assertDecimal(t, "Risk.MarginRatioFloor", cfg.Risk.MarginRatioFloor, "1.5")
 	assertDecimal(t, "Risk.MaxNotionalUSD", cfg.Risk.MaxNotionalUSD, "500")
+	// Both pinned 2026-09-22 so the decision is falsifiable rather than merely
+	// written down (api-spec section 7, provenance audit).
+	//
+	// DailyLossLimitUSD is 10% of MAX_NOTIONAL_USD and is PROVISIONAL: its real
+	// base is daily basis mark-to-market volatility, which R1 measures. Daily
+	// funding at this notional is cents, so a limit sized against funding income
+	// would halt on ordinary spread wiggle. Interpretation is unchanged either
+	// way -- hitting it means halt and investigate.
+	assertDecimal(t, "Risk.DailyLossLimitUSD", cfg.Risk.DailyLossLimitUSD, "50")
+	// FundingReconToleranceUSD is the cent-rounding floor of the reconciliation
+	// itself, not a guess at how wrong a settlement might be.
+	assertDecimal(t, "Risk.FundingReconToleranceUSD", cfg.Risk.FundingReconToleranceUSD, "0.02")
 	if got, want := cfg.Signals.HorizonHours, 168; got != want {
 		t.Errorf("Signals.HorizonHours = %d, want %d", got, want)
 	}
@@ -160,6 +172,11 @@ func TestLoadCarryDefaults(t *testing.T) {
 	}
 	if got, want := cfg.Risk.StaleFeed, 60*time.Second; got != want {
 		t.Errorf("Risk.StaleFeed = %v, want %v", got, want)
+	}
+	// The cache refreshes on the cadence the rows are written on: the same
+	// POLL_REST_SECS ingest samples on, so the two cannot be set apart.
+	if got, want := cfg.VenueRefresh, 5*time.Second; got != want {
+		t.Errorf("VenueRefresh = %v, want %v", got, want)
 	}
 }
 

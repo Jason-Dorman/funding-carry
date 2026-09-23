@@ -1005,6 +1005,110 @@ func TestLatestBookReadsTheNewestTwoSidedSnapshot(t *testing.T) {
 	}
 }
 
+// The four reads behind carry's venue state cache (Part 9). Each returns the
+// newest row for its source, keeps NULL as NULL — a mark the newest row does
+// not have is not the older row's mark, and an empty account's margin ratio is
+// not zero — and reports a source nothing has been recorded for as "no row"
+// rather than as an error.
+func TestLatestReadsReturnTheNewestRowWithNullsIntact(t *testing.T) {
+	pool := testPool(t)
+	ctx := t.Context()
+	r := NewReader(pool)
+	const product = "LATEST-READS-TEST"
+	older := time.Date(2026, 9, 22, 3, 0, 0, 0, time.UTC)
+	newer := older.Add(5 * time.Second)
+	num := func(s string) decimal.NullDecimal { return Num(decimal.RequireFromString(s)) }
+
+	// base_state and cb_account_state have no product dimension, so "the newest
+	// row" is a property of the whole database — and this package's suite shares
+	// one that is never truncated between tests. Clear them, so the assertions
+	// below are about this test's rows rather than about whichever test in the
+	// file happened to use the latest date. Without this the test passes only
+	// while this fixture stays the file-wide maximum, and when it stops being so
+	// it fails while blaming "the older row" for a value an unrelated test
+	// wrote. Nothing later in the file reads either table.
+	for _, table := range []string{"base_state", "cb_account_state"} {
+		if _, err := pool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+
+	for _, row := range []Row{
+		VenueStateRow{TS: older, ProductID: product, FuturesMark: num("2699.00"), Mid: num("2700.00"),
+			FundingRateHourly: num("0.000010"), FundingSource: FundingSourceComputed},
+		VenueStateRow{TS: newer, ProductID: product, Mid: num("2742.50"), SpreadBps: num("3.65"),
+			MaintenanceWindow: true},
+		AccountStateRow{TS: older, AvailableMargin: num("1.00"), MarginRatio: num("2.5")},
+		AccountStateRow{TS: newer, AvailableMargin: num("3.15"), LiquidationThreshold: num("0"),
+			IntradayMarginEnabled: Opt(false)},
+		BaseStateRow{TS: older, SpotPx: num("2700.20"), SpotPxSource: SpotSourceCoinbase},
+		BaseStateRow{TS: newer, WalletETH: num("0.002274242082897966"), GasGwei: num("0.006")},
+		ProductRow{ProductID: product, ContractSize: num("0.10"), Tick: num("0.5"), UpdatedAt: older},
+	} {
+		d := row.row()
+		if _, err := pool.Exec(ctx, insertStatement(d), d.values...); err != nil {
+			t.Fatalf("insert %s: %v", d.table, err)
+		}
+	}
+
+	v, ok, err := r.LatestVenueState(ctx, product)
+	if err != nil || !ok {
+		t.Fatalf("latest venue state: ok=%v err=%v", ok, err)
+	}
+	if !v.TS.Equal(newer) || !v.Mid.Decimal.Equal(decimal.RequireFromString("2742.50")) || !v.MaintenanceWindow {
+		t.Errorf("venue state = %+v, want the newer row", v)
+	}
+	if v.FuturesMark.Valid || v.FundingRateHourly.Valid || v.FundingSource != "" {
+		t.Errorf("venue state carries mark=%v funding=%v source=%q from the older row; the newer row has none",
+			v.FuturesMark.Valid, v.FundingRateHourly.Valid, v.FundingSource)
+	}
+
+	a, ok, err := r.LatestAccountState(ctx)
+	if err != nil || !ok {
+		t.Fatalf("latest account state: ok=%v err=%v", ok, err)
+	}
+	if !a.TS.Equal(newer) || !a.AvailableMargin.Decimal.Equal(decimal.RequireFromString("3.15")) {
+		t.Errorf("account state = %+v, want the newer row", a)
+	}
+	if a.MarginRatio.Valid {
+		t.Errorf("margin ratio = %s, want NULL: an account with no position has no ratio, and the older row's is not it", a.MarginRatio.Decimal)
+	}
+	if a.IntradayMarginEnabled == nil || *a.IntradayMarginEnabled {
+		t.Errorf("intraday_margin_enabled = %v, want the stored false", a.IntradayMarginEnabled)
+	}
+
+	b, ok, err := r.LatestBaseState(ctx)
+	if err != nil || !ok {
+		t.Fatalf("latest base state: ok=%v err=%v", ok, err)
+	}
+	if !b.TS.Equal(newer) || !b.WalletETH.Decimal.Equal(decimal.RequireFromString("0.002274242082897966")) {
+		t.Errorf("base state = %+v, want the newer row", b)
+	}
+	if b.SpotPx.Valid || b.SpotPxSource != "" {
+		t.Errorf("base state carries spot_px=%v source=%q from the older row", b.SpotPx.Valid, b.SpotPxSource)
+	}
+
+	p, ok, err := r.Product(ctx, product)
+	if err != nil || !ok {
+		t.Fatalf("product: ok=%v err=%v", ok, err)
+	}
+	// Scale survives: 0.10 is scale 2 on the way back, not 0.1 (section 3.5).
+	if !p.ContractSize.Decimal.Equal(decimal.RequireFromString("0.10")) || p.ContractSize.Decimal.Exponent() != -2 {
+		t.Errorf("contract size = %s exp %d, want 0.10 at scale 2", p.ContractSize.Decimal, p.ContractSize.Decimal.Exponent())
+	}
+	if p.MakerFeeBps.Valid || p.Status != "" {
+		t.Errorf("product = %+v, want NULL fee and status as stored", p)
+	}
+
+	// Nothing recorded is not an error.
+	if _, ok, err := r.LatestVenueState(ctx, "NOTHING-RECORDED"); err != nil || ok {
+		t.Errorf("unrecorded product: ok=%v err=%v, want false and nil", ok, err)
+	}
+	if _, ok, err := r.Product(ctx, "NOTHING-RECORDED"); err != nil || ok {
+		t.Errorf("unknown product: ok=%v err=%v, want false and nil", ok, err)
+	}
+}
+
 // fix_sessions is the second table that upserts rather than doing nothing on
 // conflict. A session is written when it logs on, with no end and no sequence
 // numbers, and rewritten when it ends with the numbers the store finished on.

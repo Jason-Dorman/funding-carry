@@ -33,6 +33,8 @@ One short file per decision that shaped the system. ADRs make the build's judgme
 | [0018](0018-base-spot-px-from-the-pool.md) | `base_state.spot_px` is read from the Base pool, with the Coinbase mid as fallback | accepted |
 | [0019](0019-sim-fills-against-recorded-book.md) | sim-venue fills against the recorded book; orders rest, and no market means no fill | accepted |
 | [0020](0020-initiator-delivery-guarantees.md) | The FIX initiator refuses orders while down, never resends one, acknowledges a report only once it is on the channel, keeps cancel rejects out of the report stream; the tracker adopts unknown orders | accepted (amended after the Part 8 review) |
+| [0021](0021-feedok-market-data-tradeok-order-flow.md) | `FeedOK` is market-data freshness only; order flow gates on `TradeOK`, which adds the account and wallet sources | accepted |
+| [0022](0022-margin-health-from-venue-buffer.md) | The venue overloads "margin ratio" with opposite polarity across its API and its UI; our artifacts are named after the operator-visible definition, and margin health is the venue's reported `liquidation_buffer_percentage` rather than a ratio we divide | accepted |
 
 **Decision memos** — analysis prepared for a PO decision, promoted to an ADR once decided:
 

@@ -35,7 +35,7 @@ One goroutine **and one connection** per subscribed channel. Verified against th
 | `status` | product status | perp | maintenance-window flag in venue state |
 | `heartbeats` | 1/s liveness, no product | every connection | not persisted — see below |
 | `user` *(live only)* | order and fill updates | perp | `fills`, `ExecReport` stream for `cbVenue` |
-| `futures_balance_summary` *(live only)* | margin fields incl. `available_margin`, `liquidation_threshold` | account | margin ratio for the risk engine |
+| `futures_balance_summary` *(live only)* | margin fields incl. `available_margin`, `liquidation_threshold`, `liquidation_buffer_percentage`, the two margin-window measures | account | margin health for the risk engine — the venue's **reported** buffer percentage, not a ratio computed here ([ADR-0022](decisions/0022-margin-health-from-venue-buffer.md)) |
 
 **A candle is complete when a later one has been *observed*, not when a later one shares its message.** The channel sends a `snapshot` of ~100 candles on subscribe and then `update` messages carrying **exactly one** candle — the one currently forming, re-sent as its OHLCV moves. So on the five-minute roll the update carries only the new candle; the one that just closed is never mentioned again. A client that waits for a newer candle in the same message writes almost no bars, silently (build plan Part 4, found by the soak). Ingest keeps the newest start seen across messages and the latest version of each unwritten candle, which also means a bar is persisted with its final values rather than with whichever snapshot happened to mention it.
 
@@ -62,7 +62,7 @@ Polled on a ticker (default 5s for market/account context; hourly aligned for fu
 | `GET products/{id}/candles` | candle backfill — gap-driven, on every start, not just the first ([architecture §7](architecture.md#71-historical-recovery--the-backfill-pattern)) | `cb_bars` |
 | `GET products/{id}/product_book`, `best_bid_ask` | book/quote snapshot when WS is degraded | `cb_book_snapshots` |
 | `GET products/{id}/ticker` | recent trades — **not** `market_trades`, which 404s; the WS channel and the REST path have different names (verified 2026-08-22) | `cb_trades_agg` |
-| `GET cfm/balance_summary` | `available_margin`, `liquidation_threshold`, buying power, CBI/CFM balances | `cb_account_state` → margin ratio, treasury |
+| `GET cfm/balance_summary` | `available_margin`, `liquidation_threshold`, buying power, CBI/CFM balances — **plus `liquidation_buffer_amount`, `liquidation_buffer_percentage` and the `intraday_`/`overnight_margin_window_measure` objects, returned by the endpoint and not yet parsed** ([Part 5A](build-plan.md#part-5a--balance-summary-field-completion)) | `cb_account_state` → margin health, treasury |
 | `GET cfm/positions`, `cfm/positions/{id}` | `number_of_contracts`, `side`, `avg_entry_price`, `unrealized_pnl` | `cb_account_state`, `positions` reconciliation |
 | `GET cfm/intraday/current_margin_window`, `margin_setting` | confirm intraday margin is **off**, read overnight margin | risk config assertion. **`margin_setting` returns `setting` as a bare string**, not the nested object the field name implies (verified 2026-08-24) — decoding it as an object fails on every poll and leaves `intraday_margin_enabled` NULL, i.e. nobody checking the one setting v1 requires to be off |
 | `GET/POST/DELETE cfm/sweeps` | move idle margin back to spot | treasury (Part 18) |
@@ -231,7 +231,8 @@ type TargetPosition struct {
     PerpContracts  int64           // signed, short = negative — quantized leg, whole contracts
     ResidualDelta  decimal.Decimal // SpotQty - PerpContracts*contract_size, must be <= tolerance
     State          DecisionState
-    ReasonCodes    []string        // e.g. "Z_ENTER_MET", "CARRY_GT_KCOSTS", "FEED_STALE"
+    ReasonCodes    []string        // e.g. "Z_ENTER_MET", "CARRY_GT_KCOSTS", "FEED_STALE",
+                                   // "CAP_BELOW_ONE_CONTRACT" (Part 13; closed, append-only enum)
     Confidence     float64         // 0..1
     Inputs         FeatureSnapshot // persisted verbatim to decisions.input_snapshot
 }
@@ -285,6 +286,62 @@ Each stream decodes its channel's frames into the row types `internal/db` define
 Every frame is decoded into a `Message` carrying the channel, the connection's `sequence_num`, the **venue timestamp** and the **receive timestamp**. Those two are what the earlier draft of this section called for and they are used as it intended: the venue timestamp is what `ingest_last_seen_timestamp_seconds` reports, so the staleness gauge measures the age of the data rather than the age of the socket, and the receive timestamp is what the silence check and the sampling boundaries run on.
 
 Handlers optionally implement `TimeKeeper` (`Tick(ctx, now)`), which the stream calls on **every** frame including heartbeats. Output that is due at a wall-clock boundary rather than on message arrival — a book snapshot every `BOOK_SNAP_SECS`, a trade bucket closing on the minute — runs there, on the stream's own goroutine, so nothing in the package needs a timer beside the read loop or a lock around state the read loop owns.
+
+### 3.7 Venue state cache (`internal/venue`)
+
+`carry`'s read model (spec §6.2, [ADR-0003](decisions/0003-carry-reads-db-not-feeds.md)): the newest row of every source, refreshed from TimescaleDB on a ticker, with staleness judged **per source** and exposed as typed flags. It is what the feature engine (Part 10) reads and what the risk engine (Part 13) takes its "feed not stale" answer from.
+
+```go
+type Store interface {                       // defined in internal/venue, the consumer; *db.Reader satisfies it
+    LatestVenueState(ctx, product) (db.VenueStateRow, bool, error)
+    LatestAccountState(ctx)        (db.AccountStateRow, bool, error)
+    LatestBaseState(ctx)           (db.BaseStateRow, bool, error)
+    Product(ctx, product)          (db.ProductRow, bool, error)
+}
+
+type Source string                           // "perp" | "spot" | "account" | "wallet"
+
+type Freshness struct {
+    At      time.Time     // the newest row's own ts (the sampling boundary), zero when Missing
+    Age     time.Duration // RefreshedAt - At
+    Missing bool          // no row at all
+    Stale   bool          // Missing, or Age > STALE_FEED_SECS — the flag risk consumes
+}
+
+type Staleness struct{ Perp, Spot, Account, Wallet Freshness }
+func (Staleness) Of(Source) Freshness
+func (Staleness) FeedOK() bool               // !Perp.Stale && !Spot.Stale — MARKET DATA only, never "safe to act" alone
+func (Staleness) TradeOK() bool              // FeedOK && !Account.Stale && !Wallet.Stale — what order flow gates on
+
+type State struct {
+    RefreshedAt  time.Time
+    Perp, Spot   db.VenueStateRow             // newest cb_venue_state row per product; spot carries only mid/spread
+    Account      db.AccountStateRow           // newest cb_account_state row; MarginRatio NULL with no position
+    Wallet       db.BaseStateRow              // newest base_state row
+    Product      db.ProductRow                // cb_products for the perp: contract size, tick, caps, fees as confirmed
+    ProductKnown bool                         // false means `make migrate` has not run
+    Staleness    Staleness
+}
+
+func New(Store, Options, *Metrics, *slog.Logger) *Cache
+func (*Cache) Refresh(ctx) error             // one pass over every source; recomputes every age against the clock
+func (*Cache) Latest() State                 // a copy: one refresh's consistent picture
+func (*Cache) Run(ctx, every time.Duration)  // Refresh once, then on every tick, until cancelled; never returns an error
+```
+
+**The rows are the write types.** A table has one shape and the row struct beside its migration is already that shape; the reads return it rather than a second "stored" struct that could drift. NULL stays NULL through the cache — whether a missing mark is a gap to carry or a reason to block is decided one layer up, never by inventing a zero (§5).
+
+**Two rates, and which is "next".** Spec §6.2 asks for *funding now* and *estimated next funding*. `Perp.FundingRateHourly` with `FundingSource` is funding now — the venue's published rate when it has one, else the estimate. `Perp.FundingRateEst` is the system's own estimate and serves as the estimate of the next published rate, because the venue publishes one hour behind the estimator (Part 5 evidence): the local number for the hour just closed is the best available forecast of what the venue publishes next. No third column was invented.
+
+**Staleness is per source because the sources fail separately.** The perp quote stops at the Friday close while the wallet poller carries on; the account poller is absent entirely on a stack without a CDP credential; a Base RPC outage touches nothing but the wallet. Each `Freshness` is computed against the row's **own** `ts` — the sampling boundary ingest wrote it on — so the age is the age of the observation, not of the query. The limit is `STALE_FEED_SECS`, and the comparison is strictly greater: a row exactly at the limit is not yet stale.
+
+**`FeedOK` covers the market data and deliberately not the account or the wallet** *(Part 9 decision, confirmed by the PO 2026-09-22 with the condition below — see the [build plan](build-plan.md#part-9--venue-state-cache))*. "Feed" in [architecture §8](architecture.md#8-reliability-design) is the market data — what `ingest_last_seen_timestamp_seconds` and the `FeedStale` alert measure — and the two polled sources are absent by design on the public stack. Folding them into one boolean would leave that stack BLOCKED forever, which is not conservative but dead: a permanently BLOCKED flag says nothing and trains everyone to ignore it. The account and wallet flags are exposed beside `FeedOK`.
+
+**The condition: `FeedOK` at true is market-data freshness, never "safe to act".** Whatever gates order flow gates on the conjunction — `FeedOK && !Account.Stale && !Wallet.Stale`, named **`TradeOK`** so the trading stack has one word for the right question and cannot reach for `FeedOK` by mistake. On the public stack `TradeOK` is always false, which is correct there: nothing on that stack may trade. `FeedOK` alone is the public-stack reading and the decision rules' "feed not stale" input. **Nothing in `carry` gates order flow yet** — the only order path is the Part 8 probe, an operator pressing a button — so the gate itself is recorded as a Part 13 deliverable rather than claimed here. The failure this guards against is a dashboard or alert built on `carry_feed_ok == 1` letting a stale wallet trade through it, which is why the same sentence is in the series' help string (§6) and not only in this document.
+
+**A read that fails keeps the last good row and lets it age.** `Refresh` returns the error, but the source's previous row stays and its age is recomputed against the clock like every other's — so a database that stops answering degrades exactly as a feed that stops writing does: every source crosses `STALE_FEED_SECS` on its own schedule and trips, `FeedOK` goes false, and hard-stop evaluation continues on last good data (architecture §8). What the cache must never do is freeze: a refresh that hung would leave the flags at whatever they last read, so `Run` bounds each refresh to one interval. A source whose read *succeeds* with no row (a product nothing has recorded) reads as `Missing`, which is distinct from a failed read.
+
+**Refresh cadence.** `Run` ticks on `POLL_REST_SECS` — the same value ingest samples `cb_venue_state` and `cb_account_state` on ([ADR-0014](decisions/0014-one-sampler-owns-venue-state.md)) — because rows cannot change faster than they are written and one variable cannot disagree with itself. Part 10's tick driver takes over the call to `Refresh` when the feature engine arrives; the standalone loop is what makes staleness observable before then. Four metrics (§6): the per-source age and stale gauges, `carry_feed_ok`, and `carry_venue_refresh_seconds`, whose `0.05` bucket boundary is the part's acceptance criterion made readable.
 
 ---
 
@@ -459,11 +516,29 @@ base_state (
   gas_gwei numeric
 )
 
-cb_account_state (                 -- polled account/margin snapshot; risk reads margin_ratio from here
+cb_account_state (                 -- polled account/margin snapshot; risk reads margin health from here
   ts,
   available_margin numeric,
   liquidation_threshold numeric,
-  margin_ratio numeric,            -- available_margin / liquidation_threshold, as returned/derived
+  margin_ratio numeric,            -- DERIVED: available_margin / liquidation_threshold. A
+                                   -- RECONCILIATION metric, never a control value (ADR-0022).
+                                   -- Higher is safer; 1.0 is the liquidation point. NOT the
+                                   -- percentage the Coinbase app's Margin Ratio widget shows,
+                                   -- which points the other way -- venue doc 4.1.
+  -- Added by Part 5A. Until then these columns do not exist and the fields go unread.
+  liquidation_buffer_pct_raw text,     -- the venue's string, stored unreinterpreted
+  liquidation_buffer_pct numeric,      -- normalized; NULL until the scale is reconciled
+  liquidation_buffer_amount numeric,   -- available_margin - liquidation_threshold, as reported
+  margin_health_source_ts timestamptz, -- the venue's own stamp on the reading
+  margin_health_provenance text,       -- 'reported' | 'absent' | 'poll_failed' -- three states,
+                                       -- never collapsed into one NULL
+  intraday_maintenance_margin numeric,   overnight_maintenance_margin numeric,
+  intraday_initial_margin numeric,       overnight_initial_margin numeric,
+  intraday_liquidation_buffer numeric,   overnight_liquidation_buffer numeric,
+  intraday_total_hold numeric,           overnight_total_hold numeric,
+  intraday_futures_buying_power numeric, overnight_futures_buying_power numeric,
+  intraday_margin_window_type text,      overnight_margin_window_type text,
+  intraday_margin_level text,            overnight_margin_level text,
   cfm_usd_balance numeric,         -- futures account
   cbi_usd_balance numeric,         -- spot account
   futures_buying_power numeric,
@@ -520,7 +595,9 @@ funding_events (id PK, ts, product_id text,
                 settled_by FK NULL,       -- ACCRUAL -> the SETTLEMENT row that cleared it
                 spot_mark numeric, contracts bigint)
 
-risk_events (id PK, ts, kind text,        -- 'HARD_STOP_MARGIN_RATIO', 'FEED_STALE', ...
+risk_events (id PK, ts, kind text,        -- 'HARD_STOP_LIQUIDATION_BUFFER', 'MARGIN_DATA_UNAVAILABLE',
+                                          -- 'FEED_STALE', ... (append-only: 'HARD_STOP_MARGIN_RATIO'
+                                          -- is retained, unused, and never repurposed -- ADR-0022)
              detail jsonb, action_taken text, resolved_at)
 
 fix_sessions (id PK, session_id text, started_at, ended_at,
@@ -533,9 +610,23 @@ Conventions: `positions.venue` separates paper/sim/live P&L buckets; `funding_ev
 
 **Both sides of funding are rows.** `kind='ACCRUAL'` rows are what the system computed hourly; `kind='SETTLEMENT'` rows are cash adjustments actually observed on the account, twice daily. An accrual points at the settlement that cleared it via `settled_by` (NULL while pending), `positions.settlement_pending_funding` carries the unsettled sum, and the difference between matched accruals and their settlement is exactly what `carry_funding_reconciliation_error` measures. Storing only one side would make the reconciliation unfalsifiable.
 
-`cb_account_state` is the polled truth behind the risk engine's margin ratio and the treasury's balance reconciliation — the system never derives a liquidation price of its own.
+`cb_account_state` is the polled truth behind the risk engine's margin health and the treasury's balance reconciliation — the system never derives a liquidation price of its own.
 
-**`margin_ratio` is NULL when there is no position, and that is not the same as zero.** An account holding nothing reports a real `available_margin` and a `liquidation_threshold` of **0** (verified 2026-08-24), so the ratio is undefined and the column is NULL. Anything reading it — the Part 13 floor above all — must treat NULL as "nothing at risk". Reading it as zero would look like imminent liquidation on an account with no exposure at all.
+**Three numbers describe margin health, and only one of them is a control value.** [Venue doc §4.1](venue-coinbase-perps.md#41-margin-ratio-names-two-opposite-quantities--read-this-before-using-either) is the only place any of them is defined; this is what the schema does with them ([ADR-0022](decisions/0022-margin-health-from-venue-buffer.md)):
+
+| | Column | Role | Fatal at |
+|---|---|---|---|
+| Venue-reported buffer | `liquidation_buffer_pct` (+ `_raw`) | **the hard stop's input** | 0% |
+| Derived ratio | `margin_ratio` | reconciliation cross-check only — **never a fallback** | 1.0 |
+| App-widget ratio | not stored | what the PO sees in the Coinbase UI; recorded by hand in the [carry log](manual-carry-playbook.md) | 100% |
+
+The derived ratio and the reported buffer disagreeing is a **signal**, not a thing to resolve in favour of whichever is still computable. When the reported field is absent or stale, the row says so through `margin_health_provenance` and the risk engine blocks new entries with a `MARGIN_DATA_UNAVAILABLE` event — it does not fall back to `margin_ratio`, which would let a blind engine trade on a number that happens to still divide.
+
+**`liquidation_buffer_pct_raw` holds the venue's string unreinterpreted, and `liquidation_buffer_pct` stays NULL until the scale is known.** The field is documented as a string and no Coinbase source states whether 33% arrives as `0.33` or `33`. Storing the raw value means a scale mistake is correctable from history rather than baked into every row; normalizing before the answer is known would bake it in silently. [Part 5A](build-plan.md#part-5a--balance-summary-field-completion) reconciles one live reading against the Coinbase UI and fills the normalized column from that point.
+
+**The per-window measures are stored side by side because the blended figures cannot express the overnight rail.** `available_margin` and `liquidation_threshold` are not window-scoped, so the ≤ 3×-on-overnight-margin constraint (spec §4) is checkable only against `overnight_maintenance_margin`. Intraday margin can also be disabled by the venue without notice, applying overnight rates during intraday hours — so which window is in force is an observation, not a clock reading.
+
+**`margin_ratio` is NULL when there is no position, and that is not the same as zero.** An account holding nothing reports a real `available_margin` and a `liquidation_threshold` of **0** (verified 2026-08-24), so the ratio is undefined and the column is NULL. Anything reading it must treat NULL as "nothing at risk". Reading it as zero would look like imminent liquidation on an account with no exposure at all. Note the venue's *other* convention runs the opposite way — the app widget shows **0%** for an empty account — which is exactly why the two are never converted between (§4.1). **The same caution now applies to the buffer columns and has not been tested:** every `cfm/*` verification so far ran against an empty account, so whether `liquidation_buffer_percentage` arrives as absent, `0`, or `100` with nothing held is unverified and is Part 5A's to establish.
 
 ### 5.3 Constraints and indexes
 
@@ -583,7 +674,7 @@ Three obligations come with that table, and none of them is enforceable by the s
 
 ## 6. Prometheus metrics
 
-All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-cardinality (`product`, `stream`, `venue`, `leg`, `component`, `outcome`, `msg_type`, `dir`, `session`).
+All metrics prefixed per binary (`ingest_`, `carry_`, `simv_`). Labels kept low-cardinality (`product`, `stream`, `venue`, `leg`, `component`, `outcome`, `msg_type`, `dir`, `session`, `source`, `table`). The list is the registry of sanctioned label names, so a new one is added here in the same change that exports it. `source` carries a different closed vocabulary on each series that uses it — `dex|coinbase|none`, `venue|computed`, `perp|spot|account|wallet` — which is fine, because label semantics are per metric and each set is named in its own row below.
 
 One of those is not like the others: **`msg_type` takes its value straight off the wire**, so it is the only label in this catalogue that needs a mechanism rather than a convention to stay bounded. FIX tag 35 is whatever the peer put there and no data dictionary is configured, so an unfiltered label would let one buggy — or hostile — client on the FIX port mint a Prometheus series per message. The counter therefore folds anything outside the twelve message types this system speaks (`0 1 2 3 4 5 8 9 A D F j`) into **`other`**, and a message whose own type could not be read into **`unknown`**. The two are different problems and are counted apart: `other` is something arriving that we do not handle, `unknown` is something we could not parse at all.
 
@@ -614,12 +705,20 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `carry_residual_delta` | gauge | venue | delta not expressible in whole contracts |
 | `carry_contracts_held` | gauge | venue | signed contract count |
 | `carry_notional_usd` | gauge | venue | gross notional |
-| `carry_margin_ratio` | gauge | — | available_margin / liquidation_threshold |
+| `carry_margin_ratio` | gauge | — | **derived** `available_margin / liquidation_threshold`, higher is safer, 1.0 fatal. A **reconciliation** series, not the one the hard stop reads ([ADR-0022](decisions/0022-margin-health-from-venue-buffer.md)). It is **not** the Coinbase app's Margin Ratio widget, which is a percentage running the other way and fatal at 100% (§4.1 of the venue doc) — the help string says so, because a dashboard panel is exactly where the two get confused |
+| `carry_liquidation_buffer_pct` | gauge | — | *(Part 5A/13)* the venue's **reported** `liquidation_buffer_percentage`, normalized. **0% is liquidation.** This is the series `LIQUIDATION_BUFFER_FLOOR_PCT` is set against and the one the hard stop reads. Absent rather than zero when the venue does not report it — a zero here means imminent liquidation |
+| `carry_no_entry_reason` | gauge | reason | *(Part 13)* 1 on the reason currently blocking entry, from the closed reason-code enum — including **`CAP_BELOW_ONE_CONTRACT`**, emitted whenever `MAX_NOTIONAL_USD` admits zero contracts at the live mark. The metric is what an operator watching sees; the **typed reason in `decisions.reason_codes` is what the log can answer with a month later**, which is the half a gauge cannot supply |
+| `carry_margin_health_missing_total` | counter | reason | *(Part 5A)* polls where the reported buffer was unusable, by `reason` = `absent`\|`poll_failed`\|`unparsed`. Rising means the hard stop is flying on a cross-check it is not allowed to act on, which is why it blocks entries rather than continuing quietly |
+| `carry_margin_window` | gauge | window | *(Part 5A)* which margin window the venue reports as in force, 1 for the active one. The venue can disable intraday without notice, so this is an observation rather than a clock reading |
 | `carry_maintenance_window` | gauge | — | 1 during Fri 17:00–18:00 ET break |
+| `carry_venue_state_age_seconds` | gauge | source | age of the newest row per source (`perp`, `spot`, `account`, `wallet`) as of the last cache refresh: refresh time minus the row's **own** sampling `ts`, so the age of the observation rather than of the query (§3.7). **`+Inf` when the source has no row at all** — every source's series is created at `+Inf` before the first refresh, so a source nothing has ever recorded is a visible stale rather than an absent series nothing can alert on |
+| `carry_venue_state_stale` | gauge | source | 1 when the source is missing or older than `STALE_FEED_SECS`, else 0. **This is the typed flag the risk engine reads**, exported as decided rather than recomputed from the age in PromQL, so the dashboard shows the value the code acted on. All four initialized to 1 |
+| `carry_feed_ok` | gauge | — | **Market-data freshness, not account state**: 1 when both market-data sources (`perp`, `spot`) are fresh, else 0 (`Staleness.FeedOK`, §3.7). The account and wallet sources are deliberately not part of it; they have their own `carry_venue_state_stale` series. **At 1 this is never "safe to act" on its own.** Anything that gates order flow — an alert, a dashboard gate, Part 13's pre-trade checks — gates on the conjunction `carry_feed_ok == 1 and carry_venue_state_stale{source="account"} == 0 and carry_venue_state_stale{source="wallet"} == 0` (`Staleness.TradeOK` in code); `carry_feed_ok` alone is the public-stack reading, where those two sources do not exist. The help string says the same, so the meaning travels with the series *(PO condition on the Part 9 decision)*. Initialized to 0 |
+| `carry_venue_refresh_seconds` | histogram | — | time one refresh of the venue state cache took, all five reads included. Buckets `0.001 0.0025 0.005 0.01 0.025 0.05 0.1 0.25 0.5 1`: **`0.05` is a boundary on purpose**, so the share of refreshes inside Part 9's fifty-millisecond acceptance criterion reads straight off the cumulative count |
 | `carry_accrued_funding_usd` | gauge | venue | funding accrued, open position |
 | `carry_settlement_pending_funding_usd` | gauge | venue | accrued but not yet cash-settled |
 | `carry_treasury_timeouts_total` | counter | transition | treasury transition exceeded its timeout |
-| `carry_account_margin_ratio` | gauge | — | from `cb_account_state`, polled |
+| `carry_account_margin_ratio` | gauge | — | the derived ratio as polled into `cb_account_state`; same caveats as `carry_margin_ratio` above |
 | `carry_pnl_usd` | gauge | venue, component=price\|funding\|fees\|slippage | P&L decomposition |
 | `carry_decision_state` | gauge | — | enum-coded decision state |
 | `carry_order_roundtrip_seconds` | histogram | venue | submit → terminal ExecReport: from `Ack.At` to the terminal report's venue time. Observed once per order, on the terminal report; a resting order that waited an hour lands in the +Inf bucket, which is the right place for it. **An adopted order contributes nothing** (§3.2) — it has no acknowledgement, so it has no round trip, and the zero it would otherwise report would make a restart recovery read as the fastest execution the system has ever done |
@@ -647,7 +746,8 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `FeedStale` | `time() - ingest_last_seen_timestamp_seconds > 60` |
 | `DeltaBreach` | `abs(carry_net_delta) * mark > tolerance_usd` for 2m |
 | `HardStop` | `increase(carry_hard_stops_total[5m]) > 0` |
-| `MarginRatioLow` | `carry_margin_ratio < floor` (floor from config) |
+| `LiquidationBufferLow` | `carry_liquidation_buffer_pct < LIQUIDATION_BUFFER_FLOOR_PCT` *(Part 13 — replaces `MarginRatioLow`, which alerted on the derived ratio; [ADR-0022](decisions/0022-margin-health-from-venue-buffer.md))* |
+| `MarginDataUnavailable` | `increase(carry_margin_health_missing_total[15m]) > 0` *(Part 5A/13)* — the margin stop has no venue-reported input. Alertable on its own because the derived ratio staying healthy is not evidence that anything is |
 | `FundingReconciliationDrift` | `abs(carry_funding_reconciliation_error) > tolerance` for 1h |
 | `TreasuryTransitionTimeout` | `increase(carry_treasury_timeouts_total[15m]) > 0` |
 | `SessionKeyExpiring` | `carry_session_key_expiry_timestamp_seconds - time() < 7d` |
@@ -670,26 +770,27 @@ One prefix is deliberately outside this catalogue: the Part 3 learning exercise 
 | `BASE_RPC_URL`, `ALCHEMY_API_KEY` | ingest, carry | — — the Alchemy key lives in `BASE_RPC_URL`'s path, so **the URL is the credential**: it is never logged, and the transport-failure path deliberately does not wrap `*url.Error`, which quotes the URL it failed on |
 | `BASE_USDC_CONTRACT`, `BASE_WETH_CONTRACT`, `BASE_SPOT_POOL` | ingest | Base mainnet native USDC / WETH / the Uniswap v3 WETH-USDC 0.05% pool. Configuration rather than constants because all three are chain-scoped — Base Sepolia, where the Base leg starts (spec §1), needs different ones. Parsed in `cmd/ingest`, so a malformed address fails the startup rather than reading an address nobody meant; the pool is additionally verified against the two token addresses on the first poll |
 | `BACKFILL_WINDOW` | ingest | `1080h` (45 days) — how far back history must reach; `0` disables it. **The backfill runs on every start and is gap-driven:** it reads what is already stored, downloads only the ranges missing from it, and costs one query when nothing is missing (0.24 s observed, against ~70 s for a full download). A container down for an hour recovers that hour by itself; one that restarts twice in a minute does no network work the second time. The z-score needs ~30 days; the venue serves candles back to the perp's launch, but re-pulling a year on every restart is pointless once the first run has stored it ([ADR-0015](decisions/0015-backfilled-funding-provenance.md)) |
-| `POLL_REST_SECS`, `POLL_BASE_SECS`, `BOOK_SNAP_SECS` | ingest | 5 / 30 / 10 — `POLL_REST_SECS` is also the `cb_venue_state` sampling boundary, shared by the WS sampler and the Part 5 poller because both must agree on where a boundary is ([ADR-0014](decisions/0014-one-sampler-owns-venue-state.md)) |
+| `POLL_REST_SECS`, `POLL_BASE_SECS`, `BOOK_SNAP_SECS` | ingest; `POLL_REST_SECS` also carry | 5 / 30 / 10 — `POLL_REST_SECS` is also the `cb_venue_state` sampling boundary, shared by the WS sampler and the Part 5 poller because both must agree on where a boundary is ([ADR-0014](decisions/0014-one-sampler-owns-venue-state.md)). **`carry` reads it too, as the venue state cache's refresh interval** (Part 9, §3.7): the rows cannot change faster than they are written, so refreshing on the cadence they land on is what makes "age of the newest row" mean "how far behind the feed is" rather than how two intervals happened to beat — and one variable cannot be set apart from itself |
 | `Z_ENTER`, `Z_EXIT`, `F_FLIP` | carry | 1.5 / 0.5 / 0 *(placeholders — real values private)* |
 | `K_COST_MULT` | carry | 2 |
 | `CARRY_HORIZON_HOURS` | carry | 168 — the `N` in `expected_carry_N_hours`; sets how long ENTER assumes the carry is held. Costs are a fixed round-trip toll while funding accrues per hour, so this parameter, not the notional cap, decides whether ENTER can ever be true *(see the break-even study, build plan R1)* |
 | `BASIS_EXTREME` | carry | 0.007 |
 | `DELTA_TOLERANCE_ETH` | carry | 0.05 *(≤ half a contract)* |
-| `MAX_NOTIONAL_USD`, `MAX_LEVERAGE` | carry | 500 / 3 |
-| `MARGIN_RATIO_FLOOR` | carry | 1.5 *(placeholder — real value private)* |
+| `MAX_NOTIONAL_USD`, `MAX_LEVERAGE` | carry | 500 / 3. **`MAX_NOTIONAL_USD` confirmed at 500 by the PO 2026-09-22**, expected to rise; note the ETH-price ceiling recorded in the audit below |
+| `MARGIN_RATIO_FLOOR` | carry | 1.5 *(placeholder — real value private)*. **Superseded at Part 13** by `LIQUIDATION_BUFFER_FLOOR_PCT` ([ADR-0022](decisions/0022-margin-health-from-venue-buffer.md)): the floor moves off the derived ratio onto the venue's reported buffer percentage. Still the live variable until then, so it stays here and in `.env.example` |
+| `LIQUIDATION_BUFFER_FLOOR_PCT` | carry | *(Part 13 — **not yet in `.env.example` or `internal/config`**, and deliberately has no placeholder value. The floor is set from the scale reconciliation [Part 5A](build-plan.md#part-5a--balance-summary-field-completion) produces; a synthetic number written here before that would be indistinguishable from a decided one, which is how the two Part 4 thresholds went wrong.)* **Unset must fail the load, not default — see below** |
 | `INTRADAY_MARGIN_OPT_IN` | carry | `false` *(must stay false in v1)* |
 | `MAINTENANCE_BREAK` | carry, ingest | `Fri 17:00-18:00 America/New_York` |
-| `FUNDING_RECON_TOLERANCE_USD` | carry | 0.50 |
+| `FUNDING_RECON_TOLERANCE_USD` | carry | **0.02** *(computed 2026-09-22 — was 0.50, which exceeded the quantity being reconciled; see the audit below)* |
 | `TREASURY_TRANSFER_TIMEOUT` | carry | `5m` *(CBI→CFM auto-transfer visible)* |
 | `TREASURY_SWEEP_TIMEOUT` | carry | `24h` *(scheduled sweep landed)* |
 | `TREASURY_SETTLEMENT_TIMEOUT` | carry | `2h` *(past expected funding settlement)* |
 | `TREASURY_BASE_TX_TIMEOUT` | carry | `10m` *(Base tx submitted→confirmed)* |
-| `DAILY_LOSS_LIMIT_USD` | carry | — |
+| `DAILY_LOSS_LIMIT_USD` | carry | **50** *(10% of `MAX_NOTIONAL_USD`; **provisional**, replaced by R1's basis-volatility measurement — see the audit below)*. This row previously read `—` while `.env.example` and the loader carried a value |
 | `SPREAD_MAX_BPS`, `STALE_FEED_SECS` | carry | 5 / 60 |
 | `PRESSURE_WEIGHTS` | carry | `0.5,0.3,0.2` *(placeholder)* |
 | `FIX_SENDER`, `FIX_TARGET`, `FIX_HOST`, `FIX_PORT` | carry, sim-venue | `CARRY` / `SIMV` / `sim-venue` / 5001 — named from the initiator's point of view; §4.1 on which is which for the acceptor. **`FIX_TARGET` must be `SIMV` in v1, and both binaries refuse to start otherwise.** FIX is sim-only by spec (§12 item 3) and the live perp venue is REST, so a FIX session whose counterparty calls itself anything else is pointed somewhere this system has no business sending an order. The variable stays configurable for the day Part 21 decides otherwise; until then the sim-only claim in the safety rails is a startup check, not a sentence *(PO decision after the Part 8 review)* |
-| `ORDER_TIMEOUT` | carry | `30s` — how long the venue has to **acknowledge** an order, measured from `Submit` (§3.2). An unacknowledged order past it is overdue; an acknowledged one never is, however long it rests *(PO decision after the Part 8 review)*. The value is still a starting point rather than a measurement, and it is now **measurable**: `carry_order_ack_seconds` (§6) records the distribution it bounds, and Part 15 sets the value from the soak's data ([CHANGE-002](CHANGE-002-ack-latency-histogram.md)). `cmd/carry`'s probe reuses the same value as its own bound on the *fill*, which is the probe's alone: it is a one-shot CLI that has to terminate |
+| `ORDER_TIMEOUT` | carry | `30s` — how long the venue has to **acknowledge** an order, measured from `Submit` (§3.2). An unacknowledged order past it is overdue; an acknowledged one never is, however long it rests *(PO decision after the Part 8 review)*. The value is still a starting point rather than a measurement, and it is now **measurable**: `carry_order_ack_seconds` (§6) records the distribution it bounds, and Part 15 sets the value from the soak's data ([CHANGE-002](CHANGE-002-ack-latency-histogram.md)). `cmd/carry`'s probe reuses the same value as its own bound on the *fill*, which is the probe's alone: it is a one-shot CLI that has to terminate. Its wait for the venue's answer to the **cancel** that follows is **not** this value reused: that is a fixed 5 s (`cancelAnswerWait`) the pass path never reaches, because the wait returns the moment the terminal report lands — a 500 ms reuse of the fill bound held idle and folded under load *(PO decision after Part 9)* |
 | `FIX_STORE_PATH` | carry, sim-venue | `/var/lib/carry/fix` — quickfixgo's sequence store and message log (one subdirectory each). A Compose volume on **each** service (`fix-store` for sim-venue, `carry-fix-store` for carry): the two ends keep their own numbers and must never share one. `ResetOnLogon` is off, so a store that did not survive a restart would give a session that silently renumbered itself — and a store reset on one end only gives a session that never logs on (§4.1) |
 | `SIM_LATENCY_MS`, `SIM_SLIPPAGE_BPS` | sim-venue | 20 / 2 — latency jittered over [half, one and a half]; slippage always adverse and never through the limit |
 | `SIM_PARTIAL_THRESHOLD`, `SIM_PARTIAL_SLICES` | sim-venue | 10 / 3 — an order above the threshold prints in this many reports, whole contracts, summing to the order |
@@ -716,6 +817,46 @@ Three values fail `carry`'s load rather than being checked at trade time, becaus
 Credentials are typed as a redacting `Secret` in `internal/config`, reachable only through an explicit `Reveal()` at the point of use. Redaction covers `String()`, `GoString()` (`%#v`), `LogValue()` (slog attributes), `MarshalJSON` and `MarshalText` — the last two because slog resolves `LogValuer` only on the attribute value itself, so a `Secret` nested inside a struct handed to the JSON handler falls through to `encoding/json`, and JSON is the format containers log in. A `Secret` that redacted only under `fmt` and a top-level slog attribute would be redacted on every path except the one production uses; `TestSecretsAreRedacted` asserts all of them.
 
 `DATABASE_URL` is **not** a `Secret` — it is a plain `string` on `Common`, and it carries the database password. Nothing logs it today, and pgx redacts it in its own connection errors, but a `%v` of a whole config struct would print it. Typing it as a `Secret` is a change to the shape every later part consumes, so it is recorded here as an open item rather than made silently.
+
+**A threshold that has not been decided must block, not default.** `internal/config` offers `Required` (fails the load, string only) and `Decimal(key, def)` (silently substitutes the default), and **every entry in `RiskLimits` uses the second**. For a value like `LIQUIDATION_BUFFER_FLOOR_PCT`, whose safe magnitude is genuinely unknown until [Part 5A](build-plan.md#part-5a--balance-summary-field-completion) reconciles the venue's percentage scale, the defaulting form is the dangerous one: it yields a number that behaves like a decision and reads like one in a diff. Such a variable is introduced through a **`RequiredDecimal`** primitive that fails the load naming the variable, joining `INTRADAY_MARGIN_OPT_IN`, `MAX_LEVERAGE` and `DELTA_TOLERANCE_ETH` as rails enforced at startup rather than at trade time.
+
+The distinction that has to survive into the code, not just the intent: **"unset, therefore blocking" and "unset, therefore not checked" must be different states.** An unset threshold and a wrong-scale threshold are both *we do not know the safe line yet*, and both block entry exactly as missing or stale venue margin data does ([ADR-0022](decisions/0022-margin-health-from-venue-buffer.md)). A loader that cannot tell them apart reproduces the scale error in different clothes — and the scale error's dangerous branch fails **open** (venue doc §4.1), so this is the second place the same silence could hide.
+
+#### Provenance audit of `RiskLimits` defaults *(2026-09-22)*
+
+The finding above indicts the ten lines that exist today, not only the one Part 5A will add: *"a number nobody decided reads in a diff exactly like one that was"* describes [`config.go`'s `RiskLimits` literal](../internal/config/config.go) as written. Every entry was traced to the decision that set it. **Standing rule from here: a defaulted decimal in `RiskLimits` carries a deciding reference in this table, or it does not merge.**
+
+| Variable | Default | Deciding reference | Disposition |
+|---|---|---|---|
+| `DELTA_TOLERANCE_ETH` | `0.05` | [venue doc §2](venue-coinbase-perps.md#2-contract-specification) — half of the 0.10 ETH contract; spec §8; CHANGE-001 | **Cited, derived from a venue fact.** Also validated at load |
+| `MAX_LEVERAGE` | `3` | spec §4 and §8; [ADR-0009](decisions/0009-perp-venue-coinbase.md) | **Cited.** Also validated at load |
+| `INTRADAY_MARGIN_OPT_IN` | `false` | spec §4; [venue doc §4](venue-coinbase-perps.md#4-margin-leverage-liquidation) | **Cited.** Also validated at load |
+| `KILL_SWITCH` | `false` | initial state, not a threshold — a system that started killed could not start | **n/a** |
+| `STALE_FEED_SECS` | `60` | spec §6.9 / architecture §8 "alert at 60s"; consumed by §3.7 | ⚠️ **Cited but underived.** Its *consistency* with the alert is recorded; nothing records why 60. See the reconstructed rationale below |
+| `MAX_NOTIONAL_USD` | `500` | **PO decision 2026-09-22**, confirming the existing value as a starting point and expected to rise; wallet doctrine (spec §1) supplies the *low* | **Cited.** Carries a hard ETH-price ceiling — see below |
+| `FUNDING_RECON_TOLERANCE_USD` | **`0.02`** | **computed 2026-09-22** from the cent-rounding floor of the comparison — derivation below | **Cited.** Was `0.50`, which made Part 18's acceptance test unfalsifiable |
+| `DAILY_LOSS_LIMIT_USD` | **`50`** | **PO 2026-09-22** — 10% of notional, **explicitly provisional** pending R1's basis-volatility measurement; rationale below | **Cited as provisional**, with a scheduled replacement |
+| `MARGIN_RATIO_FLOOR` | `1.5` | none — labelled a placeholder since CHANGE-001 | **Superseded** by `LIQUIDATION_BUFFER_FLOOR_PCT` ([ADR-0022](decisions/0022-margin-health-from-venue-buffer.md)) |
+
+**All three uncited entries were closed on 2026-09-22.** They still move to the `RequiredDecimal` fail-closed form in [Part 5A](build-plan.md#part-5a--balance-summary-field-completion) — a decided value and a fail-closed loader are independent properties, and the second is what stops the *next* variable arriving uncited.
+
+**`DAILY_LOSS_LIMIT_USD` = 50 — provisional, with a scheduled replacement** *(PO)*. **Placeholder pending the basis-volatility measurement from [R1](build-plan.md#research-task-r1--carry-break-even-study-before-part-13-notebook-not-code); interpretation unchanged — hitting it means halt and investigate.** It is 10% of `MAX_NOTIONAL_USD`.
+
+The reason it is provisional rather than derived is worth keeping, because it rules out the obvious way to set it. This limit is a **hedge-broken detector**, so the tempting base is funding income — some multiple of what the book earns per day. **That base is wrong at this notional and would be dangerous.** Daily funding at 1 contract is *cents* ($0.07/day at the observed 8.80% mean), so any small multiple of it lands near $1, and a $1 daily limit would halt on ordinary **basis mark-to-market noise**, which at this size dwarfs funding income entirely. The detector would fire constantly on the spread wiggling and teach everyone to ignore it.
+
+The correct base is **daily basis mark-to-market volatility**: the limit belongs a few sigma above normal spread movement, so that tripping it means the hedge is broken rather than that the market breathed. That is an empirical quantity, R1 measures it, and until then this number is a ceiling that admits what it is instead of a derivation that isn't one.
+
+**`FUNDING_RECON_TOLERANCE_USD` = 0.02** *(computed)*. The old `0.50` did not merely lack a citation — it **exceeded the entire quantity it was meant to bound**. At 1 contract a twelve-hour settlement is worth `$0.033` at mean funding and `$0.156` at the observed 45-day maximum, so a $0.50 tolerance was **15×** and **3.2×** the whole settlement respectively: Part 18's acceptance criterion — *"the first real observed settlement must reconcile against the accruals it cleared within tolerance"* — **could not fail**. An unfalsifiable acceptance test is worse than no test, because it reports a pass.
+
+The replacement is derived from the **irreducible error floor of the comparison**, not from a guess about how wrong things might be. The venue settles cash in USD to the cent and our accrual is full-precision decimal, so worst-case rounding on both sides is **$0.02**; a 0.1% mark disagreement contributes `$0.00016` on a twelve-hour settlement and is negligible beside it. Anything larger than $0.02 is a real discrepancy rather than an artifact of how the two numbers are represented.
+
+**Its sensitivity is size-dependent, and at $500 notional it is a gross-error check only.** One missed or duplicated funding hour is worth `$0.0028` at mean funding — *below* the $0.02 rounding floor — so at one contract no tolerance can detect a single-hour error, whatever value is chosen. What $0.02 does catch at this size is sign inversion, a wrong contract count, or several missing hours. **Single-hour sensitivity begins at about 8 contracts (~$2,200 notional)** at mean funding, where one hour first exceeds the rounding floor. When `MAX_NOTIONAL_USD` rises the tolerance becomes **`max($0.02, 1% × E)`**, where **`E` is the expected funding accrual for the settlement period being reconciled** — that is, the sum of the hourly accruals the settlement is supposed to clear, typically twelve hours' worth. **`E` is not notional, and it is not the position's value**; 1% of notional at one contract would be $2.75, a hundred times the settlement it is meant to bound and a return to exactly the defect being fixed. The relative term overtakes the floor above roughly $10,000 notional. This is a Part 18 config-surface change, recorded in its deliverables rather than pre-built here.
+
+**`MAX_NOTIONAL_USD` = 500 bounds tuition, not viability.** The [R1 preliminary result](build-plan.md#research-task-r1--carry-break-even-study-before-part-13-notebook-not-code) settled what this number does and does not control: break-even funding is **21.61% at a $500 cap and 20.86% at $50,000**, so the cap is not a lever on whether the strategy works. Profitability is governed by the entry bar against live funding; the cap governs how much a mistake costs while the system is young. **Revisit when the strandage or the ceiling becomes operationally annoying** — today quantization strands **45%** of the cap (1 contract at $275.23 of a $500 budget) and the ceiling sits a **1.8× ETH move** away. Both are measurable irritations rather than judgement calls, which is the point of citing them.
+
+**It carries a hard ETH-price ceiling that nothing currently guards.** One contract is 0.10 ETH, so the cap admits `floor(500 / (0.10 × ETH))` contracts — **at ETH $2,752 that is 1 contract, leaving 45% of the cap unusable to quantization**, and **once ETH exceeds $5,000 it is zero contracts**. The ENTER rule's "at least one whole contract affordable" test would then be permanently false and **the system would silently never trade**, indistinguishable from a market it had judged unattractive. This is the same failure shape as the `STALE_FEED_SECS` finding below. ETH is within a 1.8× move of that ceiling, so Part 13 gets a startup check (`MAX_NOTIONAL_USD ≥ CONTRACT_SIZE_ETH × mark`) and a metric rather than a comment.
+
+**`STALE_FEED_SECS` has a reconstructed rationale, recorded as reconstructed.** 60 s is **twice the slowest producer cadence** (`POLL_BASE_SECS` = 30; `POLL_REST_SECS` = 5), which is the constraint that actually matters: a staleness limit at or below the interval at which a source is *written* marks that source permanently stale. At `STALE_FEED_SECS` = 20 with `POLL_BASE_SECS` = 30, the wallet source never leaves stale, `TradeOK` is never true, and **the system silently never trades** — indistinguishable from a quiet market. This relationship is **not currently enforced anywhere**, which makes it a cross-variable validation candidate for Part 5A (`STALE_FEED_SECS` must exceed the slowest poll interval). Flagged explicitly as *inferred by this audit, not read from a decision record* — confirming or replacing it is the PO's, and presenting a reconstruction as a citation is the exact failure this table exists to catch.
 
 ---
 

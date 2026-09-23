@@ -6,7 +6,9 @@
 // metrics endpoint. Part 8 adds the order-entry stack — the FIX initiator as
 // the first Venue, and the order-state machine every report flows through —
 // with a temporary command-line trigger to send one order, which Part 15's
-// router replaces. The decision tick is assembled in Parts 9 to 15.
+// router replaces. Part 9 adds the read side: the venue state cache, refreshed
+// from TimescaleDB on a ticker, which is the first thing every decision tick
+// does. The rest of the tick is assembled in Parts 10 to 15.
 package main
 
 import (
@@ -19,6 +21,7 @@ import (
 	"syscall"
 
 	"github.com/Jason-Dorman/funding-carry/internal/config"
+	"github.com/Jason-Dorman/funding-carry/internal/db"
 )
 
 const service = "carry"
@@ -78,7 +81,16 @@ func run(args []string) error {
 		"probe", probe != nil,
 	)
 
-	if err := trade(ctx, cfg, probe, log); err != nil {
+	// The pool is opened here and closed last, after trade has returned and
+	// every goroutine that reads through it has stopped: the shutdown order
+	// in architecture section 8 ends with the pool for exactly that reason.
+	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	if err := trade(ctx, cfg, db.NewReader(pool), probe, log); err != nil {
 		return err
 	}
 	log.Info("stopped")

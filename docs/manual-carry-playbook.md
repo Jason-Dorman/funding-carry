@@ -29,7 +29,12 @@ This is the step that differs most from a crypto-native perp venue. **Perp size 
 1. Pick a contract count `N` small enough that total loss would be annoying, not painful. At ETH ≈ $4,000, one contract ≈ $400 notional — `N = 1` is a legitimate first carry.
 2. **Perp leg:** short `N` contracts of `ETP-20DEC30-CDE` = `N × 0.10` ETH of short exposure.
 3. **Spot leg:** buy exactly `N × 0.10` ETH on Base. The spot leg is continuous, so it can match the perp leg exactly — that is why it is the leg used to trim delta.
-4. Keep effective leverage ≤ 3× on overnight margin, and confirm the account's margin ratio (`available_margin / liquidation_threshold`) leaves comfortable headroom at this size.
+4. Keep effective leverage ≤ 3× on overnight margin, and confirm margin health leaves comfortable headroom at this size — see the box below for which number to read.
+
+> **Which "margin ratio" — the app shows one, the API computes another, and they point opposite ways.**
+> Coinbase's **Margin Ratio widget** is `maintenance margin / funds for margin` as a percentage: **0% flat, 100% = liquidation, higher is worse.** The API's developer-docs ratio is `available_margin / liquidation_threshold`: **higher is safer, 1.0 = liquidation.** They are not exact reciprocals; do not convert between them. Definitions and sources: [venue doc §4.1](venue-coinbase-perps.md#41-margin-ratio-names-two-opposite-quantities--read-this-before-using-either).
+>
+> **While carrying, record both, plus the API's `liquidation_buffer_percentage`** (the figure the system's hard stop will read — **0% = liquidation**). These fields only mean anything on an account holding a position, `cfm/balance_summary` returns current state and no history, and [Part 5A](build-plan.md#part-5a--balance-summary-field-completion) has not shipped — so **every carry run without these readings is a window that cannot be backfilled.** One of these snapshots is also what settles whether the buffer percentage arrives as `0.33` or `33`; the system's floor cannot be set until it does.
 
 Do not try to express a notional target that isn't a whole number of contracts — round **down**, never up.
 
@@ -47,7 +52,11 @@ Do not try to express a notional target that isn't a whole number of contracts �
 
 **3. Perp leg — immediately after.** Short `N` contracts on Coinbase, limit order at or near mid (don't cross a wide spread). Record: order id, fill price, fee, timestamp. If the perp leg can't fill within ~15 minutes at a sane price, **unwind the spot leg** rather than sitting on naked long delta — this mirrors the system's leg-risk rule.
 
-**4. Entry verification** — net delta ≈ 0 (spot ETH ≈ `N × 0.10`), effective leverage ≤ 3×, margin ratio healthy with headroom. Record the entry-complete snapshot.
+**4. Entry verification** — net delta ≈ 0 (spot ETH ≈ `N × 0.10`), effective leverage ≤ 3×, margin health comfortable. Record the entry-complete snapshot.
+
+- [ ] **BLOCKING — the margin triple.** Three numbers, **one instant**, all verbatim: the Coinbase app's **Margin Ratio widget** percentage; the API's **`liquidation_buffer_percentage`** string exactly as returned; and the **derived ratio** `available_margin / liquidation_threshold`. This carries the same status as the hard-stop checks — not a note to make if convenient. Taken together at one instant they are evidence; taken minutes apart they are three numbers nobody can line up afterwards, because the account moved between them.
+
+Why it blocks: these fields mean nothing on an empty account, `cfm/balance_summary` returns current state and **no history**, and [Part 5A](build-plan.md#part-5a--balance-summary-field-completion) has not shipped. A carry run without the triple is an observation window no backfill can recover — and the **first** carry that captures it is very likely the only cheap chance to settle the scale question, since every later one costs a live position to reproduce.
 
 ## Hold procedure
 
@@ -55,7 +64,10 @@ Hold **≥ 24h, across several funding hours and at least one settlement**, so t
 
 - Funding accrues hourly but is **credited/debited as cash twice daily**. Log both: the hourly accrual you expect (`N × 0.10 × mark × rate`) and the actual cash adjustments when they land, with timestamps. The gap between them is exactly what `settlement_pending_funding` and `carry_funding_reconciliation_error` track in the system.
 - No funding is published for the Friday maintenance hour — record it as a gap, not a zero.
-- Daily check: funding still positive? basis blown out (> 0.7%)? margin ratio still comfortable? If funding flips negative and stays there, or basis goes extreme against the perp leg, exit — same rules the engine will use (spec §8).
+- Daily check: funding still positive? basis blown out (> 0.7%)? margin health still comfortable — app widget well under 100%, `liquidation_buffer_percentage` well above 0%? **Log the full triple each time**, same instant as before.
+- **Check directional consistency across consecutive triples**, and note any violation in the log: as the reported **buffer falls**, the **derived ratio must move toward its danger direction** (down, toward 1.0) and the **app widget must rise** (toward 100%). All three describe the same account approaching the same liquidation; they cannot disagree about which way that is.
+
+  This is the cheap invariant that catches exactly the class of error this part just found — a quantity read with the wrong polarity looks perfectly plausible in isolation and betrays itself only against a second reading of the same thing. **One recorded triple across a real move validates it before any code enforces it**, which is the right order: Part 5A's reconciliation check asserts this, and an assertion written from observed rows is testable in a way one written from a doc is not. A violation means one of the three is being read backwards — record it and stop, rather than resolving it in favour of whichever number looks right. If funding flips negative and stays there, or basis goes extreme against the perp leg, exit — same rules the engine will use (spec §8).
 
 ## Exit procedure (perp first, spot second)
 
@@ -83,7 +95,11 @@ Then write the **one-paragraph explanation** (spec wk-0b requirement): why you e
 
 One workbook, three sheets (columns mirror the DB schema — keep names exactly):
 
-**carries** (≈ `positions`): `carry_id, opened_at, closed_at, contracts, spot_qty, notional_usd, avg_spot_entry_px, avg_spot_exit_px, avg_perp_entry_px, avg_perp_exit_px, funding_accrued, funding_settled, fees, gas, slippage, pnl_price, pnl_total, entry_basis, exit_basis, entry_funding_rate, margin_ratio_at_entry, engine_signal (from wk 3), explanation`
+**carries** (≈ `positions`): `carry_id, opened_at, closed_at, contracts, spot_qty, notional_usd, avg_spot_entry_px, avg_spot_exit_px, avg_perp_entry_px, avg_perp_exit_px, funding_accrued, funding_settled, fees, gas, slippage, pnl_price, pnl_total, entry_basis, exit_basis, entry_funding_rate, margin_ratio_at_entry, ui_margin_ratio_pct_at_entry, liquidation_buffer_pct_at_entry, margin_triple_ts, engine_signal (from wk 3), explanation`
+
+> **The three `*_at_entry` margin columns and `margin_triple_ts` are required, not optional.** `margin_ratio_at_entry` is the derived API ratio (higher safer, 1.0 fatal); `ui_margin_ratio_pct_at_entry` is the Coinbase app widget (higher worse, 100% fatal); `liquidation_buffer_pct_at_entry` is the API string **verbatim, un-normalized, whatever scale it arrives in** — do not "tidy" it into a fraction or a percentage, because which one it already is, is the open question ([venue doc §4.1](venue-coinbase-perps.md#41-margin-ratio-names-two-opposite-quantities--read-this-before-using-either)). `margin_triple_ts` is the single instant all three were read at; three values without it are not a triple. A carry row is **incomplete** without all four.
+
+Optionally add a **margin_log** sheet — `carry_id, ts, ui_margin_ratio_pct, liquidation_buffer_pct_raw, margin_ratio_derived` — one row per daily check, which turns the directional-consistency test above into a series rather than a pair of endpoints.
 
 **fills** (≈ `fills`): `carry_id, ts, leg (spot|perp), side (buy|sell), qty (ETH for spot, contracts for perp), px, fee, tx_hash_or_order_id, quoted_px, slippage_bps`
 

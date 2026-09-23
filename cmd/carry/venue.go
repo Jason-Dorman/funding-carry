@@ -12,6 +12,7 @@ import (
 	"github.com/Jason-Dorman/funding-carry/internal/exec"
 	"github.com/Jason-Dorman/funding-carry/internal/fix"
 	"github.com/Jason-Dorman/funding-carry/internal/metrics"
+	venuestate "github.com/Jason-Dorman/funding-carry/internal/venue"
 )
 
 // trade wires the order-entry stack and blocks until it has stopped. Read it
@@ -32,8 +33,25 @@ import (
 // working across a restart is exactly the case the file-backed sequence store
 // exists for — the fill that prints while carry is down is recovered by resend
 // when it comes back, and the tracker adopts it.
-func trade(ctx context.Context, cfg *config.Carry, probe *probeOrder, log *slog.Logger) error {
+//
+// Part 9 adds the read side beside the order-entry stack: the venue state
+// cache, refreshed from TimescaleDB on POLL_REST_SECS. It runs on the venue's
+// context, so it is the first thing cancellation stops ("stop accepting
+// decisions" heads the shutdown order) and it is stopped on the probe path
+// too; the caller closes the pool only after trade has returned, so the loop
+// never reads through a closed pool. Part 10's tick driver takes over the
+// refresh when the feature engine arrives — the cache exposes Refresh for
+// exactly that — and this loop is what makes staleness observable before then.
+func trade(ctx context.Context, cfg *config.Carry, store venuestate.Store, probe *probeOrder, log *slog.Logger) error {
 	srv := metrics.NewServer(cfg.MetricsAddr, log)
+
+	// Bind before anything else starts. A metrics endpoint that failed to bind
+	// inside the serving goroutine would go unnoticed until shutdown, leaving
+	// the process running with no /metrics and no /healthz and no way for
+	// Compose to notice (metrics.Listen).
+	if err := srv.Listen(ctx); err != nil {
+		return err
+	}
 
 	// The metrics endpoint outlives the root context, the same way ingest's
 	// and sim-venue's do: the last reports arrive during the logout, and an
@@ -61,6 +79,17 @@ func trade(ctx context.Context, cfg *config.Carry, probe *probeOrder, log *slog.
 	defer stopVenue()
 	venueErr := make(chan error, 1)
 	go func() { venueErr <- venue.Run(venueCtx) }()
+
+	state := venuestate.New(store, venuestate.Options{
+		PerpProduct: cfg.PerpProductID,
+		SpotProduct: cfg.SpotProductID,
+		StaleAfter:  cfg.Risk.StaleFeed,
+	}, venuestate.NewMetrics(srv.Registry()), log)
+	refreshed := make(chan struct{})
+	go func() {
+		defer close(refreshed)
+		state.Run(venueCtx, cfg.VenueRefresh)
+	}()
 
 	// The drain is the consumer the venue's contract requires: every report is
 	// taken off the channel and sequenced by the tracker until the venue
@@ -106,6 +135,15 @@ func trade(ctx context.Context, cfg *config.Carry, probe *probeOrder, log *slog.
 
 	runErr := <-venueErr
 	<-drained
+	// The cache loop shares the venue's context, but that context is not
+	// necessarily cancelled when Run returns by itself (a store that could
+	// not be created) — the same path that once hung the gauge watcher below
+	// — so it is cancelled here explicitly before waiting. Waiting is what
+	// lets the caller close the pool safely: no refresh is in flight after
+	// this line. Found by TestTradeFailsOnAnUnusableStorePath hanging on the
+	// first version of this wiring.
+	stopVenue()
+	<-refreshed
 	// The drain has finished, so the tracker cannot change again and the
 	// watcher's last reading is the one the final scrape sees. Stopping it any
 	// earlier is what produced the impossible gauge pair above — and stopping
