@@ -120,24 +120,35 @@ func (p *probeOrder) run(ctx context.Context, venue carry.Venue, tracker *exec.T
 		"limit_px", p.order.LimitPx.String(), "tif", string(p.order.TIF))
 
 	status, _ := tracker.Status(p.order.ClOrdID)
-	timeout := status.Deadline.Sub(status.SubmittedAt)
 	status, outcome := p.await(ctx, tracker, log, time.Until(status.Deadline))
 	if outcome != waitUnfilled {
 		return nil
 	}
 
-	// Still working: cancel, and give the venue's answer a window of its own,
-	// the same length again.
+	// Still working: cancel, and wait for the venue's answer under a bound of
+	// its own. await returns the moment the terminal report lands, so the
+	// deadline costs nothing on the pass path and only bites on a venue that
+	// never answers.
 	log.Warn("probe order still working when its wait ran out; cancelling",
 		"state", string(status.State), "cum_qty", status.CumQty.String())
 	if err = venue.Cancel(ctx, p.order.ClOrdID); err != nil {
 		return fmt.Errorf("cancel probe order: %w", err)
 	}
-	if status, outcome = p.await(ctx, tracker, log, timeout); outcome == waitUnfilled {
-		return fmt.Errorf("probe order %s still %s after the cancel timed out", p.order.ClOrdID, status.State)
+	if status, outcome = p.await(ctx, tracker, log, cancelAnswerWait); outcome == waitUnfilled {
+		return fmt.Errorf("probe order %s still %s %s after the cancel", p.order.ClOrdID, status.State, cancelAnswerWait)
 	}
 	return nil
 }
+
+// cancelAnswerWait bounds how long the probe waits for the venue to answer its
+// cancel. It is deliberately NOT ORDER_TIMEOUT reused a second time: that
+// value is the bound on the FILL and is set short in tests, and a bound that
+// holds on an idle machine and folds under load turns a red test into noise.
+// A cancel is answered in milliseconds; five seconds is the deadline only a
+// venue that never answers can reach. (PO decision after Part 9, when the
+// Part 8 test missed a 500 ms reuse of the fill bound under a load average of
+// five and passed four of four idle.)
+const cancelAnswerWait = 5 * time.Second
 
 // waitOutcome is how a wait on the order ended.
 type waitOutcome int

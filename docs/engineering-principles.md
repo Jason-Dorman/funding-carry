@@ -99,6 +99,8 @@ Before committing, ask:
 - [ ] Are there obvious code smells?
 - [ ] Will this change break other parts?
 - [ ] Do I have tests for this?
+- [ ] **Any performance acceptance window spans at least one full cycle of every periodic process in the system.** Pool retirement, connection keepalive, token refresh, log rotation, chunk creation, scheduled jobs — anything on a timer puts its worst case outside a short window by construction, so a green run measures only the path that was warm. Part 9's `<50 ms` refresh criterion was demonstrated over five minutes against a one-hour connection lifetime: the window could contain exactly one cold connection, so the criterion was **unfalsifiable as measured** and the outliers it did see were blamed on machine load. Where a cycle is too long to wait out, compress it — the review shortened `MaxConnLifetime` to 5 s so an hour passed in five seconds — or state which regime the number describes. This is the same class of error as testing cancellation on a context nobody cancels: the test cannot fail, so it proves nothing.
+- [ ] **Every loop that waits on a context has a named owner responsible for cancelling it when its peer exits.** A goroutine parked on `ctx.Done()` whose context is only cancelled by a `defer` at the end of the function that also waits for it is a hang waiting for the one path where the peer returns on its own. Found twice in this project — Part 8's gauge watcher and Part 9's cache loop, both against a `Run` that returned without its context being cancelled — so it is a checklist item, not a lesson.
  
 ---
  

@@ -137,7 +137,18 @@ func (r *Reader) LatestFundingRate(ctx context.Context, product string, before t
 	if err := rows.Scan(&ts, &rate); err != nil {
 		return decimal.Decimal{}, time.Time{}, false, fmt.Errorf("scan latest funding rate: %w", err)
 	}
-	return rate, ts.UTC(), true, rows.Err()
+	// Close before reading Err, the same way latest.go's one does: pgx assigns
+	// the drain error inside Close, and Go evaluates a return expression before
+	// the deferred call runs — so `return ..., rows.Err()` reads the error
+	// before it can be set and reports success on a connection that dropped
+	// between the row and ReadyForQuery. The scanned value is still correct;
+	// what was lost was the signal. Found by the Part 9 review, which noted
+	// that this file and latest.go had come to teach opposite rules.
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return decimal.Decimal{}, time.Time{}, false, fmt.Errorf("read latest funding rate for %s: %w", product, err)
+	}
+	return rate, ts.UTC(), true, nil
 }
 
 // StoredBook is the top of the book as cb_book_snapshots recorded it.
@@ -180,5 +191,10 @@ func (r *Reader) LatestBook(ctx context.Context, product string) (StoredBook, bo
 		return StoredBook{}, false, fmt.Errorf("scan latest book for %s: %w", product, err)
 	}
 	b.TS = b.TS.UTC()
-	return b, true, rows.Err()
+	// Close before Err; see the note in LatestFundingRate.
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return StoredBook{}, false, fmt.Errorf("read latest book for %s: %w", product, err)
+	}
+	return b, true, nil
 }

@@ -96,9 +96,8 @@ func (e *APIError) Retryable() bool {
 // Account is one polled snapshot of the futures account.
 //
 // Every field is optional. The venue omits what does not apply, and an absent
-// margin figure has to stay absent: the risk engine reads margin_ratio from
-// these rows and a zero would read as "no margin left" — the most dangerous
-// possible misreading of "not reported".
+// margin figure has to stay absent: a zero would read as "no margin left" —
+// the most dangerous possible misreading of "not reported".
 type Account struct {
 	AvailableMargin      decimal.NullDecimal
 	LiquidationThreshold decimal.NullDecimal
@@ -110,8 +109,15 @@ type Account struct {
 	DailyRealizedPnL     decimal.NullDecimal
 }
 
-// MarginRatio is available_margin / liquidation_threshold, the figure the risk
-// engine's floor is expressed against.
+// MarginRatio is available_margin / liquidation_threshold: the developer-docs
+// ratio, where higher is safer and 1.0 is the liquidation point.
+//
+// It is a RECONCILIATION metric, not a control value. The risk engine's floor
+// is expressed against the venue's reported liquidation_buffer_percentage
+// instead (ADR-0022), which this client does not yet parse — Part 5A adds it.
+// Note Coinbase's app widget shows a different "margin ratio": a percentage
+// running the other way, fatal at 100%. The two are not reciprocals and are
+// never converted between; venue doc section 4.1 defines both.
 //
 // It is a ratio, so Div is legitimate (API spec section 3.5). A zero or absent
 // threshold yields NULL rather than an infinity: an account with no liquidation

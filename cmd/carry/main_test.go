@@ -5,7 +5,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -48,6 +50,10 @@ func testConfig(t *testing.T, port int) *config.Carry {
 			MetricsAddr:   "127.0.0.1:0",
 		},
 		Execution: config.Execution{OrderTimeout: 2 * time.Second},
+		// Short so the cache loop ticks a few times inside a test; its reads
+		// hit emptyStore and cost nothing.
+		VenueRefresh: 50 * time.Millisecond,
+		Risk:         config.RiskLimits{StaleFeed: time.Minute},
 		FIX: config.FIXSession{
 			Sender: "CARRY", Target: "SIMV", Host: "127.0.0.1",
 			Port: port, StorePath: t.TempDir(),
@@ -64,6 +70,67 @@ func (fakeBooks) LatestBook(context.Context, string) (db.StoredBook, bool, error
 		BestBid: decimal.RequireFromString("2344.50"),
 		BestAsk: decimal.RequireFromString("2345.00"),
 	}, true, nil
+}
+
+// recordingStore is a database nothing has been recorded in — every read
+// answers "no row", which the cache reports as missing and stale — that also
+// records what was asked of it.
+//
+// It records because two properties of this binary's wiring are visible
+// nowhere else. The cache's own behaviour is tested in internal/venue against
+// an injected ticker, and internal/venue's integration test builds its own
+// Options; only here does anything exercise the real ticker branch of
+// venue.Cache.Run and the product ids cmd/carry passes it. With a store that
+// only answered, both a cache that refreshed once and froze and a perp/spot
+// swap in the wiring left every suite green (Part 9 adversarial review).
+type recordingStore struct {
+	mu       sync.Mutex
+	reads    int
+	products []string
+}
+
+func (r *recordingStore) LatestVenueState(_ context.Context, product string) (db.VenueStateRow, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reads++
+	r.products = append(r.products, product)
+	return db.VenueStateRow{}, false, nil
+}
+
+func (r *recordingStore) LatestAccountState(context.Context) (db.AccountStateRow, bool, error) {
+	return db.AccountStateRow{}, false, nil
+}
+
+func (r *recordingStore) LatestBaseState(context.Context) (db.BaseStateRow, bool, error) {
+	return db.BaseStateRow{}, false, nil
+}
+
+func (r *recordingStore) Product(context.Context, string) (db.ProductRow, bool, error) {
+	return db.ProductRow{}, false, nil
+}
+
+// refreshes is how many times the cache has been round the perp and spot
+// reads: two venue-state reads per refresh.
+func (r *recordingStore) refreshes() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reads / 2
+}
+
+// firstPair is the two products the cache read venue state for on its first
+// refresh, in the order it asked.
+//
+// Order, not membership: a perp/spot swap in the wiring asks for the same two
+// products, so a set comparison cannot see it. Refresh reads the perp source
+// first and the spot source second, so the pair says which id was wired into
+// which role.
+func (r *recordingStore) firstPair() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.products) < 2 {
+		return r.products
+	}
+	return r.products[:2]
 }
 
 // fakeSink accepts every row and keeps none: the venue's records are Part 7's
@@ -145,7 +212,7 @@ func TestProbeRunsAnOrderToTerminal(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- trade(context.Background(), cfg, &probe, testLogger()) }()
+	go func() { done <- trade(context.Background(), cfg, &recordingStore{}, &probe, testLogger()) }()
 
 	select {
 	case err := <-done:
@@ -172,7 +239,37 @@ func TestProbeCancelsAnOrderThatNeverFills(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- trade(context.Background(), cfg, &probe, testLogger()) }()
+	go func() { done <- trade(context.Background(), cfg, &recordingStore{}, &probe, testLogger()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("trade: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the probe never finished")
+	}
+}
+
+// The cancel is waited for under its own bound, not ORDER_TIMEOUT reused.
+// With the fill bound at one millisecond the probe gives up on the fill at
+// once and cancels; the venue's answer takes longer than a millisecond to
+// arrive, so a cancel wait that reused the fill bound would report the order
+// "still NEW" and fail — which is what the Part 8 version did under load with
+// 500 ms, and what this test does deterministically. Passing here means the
+// pass path took exactly as long as cancellation did and no longer.
+func TestProbeCancelWaitDoesNotReuseTheFillBound(t *testing.T) {
+	sim := startSim(t)
+	cfg := testConfig(t, sim.Port)
+	cfg.Execution.OrderTimeout = time.Millisecond
+
+	probe, err := parseProbe("side=buy,qty=1,px=1000.00") // rests: far below the ask
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- trade(context.Background(), cfg, &recordingStore{}, &probe, testLogger()) }()
 
 	select {
 	case err := <-done:
@@ -266,7 +363,7 @@ func TestProbeLeavesARestingOrderWhenStopped(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- trade(ctx, cfg, &probe, testLogger()) }()
+	go func() { done <- trade(ctx, cfg, &recordingStore{}, &probe, testLogger()) }()
 
 	// The NEW is the probe's first update; once it has arrived the order is
 	// resting and the stop is a stop mid-order.
@@ -293,8 +390,9 @@ func TestTradeShutsDownCleanlyOnCancellation(t *testing.T) {
 	cfg := testConfig(t, sim.Port)
 	ctx, cancel := context.WithCancel(context.Background())
 
+	store := &recordingStore{}
 	done := make(chan error, 1)
-	go func() { done <- trade(ctx, cfg, nil, testLogger()) }()
+	go func() { done <- trade(ctx, cfg, store, nil, testLogger()) }()
 
 	// Give the session time to come up, then stop. The point is the exit, not
 	// the logon; a cancellation during the connect must be clean too, which is
@@ -309,6 +407,60 @@ func TestTradeShutsDownCleanlyOnCancellation(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("trade did not return after cancellation")
 	}
+
+	// 300ms at a 50ms refresh. Two refreshes is the assertion that matters:
+	// the first is Run's immediate one, so only the real ticker can produce a
+	// second, and every test in internal/venue injects its ticker instead.
+	if got := store.refreshes(); got < 2 {
+		t.Errorf("cache refreshed %d times in 300ms at a 50ms interval; want at least 2 — "+
+			"one refresh means the ticker never fired and the flags would freeze at startup", got)
+	}
+	// The products the binary wires into the cache are visible nowhere else:
+	// internal/venue's tests build Options themselves. Swapped, every consumer
+	// would read the spot row as the perp — spot mid where futures_mark
+	// belongs, and no funding rate at all — and both CI jobs would stay green.
+	want := []string{cfg.PerpProductID, cfg.SpotProductID}
+	if got := store.firstPair(); !slices.Equal(got, want) {
+		t.Errorf("cache read venue state for %v, want %v (perp first, then spot)", got, want)
+	}
+}
+
+// A metrics endpoint that cannot bind fails the startup, rather than leaving
+// the binary running with a live FIX session, a live cache and no way to
+// observe either (metrics.Listen).
+//
+// The counted reads are the point: they prove the bind is checked before the
+// cache and the session start, so there is nothing to unwind. Compose restart
+// policies fire on exit, not on unhealthy, so a binary that kept running here
+// stayed up with no /metrics and no /healthz until someone stopped it.
+func TestTradeFailsWhenTheMetricsEndpointCannotBind(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("occupy a port: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+
+	cfg := testConfig(t, freePort(t))
+	cfg.MetricsAddr = occupied.Addr().String()
+
+	store := &recordingStore{}
+	done := make(chan error, 1)
+	go func() { done <- trade(context.Background(), cfg, store, nil, testLogger()) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("trade succeeded with a metrics address it could not bind")
+		}
+		if !strings.Contains(err.Error(), "listen on") {
+			t.Errorf("error is %v, want the bind failure named", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("trade kept running with no metrics endpoint")
+	}
+	if got := store.refreshes(); got != 0 {
+		t.Errorf("the cache refreshed %d times before the bind was checked; want 0", got)
+	}
 }
 
 // A store path that cannot be created fails the startup rather than starting
@@ -317,7 +469,7 @@ func TestTradeFailsOnAnUnusableStorePath(t *testing.T) {
 	cfg := testConfig(t, freePort(t))
 	cfg.FIX.StorePath = "/proc/carry-cannot-create-this"
 
-	if err := trade(context.Background(), cfg, nil, testLogger()); err == nil {
+	if err := trade(context.Background(), cfg, &recordingStore{}, nil, testLogger()); err == nil {
 		t.Fatal("trade succeeded with a store path it could not create")
 	}
 }

@@ -255,8 +255,12 @@ func (r BaseStateRow) row() rowData {
 }
 
 // AccountStateRow is the polled account and margin snapshot. The risk engine
-// reads margin_ratio from these rows rather than deriving a liquidation price,
+// reads margin health from these rows rather than deriving a liquidation price,
 // and the treasury reconciles the two cash balances against them.
+//
+// MarginRatio here is the DERIVED available_margin / liquidation_threshold, a
+// cross-check only. The hard stop's input is the venue's own reported
+// liquidation_buffer_percentage, which Part 5A adds to this row (ADR-0022).
 type AccountStateRow struct {
 	TS                    time.Time
 	AvailableMargin       decimal.NullDecimal

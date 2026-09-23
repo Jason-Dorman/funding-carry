@@ -31,10 +31,16 @@ type Server struct {
 	addr     string
 	registry *prometheus.Registry
 	log      *slog.Logger
+
+	// listener is bound by Listen and served by Serve. Binding is a separate,
+	// synchronous step so a binary fails at startup on an address it cannot
+	// have, rather than running on with no endpoint — see Listen.
+	listener net.Listener
 }
 
 // NewServer builds the registry and the HTTP handlers. It does not bind a port;
-// Serve does that, so a construction failure and a bind failure stay distinct.
+// Listen does that, so a construction failure and a bind failure stay distinct
+// — and so the bind is a synchronous startup step the caller can fail on.
 func NewServer(addr string, log *slog.Logger) *Server {
 	registry := prometheus.NewRegistry()
 	// Go runtime and process collectors are the baseline every binary exports:
@@ -50,15 +56,46 @@ func NewServer(addr string, log *slog.Logger) *Server {
 // Registry is where components register their collectors.
 func (s *Server) Registry() prometheus.Registerer { return s.registry }
 
-// Serve binds the configured address and serves until ctx is canceled, then
-// shuts down gracefully. It returns nil on a clean shutdown.
-func (s *Server) Serve(ctx context.Context) error {
+// Listen binds the configured address, and is the reason a metrics failure is
+// a startup failure rather than a silent one.
+//
+// It is separate from Serve because Serve runs in a goroutine whose error
+// nothing reads until shutdown: a bind that failed there left the binary
+// running with a live FIX session and a live decision loop, no /metrics and no
+// /healthz, until someone sent it SIGTERM — and Compose restart policies fire
+// on exit, not on unhealthy, so the container stayed up in that state
+// indefinitely. That is the failure shape architecture section 8 already
+// rules on for the writer: a subsystem that dies while the process lives
+// defeats the restart policy the reliability table depends on.
+//
+// Every binary calls this before it starts anything else, so the error is
+// returned while there is nothing to unwind. Binding first is also what makes
+// the fix safe: after the bind, Serve returns only on failure or cancellation,
+// so the case this catches is always a bind in the first milliseconds — before
+// any session is up and before any position can exist.
+//
+// Found by the Part 9 adversarial review in Part 1/8 wiring shared by all three
+// binaries; the tiebreak rejected reacting to the error during shutdown, which
+// would have edited ordering two earlier reviews had already corrected.
+func (s *Server) Listen(ctx context.Context) error {
 	var lc net.ListenConfig
 	listener, err := lc.Listen(ctx, "tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", s.addr, err)
 	}
-	return s.serve(ctx, listener)
+	s.listener = listener
+	return nil
+}
+
+// Serve serves the endpoint until ctx is canceled, then shuts down gracefully.
+// It returns nil on a clean shutdown. Listen must have succeeded first.
+func (s *Server) Serve(ctx context.Context) error {
+	if s.listener == nil {
+		// A programming error, not a runtime condition: the address is bound by
+		// Listen precisely so that a failure to bind is caught at startup.
+		return errors.New("metrics server: Serve called before Listen")
+	}
+	return s.serve(ctx, s.listener)
 }
 
 // serve is separated from Serve so tests can supply their own listener on port

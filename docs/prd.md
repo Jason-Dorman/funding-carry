@@ -66,9 +66,9 @@ Grouped by component; spec section references in parentheses.
 - FR-3.3 Support advisory mode (signal only, human executes) — this is the week-3 deliverable and the mode manual carry #3 uses.
 
 **FR-4 Risk engine (§6.6)**
-- FR-4.1 Track spot inventory, perp contracts, net delta, residual delta, notional, margin ratio, accrued and settlement-pending funding, P&L split (price/funding/fees/slippage).
-- FR-4.2 Pre-trade checks: leverage ≤ 3× on overnight margin (intraday never opted in), margin ratio ≥ floor, expected carry ≥ k × costs, spread ≤ max, feed fresh, outside the maintenance window, daily loss limit.
-- FR-4.3 Hard stops (max notional, max leverage, margin-ratio floor, basis blowout, funding flip, cascade flag) **flatten and alert**; only the risk engine emits orders.
+- FR-4.1 Track spot inventory, perp contracts, net delta, residual delta, notional, margin health (the venue's reported liquidation-buffer percentage, with the derived `available_margin / liquidation_threshold` ratio kept beside it as a cross-check — [ADR-0022](decisions/0022-margin-health-from-venue-buffer.md)), accrued and settlement-pending funding, P&L split (price/funding/fees/slippage).
+- FR-4.2 Pre-trade checks: leverage ≤ 3× on overnight margin (intraday never opted in), **liquidation buffer ≥ floor and reported fresh** — missing or stale venue margin data blocks entry rather than falling back to the derived ratio — expected carry ≥ k × costs, spread ≤ max, feed fresh, outside the maintenance window, daily loss limit.
+- FR-4.3 Hard stops (max notional, max leverage, **liquidation-buffer floor**, basis blowout, funding flip, cascade flag) **flatten and alert**; only the risk engine emits orders.
 - FR-4.4 Rebalance when |net delta| > tolerance. The perp leg is quantized to whole 0.10 ETH contracts, so delta is trimmed on the continuous spot leg; residual delta must stay under half a contract.
 - FR-4.5 Kill switch: cancel all open orders, flatten, halt submission on all venues; testable against paper.
 
@@ -82,7 +82,7 @@ Grouped by component; spec section references in parentheses.
 - FR-6.1 Reconcile balances across the Coinbase spot (CBI) account, futures (CFM) margin account, and the Base wallet; track cash auto-transfer into margin, scheduled sweeps back, funding-settlement timing, and Base wallet transactions, each with its own timeout (spec §6.8) raising a risk event and alert when exceeded. A missed funding settlement also feeds the reconciliation error.
 
 **FR-7 Observability (§6.9)**
-- FR-7.1 Metrics per the [API spec catalog](api-spec.md#6-prometheus-metrics); four-panel Grafana dashboard; eight alert rules (FIX down, WS gap, delta breach, hard stop, margin ratio, stale feed, funding reconciliation drift, treasury transition timeout).
+- FR-7.1 Metrics per the [API spec catalog](api-spec.md#6-prometheus-metrics); four-panel Grafana dashboard; nine alert rules (FIX down, WS gap, delta breach, hard stop, liquidation buffer low, venue margin data unavailable, stale feed, funding reconciliation drift, treasury transition timeout).
 
 **FR-8 Backtest/replay (§6.10)**
 - FR-8.1 Python replay of recorded data, chronological, funding at hourly boundaries, fees/slippage/mark-based risk; `make replay` = 30 days end-to-end + Grafana refresh.
@@ -98,7 +98,7 @@ Grouped by component; spec section references in parentheses.
 | Explainability | Every file explainable by the owner; idiomatic Go patterns (one writer, context cancellation, consumer interfaces, graceful shutdown) |
 | Security | Real thresholds, credentials, session keys only in `.env.private`; public repo ships synthetic values (§9) |
 | Auditability | Wallet activity small, real, readable; nothing unrelated from the named wallet (wallet doctrine, §1) |
-| Safety | Live notional hard-capped; leverage ≤ 3× on overnight margin with intraday never opted in; margin-ratio floor from config; kill switch proven against paper before live |
+| Safety | Live notional hard-capped; leverage ≤ 3× on overnight margin with intraday never opted in; liquidation-buffer floor from config, read from the venue rather than derived; kill switch proven against paper before live |
 
 ## 6. Success metrics
 

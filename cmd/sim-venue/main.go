@@ -93,6 +93,14 @@ func simulate(ctx context.Context, cfg *config.SimVenue, sender rowSender, books
 ) error {
 	srv := metrics.NewServer(cfg.MetricsAddr, log)
 
+	// Bind before anything else starts. A metrics endpoint that failed to bind
+	// inside the serving goroutine would go unnoticed until shutdown, leaving
+	// the process running with no /metrics and no /healthz and no way for
+	// Compose to notice (metrics.Listen).
+	if err := srv.Listen(ctx); err != nil {
+		return err
+	}
+
 	// The metrics endpoint outlives the root context deliberately, the same way
 	// ingest's does: the writer's final flush happens after cancellation, and an
 	// endpoint that stopped with everything else would make the last rows
